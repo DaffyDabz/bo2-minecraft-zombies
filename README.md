@@ -38,14 +38,18 @@ the setup script); no Black Ops II or Minecraft files. Tested on the author's PC
 - The game starts at night, in the spawn room, round 1, with Black Ops II's pistol, knife and grenades.
 - Every night is one zombies round. The sun stops at midnight until the last zombie of the round dies,
   then the day comes.
-- Every day is Minecraft: mine, place blocks, build walls around yourself. No Minecraft monsters.
+- Every day is Minecraft: mine, farm, place blocks, build walls around yourself. Only animals by day.
+- At night Minecraft's monsters spawn too and hunt you like the zombies do: they know where you are within
+  48 blocks, seen or not. Daylight burns them.
 - The spawn room can't be broken. It holds the perk machines, the Mystery Box (one spot, it never moves)
   and Pack-a-Punch. Its two doors are the only part zombies can break.
-- Zombies rise from the ground around you and break any block to reach you, natural ground too. A
+- Zombies rise from the ground around you and break any block to reach you, natural ground too. Blocks
+  have health by their Minecraft hardness: leaves and dirt go fast, wood and stone slower, iron and obsidian
+  hold for a long time, bedrock never breaks. Zombies go through the weakest way in. A
   zombie that digs too long, gets stuck or falls behind rises again closer to you.
 - Underground when night falls: they rise right on top of you. A warning comes at sunset.
-- Going down works like Black Ops II: Quick Revive (solo) brings you back, otherwise game over and the
-  same world starts fresh at round 1. Dying in the day ends the game too.
+- Going down works like Black Ops II: Quick Revive (solo) brings you back, otherwise game over and a
+  new random world starts at round 1. Every game is a new world. Dying in the day ends the game too.
 - Carpenter gives you wood (planks and doors).
 - Survival items: Black Ops II guns, grenades and the knife are inventory items; you start with wooden tools; hearts and
   hunger replace Black Ops II health (Juggernog adds golden hearts); armor, furnace and chest work; ammo station in the room.
@@ -96,10 +100,14 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 ## Coming soon
 - [ ] All 12 Black Ops II perks in the spawn room (built on branch `mc-perks`, being merged).
 - [ ] Check every first-playtest fix on screen: survival mining, hotbar scrolling, hearts/hunger, armor, brighter colours, 6-minute days.
+- [ ] Check on screen: farming, snow, saplings, night monsters, block health.
 - [ ] Zombies reaching a player on a one-block tower.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-07: a new world every game; animals by day, hunting monsters at night; farming (hoe, seeds, bone meal,
+  saplings that need soil); snow breaks like Minecraft's and tools no longer place into it; blocks have their own
+  health; Nuketown Zombies' current menus, zombies and weapons merged in.
 - 2026-10-05: release zip with one-click setup (finds Black Ops II, makes the desktop shortcut).
 - 2026-10-05: Black Ops II's front end with MINECRAFT next to NUKETOWN on the globe; new loading screen; Exit Game returns to the menus.
 - 2026-10-05: first-playtest fixes: doors you fit through, items for guns/grenades/knife, stacks, ammo station, real ammo, hearts and hunger, armor, furnace and chest.
