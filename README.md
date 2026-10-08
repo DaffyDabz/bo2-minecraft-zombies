@@ -35,15 +35,21 @@ You need your own Black Ops II (PC, Steam) with Zombies. The zip holds only this
 the setup script); no Black Ops II or Minecraft files. Tested on the author's PC only, not yet on a fresh PC.
 
 ## How it plays
-- The game starts at night, in the spawn room, round 1, with Black Ops II's pistol, knife and grenades.
+- The game starts at night, in the spawn room, round 1, with Black Ops II's pistol and knife (no free grenades: buy them at the chalk).
 - Every night is one zombies round. The sun stops at midnight until the last zombie of the round dies,
   then the day comes.
 - Every day is Minecraft: mine, farm, place blocks, build walls around yourself. Only animals by day.
 - At night Minecraft's monsters spawn too and hunt you like the zombies do: they know where you are within
   48 blocks, seen or not. Daylight burns them.
-- The spawn room can't be broken. It holds the perk machines, the Mystery Box (one spot, it never moves)
-  and Pack-a-Punch. Zombies can't break its doors: they come in through two boarded windows, tearing the
-  planks off one by one. Hold Use at a window to nail the boards back (+10 points a board), like Black Ops II.
+- The spawn room can't be broken. It holds the perk machines and the Mystery Box (one spot, it never moves).
+  Zombies can't break its doors: they come in through two glass windows, smashing the panes one by one.
+  Hold Use at a window to put the glass back (+10 points a pane), like Black Ops II's boards.
+- Wall weapons are chalk drawings, each with a Minecraft sign above it giving the name and price: four inside
+  the house, eight on its outside end walls (guns, the Bowie Knife, Galvaknuckles, Semtex, frag grenades, claymores).
+- The vault: a second room across the road, 3,000 points to open. It holds the Nether portal, the End portal
+  (twelve Eyes of Ender light it), Pack-a-Punch, and the rare wall weapons, hung on the wall itself until they
+  get chalk outlines: the Blundergat (10,000), the Spork (5,000, three times the knife) and the Golden Spork
+  (15,000, kills in one hit). Signs mark what comes next (Hell's Retriever, the Thunder Gun, more Mystery Boxes).
 - Every 5th round is a souls round, like Nacht der Untoten's dog rounds: no zombies, just hellhounds that arrive on
   Minecraft lightning bolts and a pack of angry Minecraft wolves, in thick fog; the last one drops Max Ammo and the fog lifts.
 - Swimming works like Minecraft: slower in water, you sink slowly, Jump swims up, Crouch dives; Jump and Forward at
@@ -104,6 +110,10 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - Rounds follow the day clock: a round waits for nightfall, the clock waits for the round.
 
 ## Coming soon
+- [ ] Chalk outlines for the Blundergat and both Sporks (they hang on the wall for now).
+- [ ] Hell's Retriever (the Mob of the Dead tomahawk) in the vault.
+- [ ] The Thunder Gun (Black Ops 1) in the vault.
+- [ ] Mob of the Dead and Origins Mystery Boxes in the vault.
 - [ ] Check on screen in a full playthrough: windows, souls rounds, swimming, the Nether and the End.
 - [ ] Check every first-playtest fix on screen: survival mining, hotbar scrolling, hearts/hunger, armor, brighter colours, 6-minute days.
 - [ ] Check on screen: farming, snow, saplings, night monsters, block health.
@@ -111,6 +121,14 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-07: the vault's Spork (5,000) next to the Golden Spork (15,000); the vault weapons hang on its wall;
+  frag grenades buyable again; the Blundergat and Sporks show their name and price.
+- 2026-10-07: the vault across the road (3,000 points: both portals, Pack-a-Punch, Blundergat, Golden Spork);
+  a Minecraft sign with name and price over every wall weapon; chalks moved off the windows and perks;
+  glass windows that smash; frag grenades on the wall.
+- 2026-10-07: grenades, claymores and monkey bombs are items you buy: grenades and claymores from wall chalk
+  (claymores sell again once used up), monkey bombs from the box, 3 per hit, stacking; souls-round wolves die on
+  lightning when the round ends; the End portal shows its starfield.
 - 2026-10-07: boarded windows into the spawn room (zombies tear boards off, you nail them back); the doors now
   hold; souls round every 5 rounds with Minecraft lightning, hellhounds and wolves; swimming; endless rounds in the Nether and End.
 - 2026-10-07: a new world every game; animals by day, hunting monsters at night; farming (hoe, seeds, bone meal,
