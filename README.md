@@ -7,7 +7,7 @@ our Black Ops II Zombies rebuild (bo2zm) and chasmlol's
 [2010 Rust Rewrite Mashup](https://github.com/chasmlol/2010-rust-rewrite-mashup) (the Minecraft world,
 from MinecraftOSS).
 
-**Status:** playable, work in progress (fix list from the first playtest partly done) · **Visibility:** public · **Last updated:** 2026-10-05
+**Status:** playable, work in progress (fix list from the first playtest partly done) · **Visibility:** private for now · **Last updated:** 2026-10-05
 
 Hobby/modding project. Nothing from Activision or Mojang is in this repository: Black Ops II's files
 come from your own copy of the game, Minecraft's files are fetched from Mojang's servers on first run.
@@ -121,6 +121,10 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-08: playtest fixes: the bus has its front back (the driver sits behind the windscreen, no walking
+  through the hood); zombies drop rotten flesh and bones; Minecraft swords and tools hurt the zombies by their
+  attack damage; Minecraft mobs hit you again; a tool's crack goes as soon as you stop mining (bullet cracks
+  still fade); the house doors are double doors you walk straight through; End Game ends the game.
 - 2026-10-08: the Minecraft loading picture is back (BO2's Nuketown picture had replaced it).
 - 2026-10-07: the vault's Spork (5,000) next to the Golden Spork (15,000); the vault weapons hang on its wall;
   frag grenades buyable again; the Blundergat and Sporks show their name and price.
