@@ -121,6 +121,14 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-08: mob ragdolls: a Minecraft mob that dies falls over as a ragdoll (four-legged mobs roll onto their
+  side, legs out) and lies about 5 seconds before it poofs; `IW4L_BO2MC_RAGDOLL=0` turns them off. The chat
+  also has /summon <mob> [x y z] and /kill @e.
+- 2026-10-08: polish pass: every perk also works the Minecraft way (Speed Cola mines and places faster, Double
+  Tap swings faster, Deadshot's swings crit, Stamin-Up sprints without hunger, Quick Revive heals twice as fast,
+  PhD Flopper takes no fall or creeper damage, Vulture Aid loots, Electric Cherry shocks the mobs too); every wall
+  chalk and buyable checked; Pack-a-Punched dual-wield guns get both clips; Minecraft's chat on T with /gamemode
+  (creative flight on a double jump, spectator flies through blocks), /time, /give, /tp, /kill, /seed and /help.
 - 2026-10-08: playtest fixes: the bus has its front back (the driver sits behind the windscreen, no walking
   through the hood); zombies drop rotten flesh and bones; Minecraft swords and tools hurt the zombies by their
   attack damage; Minecraft mobs hit you again; a tool's crack goes as soon as you stop mining (bullet cracks
