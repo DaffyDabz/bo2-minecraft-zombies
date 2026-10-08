@@ -121,6 +121,8 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-08: chat commands for zombies: /round <1-255> jumps to that round (between rounds it starts at once),
+  /points <amount> and /points set <amount>; /time set night between rounds now starts the next round at once.
 - 2026-10-08: playtest fixes: no invisible walls at spawn (the parked bus is solid only as its own body, so its
   doors work, and Nuketown's hidden patch walls are gone from the block world); perk machines show behind glass,
   not on top of it; the mouse stays in the game window; bread on the wall (12 for 100 points); a Minecraft
