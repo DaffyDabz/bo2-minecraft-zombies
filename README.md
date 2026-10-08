@@ -42,7 +42,13 @@ the setup script); no Black Ops II or Minecraft files. Tested on the author's PC
 - At night Minecraft's monsters spawn too and hunt you like the zombies do: they know where you are within
   48 blocks, seen or not. Daylight burns them.
 - The spawn room can't be broken. It holds the perk machines, the Mystery Box (one spot, it never moves)
-  and Pack-a-Punch. Its two doors are the only part zombies can break.
+  and Pack-a-Punch. Zombies can't break its doors: they come in through two boarded windows, tearing the
+  planks off one by one. Hold Use at a window to nail the boards back (+10 points a board), like Black Ops II.
+- Every 5th round is a souls round, like Nacht der Untoten's dog rounds: no zombies, just hellhounds that arrive on
+  Minecraft lightning bolts and a pack of angry Minecraft wolves, in thick fog; the last one drops Max Ammo and the fog lifts.
+- Swimming works like Minecraft: slower in water, you sink slowly, Jump swims up, Crouch dives; Jump and Forward at
+  the surface climbs out. Stay under too long and you drown.
+- Nether and End: zombie rounds keep going there; Nether zombies drop blaze rods, Eyes of Ender lead to the End.
 - Zombies rise from the ground around you and break any block to reach you, natural ground too. Blocks
   have health by their Minecraft hardness: leaves and dirt go fast, wood and stone slower, iron and obsidian
   hold for a long time, bedrock never breaks. Zombies go through the weakest way in. A
@@ -98,13 +104,15 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - Rounds follow the day clock: a round waits for nightfall, the clock waits for the round.
 
 ## Coming soon
-- [ ] All 12 Black Ops II perks in the spawn room (built on branch `mc-perks`, being merged).
+- [ ] Check on screen in a full playthrough: windows, souls rounds, swimming, the Nether and the End.
 - [ ] Check every first-playtest fix on screen: survival mining, hotbar scrolling, hearts/hunger, armor, brighter colours, 6-minute days.
 - [ ] Check on screen: farming, snow, saplings, night monsters, block health.
 - [ ] Zombies reaching a player on a one-block tower.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-07: boarded windows into the spawn room (zombies tear boards off, you nail them back); the doors now
+  hold; souls round every 5 rounds with Minecraft lightning, hellhounds and wolves; swimming; endless rounds in the Nether and End.
 - 2026-10-07: a new world every game; animals by day, hunting monsters at night; farming (hoe, seeds, bone meal,
   saplings that need soil); snow breaks like Minecraft's and tools no longer place into it; blocks have their own
   health; Nuketown Zombies' current menus, zombies and weapons merged in.
