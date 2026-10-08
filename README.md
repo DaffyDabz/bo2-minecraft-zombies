@@ -121,6 +121,7 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-08: the Minecraft loading picture is back (BO2's Nuketown picture had replaced it).
 - 2026-10-07: the vault's Spork (5,000) next to the Golden Spork (15,000); the vault weapons hang on its wall;
   frag grenades buyable again; the Blundergat and Sporks show their name and price.
 - 2026-10-07: the vault across the road (3,000 points: both portals, Pack-a-Punch, Blundergat, Golden Spork);
