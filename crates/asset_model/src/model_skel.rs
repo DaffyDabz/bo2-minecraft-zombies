@@ -94,6 +94,8 @@ pub struct ModelSkel {
     pub coll_surfs: Vec<xmodel_runtime::CollSurfCollision>,
 
     pub movement_brushes: Vec<xmodel_runtime::ModelMovementBrush>,
+    /// The bone boxes' surface (see `RetainedModelCapability`).
+    pub surface_flags: u32,
 
     pub lod: Option<crate::ModelLodSelector>,
 
@@ -114,6 +116,7 @@ impl ModelSkel {
             coll_lod: self.coll_lod,
             coll_surfs: self.coll_surfs.clone(),
             movement_brushes: self.movement_brushes.clone(),
+            surface_flags: self.surface_flags,
             bounds: self.bounds,
             radius: self.radius,
         })
@@ -542,6 +545,7 @@ fn capture_model_skel_iw4(
         coll_lod: geometry.coll_lod,
         coll_surfs: capture_coll_surfs(stream, geometry),
         movement_brushes: Vec::new(),
+        surface_flags: 0,
         lod: Some(crate::ModelLodSelector::Iw4 {
             lod_start: geometry.lod_start,
             num_lods: geometry.num_lods,
@@ -1091,6 +1095,7 @@ fn capture_model_skel_t5(
         coll_lod: geometry.coll_lod,
         coll_surfs,
         movement_brushes: capture_movement_brushes_t5(stream, geometry)?,
+        surface_flags: 0,
         lod: Some(crate::ModelLodSelector::T5 {
             num_lods: geometry.num_lods,
             lod_dist: geometry.lod_dist,
@@ -1719,6 +1724,7 @@ fn capture_model_skel_iw5(
         coll_lod: 0,
         coll_surfs: Vec::new(),
         movement_brushes: Vec::new(),
+        surface_flags: 0,
 
         lod: None,
         lod_smc: None,

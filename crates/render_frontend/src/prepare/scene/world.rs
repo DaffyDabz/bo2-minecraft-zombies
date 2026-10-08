@@ -266,6 +266,8 @@ pub struct WorldScene {
     /// (0 = the map's own).
     pub t6_fog_banks: Vec<(u32, [[f32; 16]; 2])>,
     pub t6_lights_loaded: std::sync::Arc<Vec<[f32; 16]>>,
+    /// bo2zm: see `asset_world::WorldDraw::t6_flicker`.
+    pub t6_flicker: Vec<asset_world::T6Flicker>,
     pub t6_fog_bank: u32,
     /// bo2zm: see `asset_world::WorldDraw::t6_probes`.
     pub t6_probes: std::sync::Arc<Vec<[[f32; 4]; 3]>>,
@@ -757,6 +759,7 @@ impl WorldScene {
             t5_exposure_volume_count: 0,
             t6_lights: Default::default(),
             t6_fog_banks: Vec::new(),
+            t6_flicker: Vec::new(),
             t6_lights_loaded: Default::default(),
             t6_fog_bank: 0,
             t6_probes: Default::default(),
@@ -857,6 +860,7 @@ impl WorldScene {
             t5_exposure_volume_count: 0,
             t6_lights: Default::default(),
             t6_fog_banks: Vec::new(),
+            t6_flicker: Vec::new(),
             t6_lights_loaded: Default::default(),
             t6_fog_bank: 0,
             t6_probes: Default::default(),
@@ -1613,6 +1617,7 @@ pub fn world_scene_from_draw(
     scene.t6_lights = std::sync::Arc::new(draw.t6_lights.clone());
     scene.t6_lights_loaded = std::sync::Arc::clone(&scene.t6_lights);
     scene.t6_fog_banks = draw.t6_fog_banks.clone();
+    scene.t6_flicker = draw.t6_flicker.clone();
     scene.t6_fog_bank = 0;
     scene.t6_probes = std::sync::Arc::new(draw.t6_probes.clone());
     scene.primary_light_types = draw

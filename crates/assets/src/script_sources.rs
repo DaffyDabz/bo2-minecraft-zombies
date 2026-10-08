@@ -20,6 +20,12 @@ pub struct T6ScriptSet {
     pub strings: Vec<(String, String)>,
     /// Every sound alias the map's banks hold (lower case).
     pub sound_aliases: Vec<String>,
+    /// Props that break in stages, by name (later zones win).
+    pub destructibles: Vec<xmodel_runtime::T5DestructibleDef>,
+    /// Screen shakes and blurs (`shock/NAME.shock`): (name, text).
+    pub shocks: Vec<(String, String)>,
+    /// Barrier types (`ZBarrierDef`), later zones winning a name.
+    pub zbarriers: Vec<asset_t6::ZBarrierDefRef>,
 }
 
 /// bo2zm M3: what the server needs of an animation.
@@ -98,10 +104,17 @@ impl ScriptSources {
     }
 
     pub fn shocks(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.configs.iter().filter_map(|(path, text)| {
-            let name = path.strip_prefix("shock/")?.strip_suffix(".shock")?;
-            Some((name, text.as_str()))
-        })
+        let t6 = self
+            .t6
+            .iter()
+            .flat_map(|t6| t6.shocks.iter().map(|(n, t)| (n.as_str(), t.as_str())));
+        self.configs
+            .iter()
+            .filter_map(|(path, text)| {
+                let name = path.strip_prefix("shock/")?.strip_suffix(".shock")?;
+                Some((name, text.as_str()))
+            })
+            .chain(t6)
     }
 
     pub(crate) fn capture(&mut self, name: &str, data: &[u8], compressed: bool) {

@@ -462,6 +462,10 @@ fn blocks_intersected_between(from: [f64; 3], to: [f64; 3], at_target: &Aabb) ->
 impl Level<'_> {
     /// Adds an entity (`Level.addFreshEntity`), ticking from this tick on.
     pub fn add_entity(&mut self, mut entity: Entity) -> i32 {
+        // bo2mc: leaf litter never lies on the ground as an item (his 10-08).
+        if matches!(&entity.kind, EntityKind::Item(item) if item.stack.id == "minecraft:leaf_litter") {
+            return 0;
+        }
         if entity.id == 0 {
             entity.id = self.next_entity_id;
             self.next_entity_id += 1;
@@ -494,6 +498,11 @@ impl Level<'_> {
         if let EntityKind::Item(data) = &mut entity.kind {
             data.pickup_delay = pickup_delay;
             data.age = age;
+        }
+        // bo2mc: an item that is never picked up and never despawns is a
+        // display (the bread on the house wall): it hangs where it was put.
+        if pickup_delay == NEVER_PICK_UP && age == -32768 {
+            entity.no_gravity = true;
         }
         self.add_entity(entity)
     }

@@ -53,6 +53,11 @@ fn main() -> ExitCode {
         .filter(|p| p.kind != "exploder")
         .filter_map(|p| facts.effects.get(&p.fxid).cloned())
         .collect();
+    // FXMAT_SEED=<name part>: the effects so named instead (the ones a
+    // weapon or a hit plays, which no map places).
+    if let Ok(seed) = std::env::var("FXMAT_SEED") {
+        todo = fx.keys().filter(|n| n.contains(seed.as_str())).cloned().collect();
+    }
     let mut seen = BTreeSet::new();
     let mut materials: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     while let Some(name) = todo.pop() {

@@ -83,6 +83,19 @@ struct Loaded {
     celestial: Arc<image::RgbaImage>,
     cloud_mask: Option<CloudMask>,
     crack_texture: Arc<image::RgbaImage>,
+    /// Minecraft Zombies: the nearest strongholds' locate points (the
+    /// Eye of Ender's way), overworld only.
+    strongholds: Vec<(i32, i32, i32)>,
+}
+
+/// Minecraft Zombies: the overworld as the players left it through a
+/// portal, waiting for the way back.
+struct Parked {
+    world: Loaded,
+    entities: Option<crate::minecraft_entities::Entities>,
+    light: Option<SkyLight>,
+    voxels: sim::voxel::ParkedVoxels,
+    bo2mc_world: bo2mc_world::Bo2mcWorld,
 }
 
 /// The hand's swing and the timers of mining and placing by hand.
@@ -95,6 +108,8 @@ struct HandState {
     /// Ticks until another placement while the button is held
     /// (`rightClickDelay`).
     place_delay: u32,
+    /// Seconds since the last attack (`attackStrengthTicker`).
+    attack_clock: f64,
 }
 
 /// The player's walk, for vanilla's step and fall sounds.
@@ -135,6 +150,11 @@ struct Runtime {
     spawn_ready: bool,
     /// Minecraft Zombies' spawn room and the rules' requests.
     bo2mc_world: bo2mc_world::Bo2mcWorld,
+    /// A portal's dimension loading ahead of the trip, and one loaded.
+    travel_load: Option<(u8, mpsc::Receiver<Result<Loaded, String>>)>,
+    travel_ready: Option<(u8, Loaded)>,
+    /// The overworld, parked while the players are in the Nether or the End.
+    parked: Option<Parked>,
 }
 
 /// Collision shape ids of block states, as handed to `sim::voxel`.
@@ -277,7 +297,7 @@ pub(crate) fn register(app: &mut App) {
         );
 }
 
-fn load(seed: i64) -> Result<Loaded, String> {
+fn load(seed: i64, dimension: Dimension) -> Result<Loaded, String> {
     let root = assets::minecraft_map::root().ok_or_else(assets::minecraft_setup::status)?;
     let paths = DataPaths::under(&root);
     let registries = Arc::new(Registries::load(&paths)?);
@@ -287,7 +307,7 @@ fn load(seed: i64) -> Result<Loaded, String> {
         registries.clone(),
         seed,
         VIEW_DISTANCE,
-        Dimension::Overworld,
+        dimension,
         None,
     )
     .map_err(|e| e.to_string())?;
@@ -295,9 +315,11 @@ fn load(seed: i64) -> Result<Loaded, String> {
         .map_err(|e| e.to_string())?;
     let scene = HandcraftedScene::streamed(stream.states.clone());
     let environment =
-        DimensionEnvironment::load(&registries, Dimension::Overworld.dimension_type())?;
+        DimensionEnvironment::load(&registries, dimension.dimension_type())?;
     let celestial = Arc::new(celestial_image(&packs).map_err(|e| e.to_string())?);
-    let cloud_mask = CloudMask::from_pack(&packs).ok();
+    // Clouds and strongholds are the overworld's (the first ring's three).
+    let cloud_mask = if dimension == Dimension::Overworld { CloudMask::from_pack(&packs).ok() } else { None };
+    let strongholds = if dimension == Dimension::Overworld { stream.strongholds(3) } else { Vec::new() };
     let crack_texture = Arc::new(crate::minecraft_mining::crack_strip(&packs).map_err(|e| e.to_string())?);
     Ok(Loaded {
         stream,
@@ -310,7 +332,99 @@ fn load(seed: i64) -> Result<Loaded, String> {
         celestial,
         cloud_mask,
         crack_texture,
+        strongholds,
     })
+}
+
+/// Minecraft Zombies' dimension number as MinecraftOSS's dimension.
+fn dimension_of(d: u8) -> Dimension {
+    match d {
+        sim::bo2mc::NETHER => Dimension::Nether,
+        sim::bo2mc::END => Dimension::End,
+        _ => Dimension::Overworld,
+    }
+}
+
+/// Minecraft Zombies: a portal trip. The world, its mobs, its light and its
+/// block collision change for the dimension's (`next`, loaded; or the
+/// parked overworld on the way back); the overworld is parked as it was,
+/// the Nether and the End are left behind. The inventory and the player's
+/// survival state go along, and the house is built around the new spawn.
+fn travel(runtime: &mut Runtime, view: &mut MinecraftWorldView, to: u8, next: Option<Loaded>) {
+    let from = sim::bo2mc::dimension();
+    let (world, mut entities, light, mut new_bo2mc, voxels) = if to == sim::bo2mc::OVERWORLD {
+        let Some(parked) = runtime.parked.take() else {
+            diag::warn!(World, "bo2mc: no overworld parked to go back to");
+            return;
+        };
+        (parked.world, parked.entities, parked.light, parked.bo2mc_world, parked.voxels)
+    } else {
+        let Some(next) = next else { return };
+        let (x, y, z) = next.stream.player_spawn;
+        let mut entities = crate::minecraft_entities::Entities::new(&next.stream, next.seed, dimension_of(to).dimension_type());
+        // Only the waves: no Minecraft mobs there.
+        entities.difficulty = 0;
+        entities.spawn_mobs = false;
+        (next, Some(entities), Some(SkyLight::streamed()), bo2mc_world::Bo2mcWorld::default(), sim::voxel::ParkedVoxels::empty([x, y, z]))
+    };
+    let Some(old_world) = runtime.world.take() else { return };
+    let mut old_entities = runtime.entities.take();
+    let old_light = runtime.light.take();
+    let mut old_bo2mc = std::mem::take(&mut runtime.bo2mc_world);
+    // What he carries goes with him.
+    if let (Some(old), Some(new)) = (old_entities.as_mut(), entities.as_mut()) {
+        std::mem::swap(&mut old.inventory, &mut new.inventory);
+        new.selected = old.selected;
+    }
+    new_bo2mc.hand_over(&mut old_bo2mc, to);
+    let (x, y, z) = world.stream.player_spawn;
+    let old_voxels = sim::voxel::exchange(voxels).unwrap_or_else(|| sim::voxel::ParkedVoxels::empty(view.origin));
+    if from == sim::bo2mc::OVERWORLD {
+        runtime.parked = Some(Parked { world: old_world, entities: old_entities, light: old_light, voxels: old_voxels, bo2mc_world: old_bo2mc });
+    }
+    view.origin = [x, y, z];
+    view.atlas = Some(world.atlas.clone());
+    view.celestial = Some(world.celestial.clone());
+    view.crack_texture = Some(world.crack_texture.clone());
+    view.uploads.clear();
+    view.removed.clear();
+    view.visible.clear();
+    view.particles = Default::default();
+    view.entity_meshes = Default::default();
+    view.hand = Default::default();
+    view.cracks = Default::default();
+    view.clouds = None;
+    view.light_volume = None;
+    view.generation += 1;
+    let mut world = world;
+    if to == sim::bo2mc::OVERWORLD {
+        // The GPU let go of its sections: every one is built again.
+        world.stream.remesh_all(&world.scene);
+    }
+    runtime.world = Some(world);
+    runtime.entities = entities;
+    runtime.light = light;
+    runtime.bo2mc_world = new_bo2mc;
+    runtime.mining = Default::default();
+    runtime.minimap = Default::default();
+    runtime.hand = Default::default();
+    runtime.steps = Default::default();
+    runtime.light_volume_at = None;
+    runtime.cloud_center = None;
+    runtime.environment_primed = false;
+    runtime.environment_accumulator = 0.0;
+    // The overworld's house stands; a new dimension's is built once its
+    // ground is in. Either way he is moved to its middle.
+    runtime.spawn_ready = to == sim::bo2mc::OVERWORLD;
+    runtime.was_alive = false;
+    sim::bo2mc::travelled(to);
+    diag::info!(
+        World,
+        "bo2mc: travelled from {} to {}, spawn {:?}",
+        sim::bo2mc::dimension_name(from),
+        sim::bo2mc::dimension_name(to),
+        (x, y, z)
+    );
 }
 
 /// The sky's sun and moon phases, laid out as MinecraftOSS lays them out.
@@ -425,7 +539,7 @@ fn update(
             let _ = std::thread::Builder::new()
                 .name("minecraft-world-load".into())
                 .spawn(move || {
-                    let _ = send.send(load(seed));
+                    let _ = send.send(load(seed, Dimension::Overworld));
                 });
             runtime.loading = Some(receive);
             view.active = true;
@@ -448,11 +562,13 @@ fn update(
                 view.crack_texture = Some(world.crack_texture.clone());
                 runtime.mining = Default::default();
                 runtime.sounds = Some(crate::minecraft_sounds::Sounds::load(&world.packs));
-                let mut entities = crate::minecraft_entities::Entities::new(&world.stream, world.seed);
-                // Minecraft Zombies has no Minecraft monsters; animals stay.
+                let mut entities = crate::minecraft_entities::Entities::new(&world.stream, world.seed, Dimension::Overworld.dimension_type());
+                // Minecraft Zombies: Normal once the world ticks (monsters
+                // spawn in the dark and hunt the players).
                 if runtime.bo2mc {
                     entities.difficulty = 0;
                 }
+                minecraftoss_entities::monster_ai::HUNT_PLAYERS.store(runtime.bo2mc, std::sync::atomic::Ordering::Relaxed);
                 runtime.entities = Some(entities);
                 runtime.spawn_ready = false;
                 runtime.day = DayCycle::default();
@@ -487,6 +603,55 @@ fn update(
             Err(error) => {
                 diag::warn!(World, "Minecraft world failed to load: {error}");
                 view.active = false;
+            }
+        }
+    }
+
+    // Minecraft Zombies: a portal trip. The dimension ahead loads in the
+    // background from his first step into the portal; he goes once it is in.
+    if runtime.bo2mc {
+        if let Some(to) = runtime.bo2mc_world.preload.take()
+            && to != sim::bo2mc::OVERWORLD
+            && runtime.travel_load.as_ref().is_none_or(|(d, _)| *d != to)
+            && runtime.travel_ready.as_ref().is_none_or(|(d, _)| *d != to)
+            && let Some(seed) = runtime.world.as_ref().map(|w| w.seed)
+        {
+            let (send, receive) = mpsc::channel();
+            let dimension = dimension_of(to);
+            let _ = std::thread::Builder::new()
+                .name("minecraft-dimension-load".into())
+                .spawn(move || {
+                    let _ = send.send(load(seed, dimension));
+                });
+            runtime.travel_load = Some((to, receive));
+            diag::info!(World, "bo2mc: loading {} ahead", sim::bo2mc::dimension_name(to));
+        }
+        if let Some((to, receive)) = &runtime.travel_load
+            && let Ok(result) = receive.try_recv()
+        {
+            let to = *to;
+            runtime.travel_load = None;
+            match result {
+                Ok(next) => {
+                    diag::info!(World, "bo2mc: {} loaded, spawn {:?}", sim::bo2mc::dimension_name(to), next.stream.player_spawn);
+                    runtime.travel_ready = Some((to, next));
+                }
+                Err(error) => {
+                    diag::warn!(World, "bo2mc: {} failed to load: {error}", sim::bo2mc::dimension_name(to));
+                    runtime.bo2mc_world.travel = None;
+                }
+            }
+        }
+        if let Some(to) = runtime.bo2mc_world.travel {
+            if to == sim::bo2mc::OVERWORLD {
+                runtime.bo2mc_world.travel = None;
+                travel(&mut runtime, &mut view, to, None);
+            } else if runtime.travel_ready.as_ref().is_some_and(|(d, _)| *d == to) {
+                runtime.bo2mc_world.travel = None;
+                let next = runtime.travel_ready.take().map(|(_, next)| next);
+                travel(&mut runtime, &mut view, to, next);
+            } else if runtime.travel_load.as_ref().is_none_or(|(d, _)| *d != to) {
+                runtime.bo2mc_world.preload = Some(to);
             }
         }
     }
@@ -576,18 +741,35 @@ fn update(
     if *bo2mc && !*spawn_ready {
         let (x, z) = (origin[0].floor() as i32, origin[2].floor() as i32);
         let reach = SPAWN_READY_BLOCKS;
-        *spawn_ready = ((x - reach) >> 4..=(x + reach) >> 4)
+        // With the bus: its road too, out east where it leaves.
+        let (x_lo, x_hi) = if sim::bo2mc::bus_on() {
+            (x + (*sim::bo2mc::ROAD_X.start()).min(-reach), x + (*sim::bo2mc::ROAD_X.end()).max(reach))
+        } else {
+            (x - reach, x + reach)
+        };
+        *spawn_ready = (x_lo >> 4..=x_hi >> 4)
             .all(|cx| ((z - reach) >> 4..=(z + reach) >> 4).all(|cz| world.scene.generated_chunk((cx, cz)).is_some()));
         if *spawn_ready {
             diag::info!(World, "bo2mc: spawn ground in, origin {origin:?}");
         }
     }
-    ui.loading_world = *bo2mc && !*spawn_ready;
+    ui.loading_world = *bo2mc && (!*spawn_ready || bo2mc_world.travel.is_some());
     if *bo2mc && *spawn_ready && !bo2mc_world.built {
         let spawn = (origin[0].floor() as i32, origin[1].floor() as i32, origin[2].floor() as i32);
         bo2mc_world.build_room(world, shapes, entities.as_mut(), spawn);
-        if let Some(entities) = entities.as_mut() {
+        // The kits are the first house's (none in the Nether or the End).
+        if let Some(entities) = entities.as_mut()
+            && !sim::bo2mc::endless()
+        {
             bo2mc_world::Bo2mcWorld::starting_items(entities);
+            if bo2mc_world::farm_kit() {
+                // Keys 4, 5, 7, 8 and 9; the shovel stays on 6.
+                for (slot, item, count) in [(3, "minecraft:iron_hoe", 1), (4, "minecraft:wheat_seeds", 16), (6, "minecraft:bone_meal", 16), (7, "minecraft:wheat", 8), (8, "minecraft:oak_sapling", 4)] {
+                    entities.inventory.slots[slot] = Some(entities.inventory.recipes.stack(item, count));
+                }
+                let snow = minecraft_terrain::scene::Block::new("minecraft:snow").with("layers", "1");
+                bo2mc_world::set_blocks(world, shapes, Some(entities), vec![(spawn, Some(snow))]);
+            }
             // IW4L_BO2MC_TEST_KIT=1 (tests): a crafting table in the room,
             // iron armor worn, five steaks; a furnace, a chest, water, lava.
             if std::env::var("IW4L_BO2MC_TEST_KIT").is_ok_and(|v| v == "1") {
@@ -618,6 +800,87 @@ fn update(
                     ],
                 );
             }
+            // IW4L_BO2MC_TEST_SWIM=1 (tests): a pool in the yard south of the
+            // room (cells dx -2..=2, dz 10..=14), three blocks of water whose
+            // surface is a block below the ground, like the ocean's shore.
+            // Its bottom is map (0, -432, -144).
+            if std::env::var("IW4L_BO2MC_TEST_SWIM").is_ok_and(|v| v == "1") {
+                use minecraft_terrain::scene::Block;
+                let mut edits = Vec::new();
+                for dx in -3i32..=3 {
+                    for dz in 9..=15 {
+                        let rim = dx.abs() == 3 || dz == 9 || dz == 15;
+                        for dy in -5..=3 {
+                            let block = if dy == -5 || (rim && dy < 0) {
+                                Block::new("minecraft:stone")
+                            } else if dy <= -2 {
+                                Block::new("minecraft:water").with("level", "0")
+                            } else {
+                                Block::new("minecraft:air")
+                            };
+                            edits.push(((spawn.0 + dx, spawn.1 + dy, spawn.2 + dz), Some(block)));
+                        }
+                    }
+                }
+                bo2mc_world::set_blocks(world, shapes, Some(entities), edits);
+                diag::info!(World, "bo2mc: test pool placed");
+            }
+            // IW4L_BO2MC_TEST_PORTAL (tests): three blocks south (+Z) of the
+            // spawn, "nether" a lit Nether portal, "frame" an empty obsidian
+            // frame with flint and steel on key 1, "end" an open End portal
+            // in the floor, "nether_here" a lit Nether portal round the spawn
+            // itself (he is in the Nether at once, for the autoplay tests);
+            // Eyes of Ender on key 2 with every one.
+            if let Ok(kind) = std::env::var("IW4L_BO2MC_TEST_PORTAL") {
+                use minecraft_terrain::scene::Block;
+                let mut edits = Vec::new();
+                if kind == "nether" || kind == "frame" || kind == "nether_here" {
+                    let dz = if kind == "nether_here" { 0 } else { 3 };
+                    for dx in -2..=1 {
+                        for dy in 0..=4 {
+                            let at = (spawn.0 + dx, spawn.1 + dy - 1, spawn.2 + dz);
+                            let block = if dx == -2 || dx == 1 || dy == 0 || dy == 4 {
+                                Block::new("minecraft:obsidian")
+                            } else if kind != "frame" {
+                                Block::new("minecraft:nether_portal").with("axis", "x")
+                            } else {
+                                Block::new("minecraft:air")
+                            };
+                            edits.push((at, Some(block)));
+                        }
+                    }
+                }
+                if kind == "end" {
+                    for dx in -1..=1 {
+                        for dz in 2..=4 {
+                            edits.push(((spawn.0 + dx, spawn.1 - 1, spawn.2 + dz), Some(Block::new("minecraft:end_portal"))));
+                        }
+                    }
+                }
+                // "ring": twelve frames in the floor around a 3x3 hole, eleven
+                // with eyes, the near middle one empty for the last eye.
+                if kind == "ring" {
+                    let (cx, y, cz) = (spawn.0, spawn.1 - 1, spawn.2 + 4);
+                    for i in -1..=1 {
+                        for (at, facing) in [
+                            ((cx + i, y, cz - 2), "south"),
+                            ((cx + i, y, cz + 2), "north"),
+                            ((cx - 2, y, cz + i), "east"),
+                            ((cx + 2, y, cz + i), "west"),
+                        ] {
+                            let eye = if at == (cx, y, cz - 2) { "false" } else { "true" };
+                            edits.push((at, Some(Block::new("minecraft:end_portal_frame").with("eye", eye).with("facing", facing))));
+                        }
+                        for k in -1..=1 {
+                            edits.push(((cx + i, y, cz + k), Some(Block::new("minecraft:air"))));
+                        }
+                    }
+                }
+                bo2mc_world::set_blocks(world, shapes, Some(entities), edits);
+                entities.inventory.slots[0] = Some(entities.inventory.recipes.stack("minecraft:flint_and_steel", 1));
+                entities.inventory.slots[1] = Some(entities.inventory.recipes.stack("minecraft:ender_eye", 8));
+                diag::info!(World, "bo2mc: test portal {kind} placed");
+            }
         }
     }
 
@@ -630,11 +893,24 @@ fn update(
     // Every spawn lands on the Minecraft spawn once its ground exists.
     let alive = ps.pm_type == 0;
     let spawn_chunk = ((origin[0].floor() as i32) >> 4, (origin[2].floor() as i32) >> 4);
-    if alive && !*was_alive && world.scene.generated_chunk(spawn_chunk).is_some() {
+    // bo2mc's first spawn is in the bus (TranZit's arrival), once its
+    // floor stands.
+    let in_bus = *bo2mc && sim::bo2mc::bus_on() && !bo2mc_world.arrived;
+    let ground = world.scene.generated_chunk(spawn_chunk).is_some() && (!*bo2mc || bo2mc_world.built);
+    if alive && !*was_alive && ground {
         // Retried each frame until the authority has the player to move.
-        if authority.0.teleport(local.0, [0.0, 0.0, 0.0]) {
-            diag::info!(World, "Minecraft spawn: moved to the world spawn");
+        let to = if in_bus {
+            let (p, _) = sim::bo2mc::bus_starts()[0];
+            [p[0], p[1], p[2] + 1.0]
+        } else {
+            [0.0, 0.0, 0.0]
+        };
+        if authority.0.teleport(local.0, to) {
+            diag::info!(World, "Minecraft spawn: moved to {}", if in_bus { "the bus" } else { "the world spawn" });
             *was_alive = true;
+            if in_bus {
+                bo2mc_world.arrived = true;
+            }
         }
     } else if !alive {
         *was_alive = false;
@@ -720,6 +996,7 @@ fn update(
     ui.empty_hand = ui.holding_item
         && entities.as_ref().is_some_and(|e| e.inventory.slots[e.selected].is_none());
     hand.clock += dt_hand;
+    hand.attack_clock += dt_hand;
     let hand_ticks = (hand.clock / TICK_SECONDS) as u32;
     hand.clock -= f64::from(hand_ticks) * TICK_SECONDS;
     // The knife item mines too (bo2mc), as it swings.
@@ -736,11 +1013,39 @@ fn update(
             let (yaw, pitch) = (f64::from(mc_yaw).to_radians(), f64::from(ps.viewangles[0]).to_radians());
             glam::DVec3::new(-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos())
         };
+        // bo2mc's game modes: adventure and spectator never break blocks.
+        let mode = if *bo2mc { sim::bo2mc::game_mode() } else { sim::bo2mc::SURVIVAL };
+        let mining_held = (buttons.pressed(MouseButton::Left) || pad_trigger(pad, GamepadButton::RightTrigger2, false))
+            && matches!(mode, sim::bo2mc::SURVIVAL | sim::bo2mc::CREATIVE);
         if buttons.just_pressed(MouseButton::Left) || pad_trigger(pad, GamepadButton::RightTrigger2, true) {
             hand.swing = Some(0.0);
-            entities.punch(eye_block, look, mc_yaw);
+            // The held item's attack damage, cut by the attack cooldown as
+            // vanilla's (`getAttackStrengthScale`, `0.2 + scale^2 * 0.8`).
+            let (damage, speed) = entities.inventory.recipes.attack_attributes(entities.inventory.slots[entities.selected].as_ref());
+            // Double Tap: a third faster to swing again, as its fire rate.
+            let speed = if *bo2mc && sim::bo2mc::player_has_perk("specialty_rof") { speed * 1.33 } else { speed };
+            let scale = ((hand.attack_clock / TICK_SECONDS + 0.5) * speed.max(0.1) / 20.0).clamp(0.0, 1.0);
+            hand.attack_clock = 0.0;
+            let strength = (0.2 + scale * scale * 0.8) as f32;
+            // Deadshot: every full-strength swing is a critical hit
+            // (Minecraft's 1.5).
+            let critical = *bo2mc && strength > 0.9 && sim::bo2mc::player_has_perk("specialty_deadshot");
+            // A Minecraft item (not a BO2 weapon) on a BO2 zombie, up to
+            // the block in the way.
+            if *bo2mc && ui.holding_item {
+                let reach = player.target(&world.scene, 3.0).map_or(3.0, |h| h.distance);
+                let crit = if critical { 1.5 } else { 1.0 };
+                sim::bo2mc::ask(sim::bo2mc::Ask::Swing { damage: damage as f32 * strength * crit, reach: (reach * 36.0) as f32 });
+            }
+            entities.punch(eye_block, look, mc_yaw, damage as f32, strength, critical);
         }
-        if buttons.pressed(MouseButton::Left) || pad_trigger(pad, GamepadButton::RightTrigger2, false) {
+        // His 10-08: "if you're like using a pickaxe or a tool, it should
+        // immediately stop if you stop trying to break the block": the
+        // crack goes when the button lets go or the aim leaves the block
+        // (a bullet's stays a while).
+        let hand_target = if mining_held { player.target(&world.scene, 4.5).map(|h| h.pos) } else { None };
+        mining.hand_on(hand_target);
+        if mining_held {
             for _ in 0..hand_ticks {
                 if let Some(hit) = player.target(&world.scene, 4.5) {
                     // A hand mines as vanilla's `getDestroyProgress`: a
@@ -748,11 +1053,16 @@ fn update(
                     // (survival): times the held tool's speed when it is
                     // the block's tool, and a block that needs a tool takes
                     // a hundred ticks a hardness without one.
-                    let factor = if *bo2mc {
+                    let factor = if mode == sim::bo2mc::CREATIVE {
+                        // Creative breaks a block at once.
+                        100.0
+                    } else if *bo2mc {
                         let held = entities.inventory.slots[entities.selected].as_ref().map_or("", |s| s.id.as_str());
-                        world.scene.state_at(hit.pos).map_or(1.0 / 30.0, |state| {
+                        // Speed Cola: Haste II's 1.4 on the dig speed.
+                        let haste = if sim::bo2mc::player_has_perk("specialty_fastreload") { 1.4 } else { 1.0 };
+                        world.scene.state_at(hit.pos).map_or(haste / 30.0, |state| {
                             let (speed, correct) = bo2mc_world::tool_speed(&world.registries, state, held);
-                            speed / if correct { 30.0 } else { 100.0 }
+                            haste * speed / if correct { 30.0 } else { 100.0 }
                         })
                     } else {
                         1.0 / 30.0
@@ -769,8 +1079,13 @@ fn update(
             }
         }
         hand.place_delay = hand.place_delay.saturating_sub(hand_ticks);
+        // Speed Cola: blocks go down twice as fast while the button is held.
+        let place_gap = if *bo2mc && sim::bo2mc::player_has_perk("specialty_fastreload") { 2 } else { 4 };
         let place = (buttons.just_pressed(MouseButton::Right) || pad_trigger(pad, GamepadButton::LeftTrigger2, true))
             || ((buttons.pressed(MouseButton::Right) || pad_trigger(pad, GamepadButton::LeftTrigger2, false)) && hand.place_delay == 0);
+        // A spectator touches nothing; adventure opens things but never builds.
+        let place = place && mode != sim::bo2mc::SPECTATOR;
+        let build = matches!(mode, sim::bo2mc::SURVIVAL | sim::bo2mc::CREATIVE);
         // A crafting table opens its 3x3 grid on the place button.
         let bench = place
             && player
@@ -778,7 +1093,7 @@ fn update(
                 .and_then(|hit| minecraft_terrain::scene::Scene::block(&world.scene, hit.pos))
                 .is_some_and(|b| b.id.path == "crafting_table");
         if bench {
-            hand.place_delay = 4;
+            hand.place_delay = place_gap;
             ui.inventory_open = true;
             ui.workbench = true;
         }
@@ -792,19 +1107,71 @@ fn update(
             None
         };
         if let Some((pos, kind)) = container_hit {
-            hand.place_delay = 4;
+            hand.place_delay = place_gap;
             ui.inventory_open = true;
             ui.container_kind = kind;
             bo2mc_world.open_container = Some(pos);
         }
         let place = place && !bench && container_hit.is_none();
+        // bo2mc (survival): an animal right-clicked takes the held item first.
+        let place = place && !(*bo2mc && entities.use_on_mob(eye_block, look));
+        // bo2mc (survival): the held item's own use (hoe, shovel, axe,
+        // seeds, bone meal, buckets, flint and steel) comes first.
+        let mut held = entities.inventory.slots[entities.selected].as_ref().map(|s| s.id.clone());
+        let mut used = if *bo2mc && place {
+            held.as_deref().and_then(|item| bo2mc_world::use_item(world, shapes, entities, &player, item))
+        } else {
+            None
+        };
+        // bo2mc: a main hand with nothing to do on the button (empty, or an
+        // item that is no gun, block, food or armor and had no use) lends
+        // the button to the offhand, as vanilla tries the main hand first.
+        let offhand = *bo2mc
+            && place
+            && used.is_none()
+            && entities.inventory.slots[40].is_some()
+            && entities.inventory.slots[entities.selected].as_ref().is_none_or(|s| {
+                crate::minecraft_inventory::weapon_of(s).is_none()
+                    && !bo2mc_world::places_block(world, &s.id)
+                    && minecraftoss_player::food::catalog().get(&s.id).is_none()
+                    // Armor goes on; a tool's "mainhand" is no reason.
+                    && !matches!(entities.inventory.recipes.equipment_slot(s), Some("head" | "chest" | "legs" | "feet" | "body"))
+            });
+        if *bo2mc && place && used.is_none() && !offhand && entities.inventory.slots[40].is_some() {
+            diag::info!(World, "bo2mc offhand: kept, the main hand holds {}", held.as_deref().unwrap_or("nothing"));
+        }
+        if offhand {
+            let selected = entities.selected;
+            entities.inventory.slots.swap(selected, 40);
+            held = entities.inventory.slots[selected].as_ref().map(|s| s.id.clone());
+            used = held.as_deref().and_then(|item| bo2mc_world::use_item(world, shapes, entities, &player, item));
+            diag::info!(World, "bo2mc offhand: {}", held.as_deref().unwrap_or("nothing"));
+        }
+        if *bo2mc
+            && place
+            && let Some(item) = held.as_deref()
+        {
+            diag::info!(World, "bo2mc used {item}: {}", used.map_or("nothing".to_owned(), |(sound, at)| format!("{sound} at {at:?}")));
+        }
+        if let Some((sound, at)) = used {
+            hand.place_delay = place_gap;
+            hand.swing = Some(0.0);
+            if let Some(sounds) = sounds.as_mut() {
+                let centre = [at.0 as f64 + 0.5, at.1 as f64 + 0.5, at.2 as f64 + 0.5];
+                sounds.play(&world.packs, sound, Some(Vec3::from_array(sim::voxel::to_map(origin, centre))), 1.0, 1.0);
+            }
+        }
+        // Tools, food and materials never go into the world as blocks.
+        let place = place
+            && used.is_none()
+            && !(*bo2mc && held.as_deref().is_some_and(|item| !bo2mc_world::places_block(world, item)));
         // bo2mc: a door item places both halves, facing where he looks.
         let door_item = entities.inventory.slots[entities.selected]
             .as_ref()
             .map(|s| s.id.clone())
             .filter(|id| *bo2mc && id.ends_with("_door"));
-        if place && let Some(item) = door_item {
-            hand.place_delay = 4;
+        if place && build && let Some(item) = door_item {
+            hand.place_delay = place_gap;
             if let Some(hit) = player.target(&world.scene, 4.5) {
                 let (dx, dy, dz) = hit.face.offset();
                 let at = (hit.pos.0 + dx, hit.pos.1 + dy, hit.pos.2 + dz);
@@ -831,19 +1198,16 @@ fn update(
                     }
                 }
             }
-        } else if place
-            && !(*bo2mc
-                && entities.inventory.slots[entities.selected]
-                    .as_ref()
-                    .is_some_and(|s| minecraftoss_player::food::catalog().contains_key(&s.id)))
-        {
-            // (bo2mc: food is eaten, never placed.)
-            hand.place_delay = 4;
-            if let Some(pos) = player.place_selected(
-                &mut world.scene,
-                &mut entities.inventory,
-                minecraftoss_player::GameMode::Survival,
-            ) {
+        } else if place && build {
+            // (bo2mc: food is eaten, never placed; `places_block` above.)
+            hand.place_delay = place_gap;
+            // Creative keeps the stack (`place_selected` takes none).
+            let place_mode = if mode == sim::bo2mc::CREATIVE {
+                minecraftoss_player::GameMode::Creative
+            } else {
+                minecraftoss_player::GameMode::Survival
+            };
+            if let Some(pos) = player.place_selected(&mut world.scene, &mut entities.inventory, place_mode) {
                 // Not into the player's own box.
                 let [fx, fy, fz] = feet;
                 let inside = (fx - 0.3) < f64::from(pos.0 + 1)
@@ -853,7 +1217,13 @@ fn update(
                     && (fz - 0.3) < f64::from(pos.2 + 1)
                     && (fz + 0.3) > f64::from(pos.2);
                 let block = minecraft_terrain::scene::Scene::block(&world.scene, pos).cloned();
-                if inside {
+                // bo2mc: a sapling or flower needs soil under it.
+                let no_soil = *bo2mc && block.as_ref().is_some_and(|b| !bo2mc_world::has_soil(world, pos, b));
+                if *bo2mc && (inside || no_soil) {
+                    let below = minecraft_terrain::scene::Scene::block(&world.scene, (pos.0, pos.1 - 1, pos.2)).map_or("nothing".to_owned(), |b| b.id.path.clone());
+                    diag::info!(World, "bo2mc refused {} at {pos:?}: {} (on {below})", block.as_ref().map_or("?", |b| b.id.path.as_str()), if inside { "inside him" } else { "no soil" });
+                }
+                if inside || no_soil {
                     world.scene.set(pos, None);
                     if let Some(block) = block {
                         let _ = entities.inventory.add_item(
@@ -865,6 +1235,9 @@ fn update(
                     let state = world.stream.states.state_of(&block);
                     let shape = state.map_or(0, |state| shapes.shape_id(&world.registries, state));
                     sim::voxel::set_block_shape(pos.0, pos.1, pos.2, shape);
+                    if *bo2mc {
+                        bo2mc_world::note_dig_cost(world, pos, Some(&block));
+                    }
                     world.stream.record_edits(&world.scene, &[pos]);
                     world.stream.mark_edited(&world.scene, &[pos]);
                     entities.placed(&world.scene, pos);
@@ -876,6 +1249,10 @@ fn update(
                     }
                 }
             }
+        }
+        if offhand {
+            let selected = entities.selected;
+            entities.inventory.slots.swap(selected, 40);
         }
     }
 
@@ -949,11 +1326,18 @@ fn update(
                 .map(|(pos, block, _)| {
                     let tool = if hand_hits.contains(pos) { held.clone() } else { None };
                     let id = tool.as_ref().map_or("", |s| s.id.as_str());
-                    let correct = world
-                        .stream
-                        .states
-                        .state_of(block)
-                        .is_none_or(|state| bo2mc_world::tool_speed(&world.registries, state, id).1);
+                    // Snow drops snowballs only to a shovel, a cobweb its
+                    // string only to a sword or shears (vanilla
+                    // `requiresCorrectToolForDrops`).
+                    let correct = match block.id.path.as_str() {
+                        "snow" | "snow_block" => id.ends_with("_shovel"),
+                        "cobweb" => id.ends_with("_sword") || id == "minecraft:shears",
+                        _ => world
+                            .stream
+                            .states
+                            .state_of(block)
+                            .is_none_or(|state| bo2mc_world::tool_speed(&world.registries, state, id).1),
+                    };
                     if hand_hits.contains(pos) {
                         diag::info!(
                             World,
@@ -1041,6 +1425,19 @@ fn update(
             pitch: ps.viewangles[0],
         };
         let bright_outside = world.environment.sky_light_level() > 11.0;
+        if *bo2mc {
+            // Normal all day in the Overworld: daylight stops monsters
+            // spawning outside and burns the ones that burn; a Peaceful
+            // morning deleted every monster at once (his 10-08: "zombies
+            // are like just straight up disappearing when they're right
+            // next to me").
+            entities.difficulty = if sim::bo2mc::endless() { 0 } else { 2 };
+            // The dead fall as ragdolls and lie five seconds before they
+            // poof (IW4L_BO2MC_RAGDOLL=0: vanilla's tip over).
+            static CORPSE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+            let corpse = *CORPSE.get_or_init(|| if std::env::var("IW4L_BO2MC_RAGDOLL").is_ok_and(|v| v == "0") { 20 } else { 100 });
+            minecraftoss_entities::health::set_corpse_ticks(corpse);
+        }
         let ticks_before = entities.client_ticks();
         let (changes, hits) = entities.tick(dt, day.ticks as i64, bright_outside, &player);
         let mob_ticks = (entities.client_ticks() - ticks_before) as u32;
@@ -1048,12 +1445,15 @@ fn update(
             let mut positions = Vec::with_capacity(changes.len());
             for (pos, block) in changes {
                 // Mobs never change the spawn room (bo2mc).
-                if sim::bo2mc::is_protected([pos.0, pos.1, pos.2]) {
+                if sim::bo2mc::is_protected([pos.0, pos.1, pos.2]) || sim::bo2mc::zombie_proof([pos.0, pos.1, pos.2]) {
                     continue;
                 }
                 let state = block.as_ref().and_then(|b| world.stream.states.state_of(b));
                 let shape = state.map_or(0, |state| shapes.shape_id(&world.registries, state));
                 sim::voxel::set_block_shape(pos.0, pos.1, pos.2, shape);
+                if *bo2mc {
+                    bo2mc_world::note_dig_cost(world, pos, block.as_ref());
+                }
                 world.scene.set(pos, block);
                 positions.push(pos);
             }
@@ -1061,6 +1461,9 @@ fn update(
         }
         for (amount, from) in hits {
             sim::voxel::push_player_damage(local.0.0, amount, from.map(|b| sim::voxel::to_map(origin, b)));
+        }
+        if *bo2mc && alive {
+            bo2mc_world::digger_claws(&entities.diggers, feet, dt as f32);
         }
         // The inventory: MW2 guns as items, the HUD's clicks, the hotbar's
         // gun, and what the HUD shows.
@@ -1253,7 +1656,7 @@ fn update(
         sim::voxel::set_mob_boxes(entities.boxes());
         entities.tick_scene(&world.scene, mob_ticks);
         let sky_darken = (15.0 - world.environment.sky_light_level()).clamp(0.0, 15.0) as u8;
-        let meshes = entities.meshes(
+        let mut meshes = entities.meshes(
             &world.scene,
             &world.packs,
             &world.atlas,
@@ -1262,6 +1665,8 @@ fn update(
             glam::DVec3::from_array(eye),
             sky_darken,
         );
+        // Minecraft Zombies' wall signs, cut out with the mobs.
+        bo2mc_world.append_signs(&mut meshes.models, &world.atlas, light);
         let raw = |mesh: &minecraft_terrain::mesh::ChunkMesh| {
             (bytemuck::cast_slice::<_, u8>(&mesh.vertices).to_vec(), mesh.indices.clone())
         };
@@ -1328,15 +1733,15 @@ fn update(
     ];
     world
         .environment
-        .update_rain_fog(0.0, light.get(eye_block), false, (dt * 20.0) as f32);
+        .update_rain_fog(souls_level(), light.get(eye_block), true, (dt * 20.0) as f32);
     *environment_accumulator += dt;
     if !*environment_primed || *environment_accumulator >= TICK_SECONDS {
         *environment_accumulator = (*environment_accumulator % TICK_SECONDS).min(TICK_SECONDS);
         let scene = &world.scene;
         world.environment.tick(
             day.ticks.floor() as i64,
-            0.0,
-            0.0,
+            souls_level(),
+            souls_level(),
             eye,
             |x, y, z| scene.noise_biome((x, y, z)).map_or(0, |id| id.0),
             !*environment_primed,
@@ -1349,10 +1754,18 @@ fn update(
         forward,
         camera_y: eye[1] as f32,
         render_distance: VIEW_DISTANCE as u32,
-        rain_level: 0.0,
-        thunder_level: 0.0,
+        rain_level: souls_level(),
+        thunder_level: souls_level(),
     });
     let render_distance = VIEW_DISTANCE as f32 * 16.0;
+    // bo2mc's souls round: thick dark fog rolls in (Nacht der Untoten's
+    // hellhound rounds) and lifts when it is over.
+    // Minecraft's thunderstorm sky comes with it (rain and thunder levels),
+    // and the sky flashes while a Minecraft lightning bolt lives.
+    let (souls, flash) = if *bo2mc { souls_fog(sim::bo2mc::souls_fog(), dt) } else { (0.0, 0.0) };
+    let fog_tint = glam::Vec3::new(0.10, 0.11, 0.13);
+    let sky_tint = glam::Vec3::new(0.08, 0.08, 0.10);
+    let lerp = |a: f32, b: f32| a + (b - a) * souls;
     let right = forward.cross(glam::Vec3::Y).normalize_or(glam::Vec3::X);
     let up = right.cross(forward).normalize_or(glam::Vec3::Y);
     let put = |v: glam::Vec3| [v.x, v.y, v.z, 0.0];
@@ -1362,8 +1775,11 @@ fn update(
         put(right),
         put(up),
         [eye[0] as f32, eye[1] as f32, eye[2] as f32, 0.0],
-        put(sky.sky),
-        [sky.fog.x, sky.fog.y, sky.fog.z, render_distance.min(sky.sky_fog_end)],
+        put(sky.sky.lerp(sky_tint, souls).lerp(LIGHTNING, flash)),
+        {
+            let fog = sky.fog.lerp(fog_tint, souls).lerp(LIGHTNING, flash * 0.6);
+            [fog.x, fog.y, fog.z, lerp(render_distance.min(sky.sky_fog_end), SOULS_FOG_END)]
+        },
         [
             sky.sky_light_color.x,
             sky.sky_light_color.y,
@@ -1378,8 +1794,8 @@ fn update(
         [aspect, 0.0, sky.star_brightness, sky.star_angle],
         [sky.moon_phase as f32, (game_time as f32) * 0.03, 96.0, 160.0],
         [
-            sky.fog_start,
-            sky.fog_end,
+            lerp(sky.fog_start, SOULS_FOG_START),
+            lerp(sky.fog_end, SOULS_FOG_END),
             render_distance - (render_distance / 10.0).clamp(4.0, 64.0),
             render_distance,
         ],
@@ -1475,6 +1891,9 @@ fn stop(runtime: &mut Runtime, view: &mut MinecraftWorldView) {
     runtime.bo2mc = false;
     runtime.spawn_ready = false;
     runtime.bo2mc_world = Default::default();
+    runtime.travel_load = None;
+    runtime.travel_ready = None;
+    runtime.parked = None;
     if runtime.world.take().is_some() || runtime.loading.take().is_some() || view.active {
         sim::voxel::deactivate();
         view.active = false;
@@ -1544,4 +1963,29 @@ fn lightmap(environment: &[[f32; 4]; 16], sky_level: f32, block_level: f32) -> [
     let inverted = 1.0 - greatest;
     let scale = (1.0 - inverted * inverted * inverted * inverted) / greatest.max(0.00001);
     std::array::from_fn(|k| colour[k] + (colour[k] * scale - colour[k]) * gamma_mix)
+}
+
+/// The souls round's fog: where it starts and where nothing shows (blocks).
+const SOULS_FOG_START: f32 = 1.0;
+const SOULS_FOG_END: f32 = 20.0;
+
+const LIGHTNING: glam::Vec3 = glam::Vec3::new(0.85, 0.88, 1.0);
+/// How far the sky goes to `LIGHTNING` while a bolt flashes.
+const LIGHTNING_FLASH: f32 = 0.75;
+/// How far the souls fog has come in (0 to 1), as of the last frame.
+static SOULS_AMOUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn souls_level() -> f32 {
+    f32::from_bits(SOULS_AMOUNT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The souls fog's amount, rolling in or out over four seconds, and the
+/// sky flash of a Minecraft lightning bolt.
+fn souls_fog(on: bool, dt: f64) -> (f32, f32) {
+    let was = souls_level();
+    let step = (dt as f32 / 4.0).max(0.0);
+    let now = if on { (was + step).min(1.0) } else { (was - step).max(0.0) };
+    SOULS_AMOUNT.store(now.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    let flash = if crate::minecraft_lightning::sky_flash() { LIGHTNING_FLASH } else { 0.0 };
+    (now, flash)
 }

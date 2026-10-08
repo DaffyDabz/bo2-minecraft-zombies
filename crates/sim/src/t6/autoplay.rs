@@ -26,7 +26,21 @@ pub(crate) fn rounds_test() -> bool {
     *ON.get_or_init(|| std::env::var("IW4L_T6_AUTOPLAY").is_ok_and(|v| v == "2"))
 }
 
-fn look(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
+/// IW4L_T6_AUTOPLAY_SEEK=1: with none in shooting range the player turns
+/// to the nearest zombie and walks up to it (Tranzit's depot sleepers).
+fn seek() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IW4L_T6_AUTOPLAY_SEEK").is_ok_and(|v| v == "1"))
+}
+
+/// IW4L_T6_AUTOPLAY_KNIFE=1: the test player never shoots, only knifes the
+/// ones that reach it (the knife's blood gets seen every run).
+fn knife_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IW4L_T6_AUTOPLAY_KNIFE").is_ok_and(|v| v == "1"))
+}
+
+pub(super) fn look(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
     let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let yaw = d[1].atan2(d[0]).to_degrees();
     let flat = (d[0] * d[0] + d[1] * d[1]).sqrt();
@@ -82,7 +96,9 @@ pub(crate) fn drive(world: &mut World, now: i64) {
         return;
     }
     let client = ClientId(0);
-    if rounds_test() {
+    // The rounds test's gun and ammo; with IW4L_T6_AUTOPLAY_GUN named the
+    // damage-on player gets them too (a soak that lasts past round 9).
+    if rounds_test() || std::env::var_os("IW4L_T6_AUTOPLAY_GUN").is_some() {
         rounds_kit(world, now, client);
     }
     let Some(ps) = frame(world).player(client).copied() else {
@@ -134,10 +150,16 @@ pub(crate) fn drive(world: &mut World, now: i64) {
     // door and goes to buy Juggernog when it can.
     let threat = closest.is_some_and(|(d, _)| d < 400.0);
     let mc = crate::bo2mc::enabled().then(|| mc_bot(world, now, client, ps.origin, threat));
-    let view = match (target, &mc) {
-        (Some(t), _) => look(eye, t),
-        (None, Some((_, at, _))) => look(eye, *at),
-        (None, None) => ps.viewangles,
+    // None in sight: face the nearest one (Tranzit's depot zombies lie
+    // asleep until a player comes close; nothing comes to him).
+    let mut view = match (target, closest, &mc) {
+        (Some(t), _, _) => look(eye, t),
+        (None, _, Some((_, at, _))) => look(eye, *at),
+        (None, Some((_, o)), None) if seek() => {
+            let v = look(eye, [o[0], o[1], o[2] + 30.0]);
+            [0.0, v[1], 0.0]
+        }
+        _ => ps.viewangles,
     };
     let (clip, stock) = {
         let f = frame(world);
@@ -163,15 +185,33 @@ pub(crate) fn drive(world: &mut World, now: i64) {
         if fire_phase {
             press |= buttons::RELOAD;
         }
-    } else if target.is_some() && range < 450.0 && ps.f_weapon_pos_frac > 0.9 && fire_phase {
+    } else if target.is_some()
+        && range < 450.0
+        && ps.f_weapon_pos_frac > 0.9
+        && fire_phase
+        && !knife_only()
+    {
+        press |= buttons::ATTACK;
+    } else if seek()
+        && target.is_none()
+        && closest.is_some_and(|(d, _)| d < 2400.0)
+        && clip > 0
+        && now % 3000 < i64::from(crate::MATCH_TICK_MS)
+    {
+        // Nothing in sight but one near: a shot every 3 s, as a player
+        // would, wakes the sleepers a gunshot reaches (2400 units).
         press |= buttons::ATTACK;
     }
-    // Back away from one that is close.
+    // Back away from one that is close; walk up to the nearest when none
+    // is in shooting range (knifed or woken once in reach).
     let (mut forward, mut right) = (0i8, 0i8);
-    if let Some((d, o)) = closest
-        && (64.0..110.0).contains(&d)
-    {
-        let wish = [ps.origin[0] - o[0], ps.origin[1] - o[1]];
+    let walk_to = match closest {
+        Some((d, o)) if seek() && d >= 64.0 && range >= 450.0 => Some((1.0, o)),
+        Some((d, o)) if (64.0..110.0).contains(&d) => Some((-1.0, o)),
+        _ => None,
+    };
+    if let Some((sign, o)) = walk_to {
+        let wish = [(ps.origin[0] - o[0]) * -sign, (ps.origin[1] - o[1]) * -sign];
         let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt().max(1e-3);
         let (s, c) = view[1].to_radians().sin_cos();
         let (fw, rt) = ([c, s], [s, -c]);
@@ -181,6 +221,20 @@ pub(crate) fn drive(world: &mut World, now: i64) {
         (forward, right) = steer(view[1], ps.origin, goal);
         if use_ {
             press |= buttons::USE;
+        }
+    }
+    // Mob of the Dead: a ghost in Afterlife walks back to its body and
+    // holds Use on it.
+    if let Some(corpse) = super::autoplay_prison::afterlife_corpse(world, client) {
+        (press, forward, right, view) = super::autoplay_prison::revive_keys(ps.origin, eye, corpse);
+        if now % 5000 < i64::from(crate::MATCH_TICK_MS) {
+            diag::info!(
+                Sim,
+                "bo2zm t6 autoplay afterlife at {}s: at {:?} body {:?}",
+                now / 1000,
+                ps.origin.map(f32::round),
+                corpse.map(f32::round)
+            );
         }
     }
     // The view turns the way a script's setplayerangles turns it: the delta
@@ -231,11 +285,15 @@ pub(crate) fn drive(world: &mut World, now: i64) {
         .unwrap_or_default();
         diag::info!(
             Sim,
-            "bo2zm t6 autoplay at {}s: round {round}, points {score}, health {}, ammo {clip}+{stock}, zombies alive {}, in sight {}",
+            "bo2zm t6 autoplay at {}s: round {round}, points {score}, health {}, ammo {clip}+{stock}, zombies alive {}, in sight {}, at ({:.0} {:.0} {:.0}), nearest {:.0}",
             now / 1000,
             ps.health,
             living.len(),
-            seen.len()
+            seen.len(),
+            ps.origin[0],
+            ps.origin[1],
+            ps.origin[2],
+            closest.map_or(-1.0, |c| c.0)
         );
     }
 }
@@ -337,9 +395,16 @@ pub(crate) fn census_test(world: &mut World, now: i64) {
     };
     let mut last = LAST.lock().unwrap();
     let prev = last.get_or_insert_with(Default::default);
-    // Each zombie's walk/run/sprint (the scripts' zombie_move_speed).
+    // Each zombie's walk/run/sprint (the scripts' zombie_move_speed), and
+    // the script fields named in IW4L_T6_CENSUS_FIELDS=a,b,... as [a=.. b=..].
+    let extra = std::env::var("IW4L_T6_CENSUS_FIELDS").unwrap_or_default();
     let speeds: std::collections::BTreeMap<u32, String> = with_vm(world, |vm, world| {
         let f = vm.intern("zombie_move_speed");
+        let fields: Vec<(&str, _)> = extra
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(|k| (k, vm.intern(k)))
+            .collect();
         let zm = world.resource::<Zm>();
         let objs: Vec<(u32, _)> = zm
             .actors
@@ -348,7 +413,17 @@ pub(crate) fn census_test(world: &mut World, now: i64) {
             .filter_map(|(n, _)| Some((*n, zm.ents.get(n)?.obj?)))
             .collect();
         objs.into_iter()
-            .map(|(n, o)| (n, vm.to_text(&vm.raw_field(o, f))))
+            .map(|(n, o)| {
+                let mut t = vm.to_text(&vm.raw_field(o, f));
+                if !fields.is_empty() {
+                    let kv: Vec<String> = fields
+                        .iter()
+                        .map(|(k, id)| format!("{k}={}", vm.to_text(&vm.raw_field(o, *id))))
+                        .collect();
+                    t += &format!("[{}]", kv.join(" "));
+                }
+                (n, t)
+            })
             .collect()
     })
     .unwrap_or_default();
@@ -583,13 +658,49 @@ pub(crate) fn open_all_test(world: &mut World, now: i64) {
     if buy && (5000..5000 + tick).contains(&now) {
         give_points(world, 100_000);
     }
-    // One a tick from 5.5 s (a door's script waits on its own trigger).
-    if buy && (5500..8500).contains(&now) {
-        let i = ((now - 5500) / tick) as usize;
+    // One a tick from 5.5 s, or once he is in play if later (a debris
+    // pile's script refuses a buyer who isn't alive; Origins' intro keeps
+    // him a spectator past 5.5 s). Again 15 s on for those whose flag is
+    // still clear.
+    static START: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    if buy && now >= 5500 && START.load(std::sync::atomic::Ordering::Relaxed) < 0 {
+        let playing = world
+            .resource::<Zm>()
+            .players
+            .get(&0)
+            .is_some_and(|p| p.sessionstate == "playing");
+        if playing {
+            START.store(now, std::sync::atomic::Ordering::Relaxed);
+            give_points(world, 100_000);
+        }
+    }
+    let first = START.load(std::sync::atomic::Ordering::Relaxed);
+    let pass = [first, first + 15000]
+        .into_iter()
+        .find(|t| first >= 0 && (*t..*t + 3000).contains(&now));
+    if let (true, Some(start)) = (buy, pass) {
+        // The next one by entity number (a bought debris pile deletes its
+        // sibling triggers, so a list index would skip some).
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if now - start < tick {
+            NEXT.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        let next = NEXT.load(std::sync::atomic::Ordering::Relaxed);
         with_vm(world, |vm, world| {
             let (tn, flag_f) = (vm.intern("targetname"), vm.intern("script_flag"));
+            let flag_k = vm.intern("flag");
+            let flags = match vm.raw_field(vm.level, flag_k) {
+                gsc_t6::Value::Array(a) => Some(a),
+                _ => None,
+            };
+            let set = |vm: &mut gsc_t6::Vm<World>, f: &str| {
+                flags.as_ref().is_some_and(|a| {
+                    a.get(&gsc_t6::Key::Str(vm.intern(f)))
+                        .is_some_and(|v| gsc_t6::truthy(&v))
+                })
+            };
             let zm = world.resource::<Zm>();
-            let mut trigs: Vec<(u32, gsc_t6::ObjRef)> = zm
+            let mut trigs: Vec<(u32, gsc_t6::ObjRef, String)> = zm
                 .ents
                 .iter()
                 .filter(|(_, e)| e.classname.starts_with("trigger_use"))
@@ -598,14 +709,23 @@ pub(crate) fn open_all_test(world: &mut World, now: i64) {
                     let name = vm.to_text(&vm.raw_field(o, tn));
                     let flag = vm.to_text(&vm.raw_field(o, flag_f));
                     ((name == "zombie_door" || name == "zombie_debris")
-                        && (only.is_empty() || only.contains(&flag)))
-                    .then_some((*n, o))
+                        && (only.is_empty() || only.contains(&flag))
+                        && (start == first || !set(vm, &flag)))
+                    .then_some((*n, o, flag))
                 })
                 .collect();
             trigs.sort_by_key(|t| t.0);
             let player = zm.players.get(&0).map(|p| p.obj);
-            if let (Some((n, t)), Some(p)) = (trigs.get(i).copied(), player) {
-                diag::info!(Sim, "bo2zm t6 open all: buying ent{n}");
+            let state = zm.players.get(&0).map(|p| p.sessionstate.clone());
+            if let (Some((n, t, flag)), Some(p)) =
+                (trigs.iter().find(|t| t.0 >= next).cloned(), player)
+            {
+                let health = frame(world).player(ClientId(0)).map(|ps| ps.health);
+                diag::info!(
+                    Sim,
+                    "bo2zm t6 open all: buying ent{n} ({flag}); player {state:?} health {health:?}"
+                );
+                NEXT.store(n + 1, std::sync::atomic::Ordering::Relaxed);
                 // (who, force): forced, as the scripts' own open-all does.
                 vm.notify_str(
                     world,
@@ -616,6 +736,69 @@ pub(crate) fn open_all_test(world: &mut World, now: i64) {
             }
         });
     }
+    if buy && only.is_empty() && (8600..8600 + tick).contains(&now) {
+        break_sloth_barricades(world);
+    }
+}
+
+/// Buried's wooden barricades (`sloth_barricade` triggers: the church,
+/// jail, gun store, mansion lawn ...) only break for Leroy. Open them as his
+/// break does: the zone flag set, the pieces hidden by the map's own
+/// `hide_sloth_barrier`, the trigger's watcher ended.
+fn break_sloth_barricades(world: &mut World) {
+    with_vm(world, |vm, world| {
+        let (tn, tg, flag_f) = (
+            vm.intern("targetname"),
+            vm.intern("target"),
+            vm.intern("script_flag"),
+        );
+        let objs: Vec<gsc_t6::ObjRef> = world
+            .resource::<Zm>()
+            .ents
+            .values()
+            .filter_map(|e| e.obj)
+            .collect();
+        let named = |vm: &mut gsc_t6::Vm<World>, o, f| vm.to_text(&vm.raw_field(o, f));
+        let trigs: Vec<gsc_t6::ObjRef> = objs
+            .iter()
+            .copied()
+            .filter(|&o| named(vm, o, tn) == "sloth_barricade")
+            .collect();
+        let level = gsc_t6::Value::Object(vm.level);
+        for t in trigs {
+            let (flag, target) = (named(vm, t, flag_f), named(vm, t, tg));
+            diag::info!(Sim, "bo2zm t6 open all: breaking barricade ({flag})");
+            if flag != "undefined" && !flag.is_empty() {
+                let name = vm.string(&flag);
+                vm.spawn_named(
+                    world,
+                    "common_scripts/utility",
+                    "flag_set",
+                    level.clone(),
+                    vec![name],
+                );
+            }
+            for &p in &objs {
+                if !target.is_empty() && named(vm, p, tn) == target {
+                    vm.spawn_named(
+                        world,
+                        "maps/mp/zombies/_zm_ai_sloth",
+                        "hide_sloth_barrier",
+                        gsc_t6::Value::Object(p),
+                        Vec::new(),
+                    );
+                }
+            }
+            vm.notify_str(world, t, "maxis_minigame_opens_barricade", &[]);
+            vm.spawn_named(
+                world,
+                "maps/mp/zombies/_zm_ai_sloth",
+                "hide_sloth_barrier",
+                gsc_t6::Value::Object(t),
+                Vec::new(),
+            );
+        }
+    });
 }
 
 /// IW4L_T6_BUY=<wall weapon> (e.g. m14_zm): at 5 s the doors open and he
@@ -737,6 +920,11 @@ pub(crate) fn buy_test(world: &mut World, now: i64) {
     }
 }
 
+/// When the box test's clock starts (its "11.5 s"), if not at 0: Mob's
+/// door sweep once it is done.
+pub(crate) static BOX_BASE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
 /// IW4L_T6_BOX=1: the magic box. At 12 s the player gets 10000 points and
 /// is put on the active box's use side, looking at it; he presses use at
 /// 13 s (open, 950) and again at 19.5 s (take the weapon); at 22 s his
@@ -746,6 +934,12 @@ pub(crate) fn box_test(world: &mut World, now: i64) {
     if !*ON.get_or_init(|| std::env::var("IW4L_T6_BOX").is_ok_and(|v| v != "move" && v != "bear")) {
         return;
     }
+    // With Mob's door sweep the clock starts when every door is bought.
+    let base = BOX_BASE.load(std::sync::atomic::Ordering::Relaxed);
+    if base == i64::MIN && std::env::var_os("IW4L_T6_DOORS").is_some() {
+        return;
+    }
+    let now = if base == i64::MIN { now } else { now - base };
     let client = ClientId(0);
     let tick = i64::from(crate::MATCH_TICK_MS);
     if (11000..11000 + tick).contains(&now) {
@@ -809,11 +1003,35 @@ fn open_all_zones(world: &mut World) {
                 vec![name],
             );
         }
+        // Other maps: every zone in `level.zones` enabled by the zone
+        // manager's own enable_zone (Tranzit's bus stops, the box spots).
+        let zones = vm.intern("zones");
+        let names: Vec<gsc_t6::Value> = match vm.raw_field(vm.level, zones) {
+            gsc_t6::Value::Array(a) => a
+                .read()
+                .keys()
+                .filter_map(|k| match k {
+                    gsc_t6::Key::Str(s) => Some(gsc_t6::Value::Str(s)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        diag::info!(Sim, "bo2zm t6: open all zones: {} zones enabled", names.len());
+        for name in names {
+            vm.spawn_named(
+                world,
+                "maps/mp/zombies/_zm_zonemgr",
+                "enable_zone",
+                level.clone(),
+                vec![name],
+            );
+        }
     });
 }
 
 /// Player 0's points set (the scripts' `score`).
-fn give_points(world: &mut World, points: i32) {
+pub(super) fn give_points(world: &mut World, points: i32) {
     with_vm(world, |vm, world| {
         if let Some(p) = world.resource::<Zm>().players.get(&0).map(|p| p.obj) {
             let f = vm.intern("score");
@@ -944,6 +1162,426 @@ pub(crate) fn box_move_test(world: &mut World, now: i64) {
     }
 }
 
+/// IW4L_T6_KNIFE_AT=x,y,z: from 10 s, the nearest damage trigger to that
+/// spot (Nuketown's bunker hatch) is knifed once a second for 6 s, from the
+/// first clear spot 40 units round it.
+pub(crate) fn knife_at_test(world: &mut World, now: i64) {
+    static AT: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    let Some(at) = *AT.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("IW4L_T6_KNIFE_AT")
+            .ok()?
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        (v.len() == 3).then(|| [v[0], v[1], v[2]])
+    }) else {
+        return;
+    };
+    if !(10000..16000).contains(&now) {
+        return;
+    }
+    let client = ClientId(0);
+    let trig = world
+        .resource::<Zm>()
+        .ents
+        .values()
+        .filter(|e| e.classname == "trigger_damage")
+        .cloned()
+        .min_by(|a, b| {
+            let d = |e: &super::Ent| gsc_t6::math::length(gsc_t6::math::sub(e.origin, at));
+            d(a).total_cmp(&d(b))
+        });
+    let target = trig.as_ref().map_or(at, |e| super::triggers::center(world, e));
+    let Some(ps) = frame(world).player(client).copied() else {
+        return;
+    };
+    let tick = i64::from(crate::MATCH_TICK_MS);
+    if now < 10000 + tick {
+        diag::info!(Sim, "bo2zm t6 test: knife trigger at {target:?} ({:?})", trig.map(|e| e.origin));
+    }
+    let mut pick = None;
+    for a in (0..16).map(|i| (i as f32 * 22.5).to_radians()) {
+        let stand = [target[0] + a.cos() * 40.0, target[1] + a.sin() * 40.0, target[2] + 40.0];
+        let down = [stand[0], stand[1], stand[2] - 200.0];
+        let f = frame(world);
+        let t = f.trace_static_world(
+            stand,
+            down,
+            crate::bullet_collision::PLAYER_MINS,
+            crate::bullet_collision::PLAYER_MAXS,
+            crate::bullet_collision::MASK_PLAYER_SOLID,
+        );
+        if t.startsolid != 0 {
+            continue;
+        }
+        let feet: [f32; 3] = std::array::from_fn(|i| stand[i] + (down[i] - stand[i]) * t.fraction);
+        pick = Some((feet, [feet[0], feet[1], feet[2] + ps.view_height_current]));
+        break;
+    }
+    let Some((feet, eye)) = pick else { return };
+    super::teleport_player(world, client, feet);
+    super::set_player_view(world, client, look(eye, target));
+    if (now - 10000) % 1000 < tick && now >= 10500 {
+        let mut req = world.resource_mut::<crate::step::StepRequest>();
+        for (id, cmd) in &mut req.input.cmds {
+            if *id == client {
+                cmd.buttons |= weapon_iw4::BUTTON_MELEE;
+            }
+        }
+    }
+}
+
+/// IW4L_T6_VIEW=fx,fy,fz,tx,ty,tz (pictures): from 5 s the player stands
+/// with his feet at f, looking at t.
+pub(crate) fn view_test(world: &mut World, now: i64) {
+    static AT: OnceLock<Option<[f32; 6]>> = OnceLock::new();
+    let Some(v) = *AT.get_or_init(|| {
+        let v: Vec<f32> = std::env::var("IW4L_T6_VIEW")
+            .ok()?
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        (v.len() == 6).then(|| std::array::from_fn(|i| v[i]))
+    }) else {
+        return;
+    };
+    if now < 5000 {
+        return;
+    }
+    let client = ClientId(0);
+    let Some(ps) = frame(world).player(client).copied() else {
+        return;
+    };
+    let feet = [v[0], v[1], v[2]];
+    super::teleport_player(world, client, feet);
+    let eye = [feet[0], feet[1], feet[2] + ps.view_height_current];
+    super::set_player_view(world, client, look(eye, [v[3], v[4], v[5]]));
+}
+
+/// IW4L_T6_BEARS=<secs>: the hidden song's three teddy bears (zm_nuked's
+/// sndmusegg2 origins). From then, 8 s at each: the player stands 30 units
+/// off it, faces it, and holds Use for half a second 3 s in.
+pub(crate) fn bears_test(world: &mut World, now: i64) {
+    const BEARS: [[f32; 3]; 3] = [[-1998.0, 632.0, -48.0], [-80.0, 35.0, -18.0], [617.0, 313.0, 152.0]];
+    static AT: OnceLock<Option<i64>> = OnceLock::new();
+    let Some(at) = *AT.get_or_init(|| std::env::var("IW4L_T6_BEARS").ok()?.trim().parse::<i64>().ok())
+    else {
+        return;
+    };
+    let t = now - at * 1000;
+    if t < 0 || t >= 8000 * BEARS.len() as i64 {
+        return;
+    }
+    let bear = BEARS[(t / 8000) as usize];
+    let client = ClientId(0);
+    let Some(ps) = frame(world).player(client).copied() else {
+        return;
+    };
+    let feet = [bear[0] + 21.0, bear[1] + 21.0, bear[2] - 20.0];
+    super::teleport_player(world, client, feet);
+    let eye = [feet[0], feet[1], feet[2] + ps.view_height_current];
+    super::set_player_view(world, client, look(eye, bear));
+    if (3000..3500).contains(&(t % 8000)) {
+        let mut req = world.resource_mut::<crate::step::StepRequest>();
+        for (id, cmd) in &mut req.input.cmds {
+            if *id == client {
+                cmd.buttons |= buttons::USE;
+            }
+        }
+    }
+}
+
+/// IW4L_T6_PERK_DROP=1: while a perk machine is flying in, the player
+/// stands 100 units in front of where it lands, facing it (inside the
+/// landing's 300-unit knockdown).
+pub(crate) fn perk_drop_test(world: &mut World, now: i64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("IW4L_T6_PERK_DROP").is_some()) {
+        return;
+    }
+    if now % 500 >= i64::from(crate::MATCH_TICK_MS) {
+        return;
+    }
+    let spot = with_vm(world, |vm, world| {
+        let (tn, fx, pos, ang) = (
+            vm.intern("targetname"),
+            vm.intern("fx"),
+            vm.intern("original_pos"),
+            vm.intern("original_angles"),
+        );
+        world.resource::<Zm>().ents.values().find_map(|e| {
+            let o = e.obj?;
+            if !vm.to_text(&vm.raw_field(o, tn)).starts_with("vending_")
+                || matches!(vm.raw_field(o, fx), gsc_t6::Value::Undefined)
+            {
+                return None;
+            }
+            let p = vm.raw_field(o, pos).as_vec3()?;
+            // Landed: leave the player where he is.
+            if (e.origin[2] - p[2]).abs() < 30.0 {
+                return None;
+            }
+            Some((p, vm.raw_field(o, ang).as_vec3().unwrap_or([0.0; 3])))
+        })
+    })
+    .flatten();
+    let Some((pos, ang)) = spot else {
+        return;
+    };
+    // The machine's front (the script's anglestoforward(angles - (0, 90, 0))).
+    let yaw = (ang[1] - 90.0).to_radians();
+    let feet = [pos[0] + yaw.cos() * 100.0, pos[1] + yaw.sin() * 100.0, pos[2]];
+    let client = ClientId(0);
+    let Some(ps) = frame(world).player(client).copied() else {
+        return;
+    };
+    super::teleport_player(world, client, feet);
+    let eye = [feet[0], feet[1], feet[2] + ps.view_height_current];
+    super::set_player_view(world, client, look(eye, [pos[0], pos[1], pos[2] + 40.0]));
+}
+
+/// IW4L_T6_EGG1=1 (with the rounds test): the first song's egg. The player
+/// leaves the power-up behind the door (`level.door_powerup`, back each time
+/// the doomsday clock moves) until the population sign reads 15, then
+/// stands on it.
+pub(crate) fn egg1_test(world: &mut World, now: i64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    if !*ON.get_or_init(|| std::env::var_os("IW4L_T6_EGG1").is_some()) {
+        return;
+    }
+    if now % 500 >= i64::from(crate::MATCH_TICK_MS) {
+        return;
+    }
+    let spot = with_vm(world, |vm, world| {
+        let (pc, dp) = (vm.intern("population_count"), vm.intern("door_powerup"));
+        let pop = vm.raw_field(vm.level, pc).as_int().unwrap_or(-1);
+        let o = vm.raw_field(vm.level, dp).as_obj();
+        let at = o.and_then(|o| {
+            world
+                .resource::<Zm>()
+                .ents
+                .values()
+                .find(|e| e.obj == Some(o))
+                .map(|e| e.origin)
+        });
+        (pop, at)
+    });
+    let Some((pop, at)) = spot else {
+        return;
+    };
+    if LAST.swap(pop, std::sync::atomic::Ordering::Relaxed) != pop {
+        diag::info!(Sim, "bo2zm t6 egg1 test: population sign {pop}, door power-up {at:?}");
+    }
+    let (15, Some(at)) = (pop, at) else {
+        return;
+    };
+    super::teleport_player(world, ClientId(0), at);
+}
+
+/// IW4L_T6_MANNEQUIN=<n> (default 1): the breakable props (map
+/// `destructibledef` naming "male": Nuketown's mannequins) in turn. From 10 s, every 4 s
+/// the player stands 90 units in front of the next one, looks at its head
+/// and fires a tick of attack every 0.3 s for 2 s. IW4L_T6_MANNEQUIN_HOW=knife
+/// stands 45 units off and knifes it twice; =nade stands 160 off and throws a
+/// frag at its feet once (give frags with IW4L_T6_NADES).
+pub(crate) fn mannequin_test(world: &mut World, now: i64) {
+    static HOW: OnceLock<String> = OnceLock::new();
+    let how = HOW.get_or_init(|| std::env::var("IW4L_T6_MANNEQUIN_HOW").unwrap_or_default());
+    static WANT: OnceLock<Option<usize>> = OnceLock::new();
+    let Some(want) = *WANT.get_or_init(|| {
+        std::env::var("IW4L_T6_MANNEQUIN")
+            .ok()
+            .map(|v| v.parse().unwrap_or(1))
+    }) else {
+        return;
+    };
+    if now < 10000 {
+        return;
+    }
+    let slot = ((now - 10000) / 4000) as usize;
+    let within = (now - 10000) % 4000;
+    if slot >= want {
+        return;
+    }
+    let client = ClientId(0);
+    let targets: Vec<(u32, [f32; 3], f32, String)> = {
+        let zm = world.resource::<Zm>();
+        zm.ents
+            .iter()
+            .filter(|(_, e)| e.destructible.contains("male") && !e.hidden)
+            .map(|(n, e)| (*n, e.origin, e.angles[1], e.destructible.clone()))
+            .collect()
+    };
+    let Some((n, origin, yaw, def)) = targets.get(slot).cloned() else {
+        return;
+    };
+    let tick = i64::from(crate::MATCH_TICK_MS);
+    if within < tick {
+        // Its hit boxes (none = bullets pass through it).
+        let id = world.resource::<Zm>().presences.by_ent.get(&n).map(|s| s.id);
+        let model = world.resource::<Zm>().ents.get(&n).map(|e| e.model.clone()).unwrap_or_default();
+        let (row, destr, bones) = id.map_or((false, false, 0), |id| {
+            let f = frame(world);
+            let row = f
+                .entity_collision_capabilities()
+                .iter()
+                .find(|row| row.owner.script_model() == Some(id));
+            let dobj = row.and_then(|r| r.dobj.as_ref());
+            if let Some(d) = dobj {
+                diag::info!(
+                    Sim,
+                    "bo2zm t6 test: mannequin dobj cap={} contents={:?} coll={} err={:?} surfs={:?}",
+                    d.capability.is_some(),
+                    d.capability.as_ref().map(|c| c.contents),
+                    d.current_collision.is_some(),
+                    d.materialize_error,
+                    d.capability.as_ref().map(|c| c
+                        .coll_surfs
+                        .iter()
+                        .map(|s| (s.bone, s.contents, s.surf_flags, s.tris.len()))
+                        .collect::<Vec<_>>())
+                );
+            }
+            (
+                row.is_some(),
+                dobj.is_some_and(|d| d.t5_destructible.is_some()),
+                dobj.and_then(|d| d.current_collision.as_ref())
+                    .map_or(0, |c| c.bones.len()),
+            )
+        });
+        diag::info!(
+            Sim,
+            "bo2zm t6 test: mannequin {}/{} ent{n} {def} at ({:.0} {:.0} {:.0}) presence={} row={row} destructible={destr} boxes={bones} model={}",
+            slot + 1,
+            targets.len(),
+            origin[0],
+            origin[1],
+            origin[2],
+            id.is_some(),
+            model
+        );
+    }
+    let Some(ps) = frame(world).player(client).copied() else {
+        return;
+    };
+    // Its head piece's box (the bone named for the head).
+    let head = world
+        .resource::<Zm>()
+        .presences
+        .by_ent
+        .get(&n)
+        .map(|s| s.id)
+        .and_then(|id| {
+            let f = frame(world);
+            let d = f
+                .entity_collision_capabilities()
+                .iter()
+                .find(|row| row.owner.script_model() == Some(id))?
+                .dobj
+                .as_ref()?;
+            let names = &d.capability.as_ref()?.pose.bone_names;
+            d.current_collision
+                .as_ref()?
+                .bones
+                .iter()
+                .find(|b| names.get(usize::from(b.bone)).is_some_and(|nm| nm.contains("head")))
+                .map(|b| b.center)
+        })
+        .or_else(|| head_of(world, n, true))
+        .unwrap_or([origin[0], origin[1], origin[2] + 60.0]);
+    // The first spot round it (in front first) with a clear line to its
+    // head.
+    let mut pick = None;
+    for (i, off) in [0.0f32, 180.0, 90.0, 270.0, 45.0, 315.0, 135.0, 225.0]
+        .into_iter()
+        .enumerate()
+    {
+        let a = (yaw + off).to_radians();
+        let reach = match how.as_str() {
+            "knife" => 45.0,
+            "nade" => 160.0,
+            _ => 90.0,
+        };
+        let stand = [origin[0] + a.cos() * reach, origin[1] + a.sin() * reach, origin[2] + 40.0];
+        let down = [stand[0], stand[1], stand[2] - 200.0];
+        let f = frame(world);
+        let t = f.trace_static_world(
+            stand,
+            down,
+            crate::bullet_collision::PLAYER_MINS,
+            crate::bullet_collision::PLAYER_MAXS,
+            crate::bullet_collision::MASK_PLAYER_SOLID,
+        );
+        let feet: [f32; 3] = std::array::from_fn(|i| stand[i] + (down[i] - stand[i]) * t.fraction);
+        let eye = [feet[0], feet[1], feet[2] + ps.view_height_current];
+        let sight = f.trace_static_world(
+            eye,
+            head,
+            [0.0; 3],
+            [0.0; 3],
+            crate::bullet_collision::MASK_BULLET_WORLD,
+        );
+        if t.startsolid != 0 || sight.fraction < 0.98 {
+            if i == 0 {
+                pick = Some((feet, eye));
+            }
+            continue;
+        }
+        pick = Some((feet, eye));
+        break;
+    }
+    let Some((feet, eye)) = pick else { return };
+    super::teleport_player(world, client, feet);
+    let aim = if how == "nade" { [origin[0], origin[1], origin[2] + 8.0] } else { head };
+    // IW4L_T6_MANNEQUIN_LOOK=floor: from 2.5 s on, look where its thrown
+    // head or arm landed.
+    static FLOOR: OnceLock<bool> = OnceLock::new();
+    if *FLOOR.get_or_init(|| std::env::var("IW4L_T6_MANNEQUIN_LOOK").is_ok_and(|v| v == "floor"))
+        && within >= 2500
+    {
+        // The newest thrown piece, else its feet.
+        let piece = {
+            let zm = world.resource::<Zm>();
+            zm.gibs.last().and_then(|(g, _)| zm.ents.get(g)).map(|e| e.origin)
+        };
+        super::set_player_view(world, client, look(eye, piece.unwrap_or(origin)));
+        return;
+    }
+    super::set_player_view(world, client, look(eye, aim));
+    if how == "knife" || how == "nade" {
+        let press = if how == "knife" {
+            (within % 1000 < tick && (500..2500).contains(&within))
+                .then_some(weapon_iw4::BUTTON_MELEE)
+        } else {
+            (500..700).contains(&within).then_some(buttons::FRAG)
+        };
+        if let Some(press) = press {
+            let mut req = world.resource_mut::<crate::step::StepRequest>();
+            for (id, cmd) in &mut req.input.cmds {
+                if *id == client {
+                    cmd.buttons |= press;
+                }
+            }
+        }
+        return;
+    }
+    if (500..2500).contains(&within) && within % 300 < tick {
+        {
+            let mut f = frame(world);
+            if let Some(w) = f.player(client).map(|p| p.weapon) {
+                crate::script_player::set_ammo_clip(&mut f, client, w, 8);
+            }
+        }
+        let mut req = world.resource_mut::<crate::step::StepRequest>();
+        for (id, cmd) in &mut req.input.cmds {
+            if *id == client {
+                cmd.buttons |= buttons::ATTACK;
+            }
+        }
+    }
+}
+
 /// IW4L_T6_DWTEST=<weapon> (e.g. fivesevendw_zm): a dual-wield check. At 8 s
 /// the weapon is given; from 12 s, one tick of attack (the left gun) every
 /// 0.5 s for 2 s, then one tick of the aim button (the right gun) every
@@ -1026,6 +1664,39 @@ pub(crate) fn dual_wield_test(world: &mut World, now: i64) {
                 ps.weap_anim_secondary
             );
         }
+    }
+}
+
+/// IW4L_T6_AMMOLOG=1: the held weapon's clips (right, left) and stock,
+/// logged whenever they change.
+pub(crate) fn ammo_log(world: &mut World) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("IW4L_T6_AMMOLOG").is_ok()) {
+        return;
+    }
+    static LAST: std::sync::Mutex<(u32, i32, i32, i32)> = std::sync::Mutex::new((0, -1, -1, -1));
+    let client = ClientId(0);
+    let f = frame(world);
+    let Some(ps) = f.player(client) else { return };
+    let w = ps.weapon;
+    let now = (
+        w,
+        crate::script_player::ammo_clip(&f, client, w),
+        crate::script_player::left_clip(&f, client, w),
+        crate::script_player::ammo_stock(&f, client, w),
+    );
+    if let Ok(mut last) = LAST.lock()
+        && *last != now
+    {
+        diag::info!(
+            Sim,
+            "bo2zm ammo: {} right {} left {} stock {}",
+            crate::script_player::weapon_name(&f, w),
+            now.1,
+            now.2,
+            now.3
+        );
+        *last = now;
     }
 }
 
@@ -1389,28 +2060,31 @@ pub(crate) fn floor_map(world: &mut World, now: i64) {
     }
 }
 
-/// IW4L_T6_WALK="x y z yaw secs": at 12 s the player stands at x y z facing
-/// yaw, then walks forward for secs; his place is logged every 250 ms (does
-/// a door or debris stop him).
+/// IW4L_T6_WALK="x y z yaw secs [at]": at 12 s (or `at` s) the player
+/// stands at x y z facing yaw, then walks forward for secs; his place is
+/// logged every 250 ms (does a door or debris stop him).
 pub(crate) fn walk_test(world: &mut World, now: i64) {
-    static WANT: OnceLock<Option<[f32; 5]>> = OnceLock::new();
-    let Some([x, y, z, yaw, secs]) = *WANT.get_or_init(|| {
+    static WANT: OnceLock<Option<[f32; 6]>> = OnceLock::new();
+    let Some([x, y, z, yaw, secs, at]) = *WANT.get_or_init(|| {
         let v: Vec<f32> = std::env::var("IW4L_T6_WALK")
             .ok()?
             .split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect();
-        (v.len() == 5).then(|| [v[0], v[1], v[2], v[3], v[4]])
+        (v.len() == 5 || v.len() == 6)
+            .then(|| [v[0], v[1], v[2], v[3], v[4], v.get(5).copied().unwrap_or(12.0)])
     }) else {
         return;
     };
     let client = ClientId(0);
     let tick = i64::from(crate::MATCH_TICK_MS);
-    if (12000..12000 + tick).contains(&now) {
+    let t0 = (at * 1000.0) as i64;
+    // "0 0 0": he walks from where he stands.
+    if (t0..t0 + tick).contains(&now) && [x, y, z] != [0.0; 3] {
         super::teleport_player(world, client, [x, y, z]);
         super::set_player_view(world, client, [0.0, yaw, 0.0]);
     }
-    let end = 12300 + (secs * 1000.0) as i64;
+    let end = t0 + 300 + (secs * 1000.0) as i64;
     // IW4L_T6_WALK_CLIENT: the console's +forward walks him instead (his
     // client predicts the walk: does it clip as the server does).
     let pushed = std::env::var_os("IW4L_T6_WALK_CLIENT").is_none();
@@ -1418,8 +2092,8 @@ pub(crate) fn walk_test(world: &mut World, now: i64) {
     let jump_at = std::env::var("IW4L_T6_WALK_JUMP")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
-        .map(|ms| 12300 + ms);
-    if pushed && (12300..end).contains(&now) {
+        .map(|ms| t0 + 300 + ms);
+    if pushed && (t0 + 300..end).contains(&now) {
         let jump = jump_at.is_some_and(|t| (t..t + 100).contains(&now));
         let mut req = world.resource_mut::<crate::step::StepRequest>();
         for (id, cmd) in &mut req.input.cmds {
@@ -1458,7 +2132,7 @@ pub(crate) fn walk_test(world: &mut World, now: i64) {
             }
         }
     }
-    if (12000..end + 1500).contains(&now) && (now - 12000) % 250 < tick {
+    if (t0..end + 1500).contains(&now) && (now - t0) % 250 < tick {
         if let Some(ps) = frame(world).player(client) {
             diag::info!(
                 Sim,
@@ -1476,6 +2150,16 @@ pub(crate) fn walk_test(world: &mut World, now: i64) {
 pub(crate) fn face_test(world: &mut World) {
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("IW4L_T6_FACE").is_some()) {
+        return;
+    }
+    // IW4L_T6_FACE_STOP=<seconds>: then the view holds where it was (to
+    // watch what happens to the zombie it was on).
+    static STOP: OnceLock<Option<i64>> = OnceLock::new();
+    let stop = *STOP.get_or_init(|| {
+        let s = std::env::var("IW4L_T6_FACE_STOP").ok()?;
+        Some((s.trim().parse::<f32>().ok()? * 1000.0) as i64)
+    });
+    if stop.is_some_and(|s| world.resource::<Zm>().now_ms >= s) {
         return;
     }
     let client = ClientId(0);
@@ -1657,6 +2341,32 @@ pub(crate) fn sprint_log(world: &mut World, now: i64) {
     }
 }
 
+/// IW4L_T6_PRESS="<frag|smoke> <seconds>": then that grenade button is held
+/// for 200 ms (the throw a player's G or 4 key makes).
+pub(crate) fn press_test(world: &mut World, now: i64) {
+    static WANT: OnceLock<Option<(u32, i64)>> = OnceLock::new();
+    let Some((button, at)) = *WANT.get_or_init(|| {
+        let v = std::env::var("IW4L_T6_PRESS").ok()?;
+        let (b, t) = v.trim().split_once(' ')?;
+        let b = match b {
+            "frag" => buttons::FRAG,
+            "smoke" => buttons::SMOKE,
+            _ => return None,
+        };
+        Some((b, (t.trim().parse::<f32>().ok()? * 1000.0) as i64))
+    }) else {
+        return;
+    };
+    if (at..at + 200).contains(&now) {
+        let mut req = world.resource_mut::<crate::step::StepRequest>();
+        for (id, cmd) in &mut req.input.cmds {
+            if *id == ClientId(0) {
+                cmd.buttons |= button;
+            }
+        }
+    }
+}
+
 /// IW4L_T6_NADES=<seconds>: then two frag grenades in his hand (BO2 gives
 /// none on round 1; a test of the throw key without playing a round).
 pub(crate) fn nades_test(world: &mut World, now: i64) {
@@ -1725,26 +2435,48 @@ pub(crate) fn down_test(world: &mut World, now: i64) {
     }
 }
 
-/// IW4L_T6_PERK=<machine targetname> (e.g. vending_revive, or `landed`
-/// for the lowest machine): at 42 s (the
+/// When the perk test's clock starts (its "42 s"), if not at 0: `landed`, or
+/// Mob's shock test once the box is on and he is up again.
+pub(crate) static PERK_BASE: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(i64::MIN);
+
+/// IW4L_T6_PERK=<machine targetname>[@<seconds>] (e.g. vending_revive, or
+/// `landed` for the lowest machine): at 42 s (the
 /// first perk has landed) the player gets 10000 points and stands 40 units
 /// in front of the machine, looking at it; he presses use at 43 s; at 50 s
-/// his perks, weapons and points are logged.
+/// his perks, weapons and points are logged. `@<seconds>` starts it then
+/// instead of at 42 s (after a power test).
 pub(crate) fn perk_test(world: &mut World, now: i64) {
-    static WANT: OnceLock<Option<String>> = OnceLock::new();
-    let Some(want) = WANT
-        .get_or_init(|| std::env::var("IW4L_T6_PERK").ok())
+    static WANT: OnceLock<Option<(String, i64)>> = OnceLock::new();
+    let Some((want, shift)) = WANT
+        .get_or_init(|| {
+            let v = std::env::var("IW4L_T6_PERK").ok()?;
+            Some(match v.split_once('@') {
+                Some((n, s)) => (
+                    n.to_owned(),
+                    s.parse::<f32>().map_or(0, |s| (s * 1000.0) as i64 - 42000),
+                ),
+                None => (v, 0),
+            })
+        })
         .clone()
     else {
         return;
     };
+    let now = now - shift;
     let client = ClientId(0);
     let tick = i64::from(crate::MATCH_TICK_MS);
     // "landed": the test starts once a perk machine is on the ground
     // (Nuketown drops them from the sky, the first some time into round 1):
     // its times count from then as if it were 42 s.
-    static BASE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
-    if want == "landed" && BASE.load(std::sync::atomic::Ordering::Relaxed) == i64::MIN {
+    let base = &PERK_BASE;
+    // With Mob's shock test the clock starts when that test is done.
+    if std::env::var_os("IW4L_T6_SHOCK").is_some()
+        && base.load(std::sync::atomic::Ordering::Relaxed) == i64::MIN
+    {
+        return;
+    }
+    if want == "landed" && base.load(std::sync::atomic::Ordering::Relaxed) == i64::MIN {
         if now < 42000 || now % 1000 >= tick {
             return;
         }
@@ -1764,9 +2496,9 @@ pub(crate) fn perk_test(world: &mut World, now: i64) {
         if low > 150.0 {
             return;
         }
-        BASE.store(now - 42000, std::sync::atomic::Ordering::Relaxed);
+        base.store(now - 42000, std::sync::atomic::Ordering::Relaxed);
     }
-    let base = BASE.load(std::sync::atomic::Ordering::Relaxed);
+    let base = base.load(std::sync::atomic::Ordering::Relaxed);
     let now = if base == i64::MIN { now } else { now - base };
     if (42000..42000 + tick).contains(&now) {
         let machine = with_vm(world, |vm, world| {
@@ -1866,7 +2598,7 @@ pub(crate) fn perk_test(world: &mut World, now: i64) {
 }
 
 /// An entity's object by a key's value (`targetname`, `script_noteworthy`).
-fn ent_by(
+pub(crate) fn ent_by(
     world: &mut World,
     key: &str,
     value: &str,
@@ -1886,11 +2618,21 @@ fn ent_by(
 /// by the game's own `bring_perk`; at 90 s the player, given 10000 points,
 /// stands at it and uses it with his gun; at 100 s he takes the upgraded
 /// gun back; at 106 s his weapons and points are logged.
+/// IW4L_T6_PAP=@<seconds>: a machine already there (Tranzit's is built):
+/// no bringing, he uses it at that time instead of 90 s.
 pub(crate) fn pap_test(world: &mut World, now: i64) {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("IW4L_T6_PAP").is_ok()) {
+    static ON: OnceLock<Option<i64>> = OnceLock::new();
+    let Some(shift) = *ON.get_or_init(|| {
+        let v = std::env::var("IW4L_T6_PAP").ok()?;
+        Some(
+            v.strip_prefix('@')
+                .and_then(|s| s.parse::<f32>().ok())
+                .map_or(0, |s| (s * 1000.0) as i64 - 90000),
+        )
+    }) else {
         return;
-    }
+    };
+    let now = now - shift;
     let client = ClientId(0);
     let tick = i64::from(crate::MATCH_TICK_MS);
     let machine = |world: &mut World| {
@@ -1903,7 +2645,7 @@ pub(crate) fn pap_test(world: &mut World, now: i64) {
         Some((trigger, m, origin, angles))
     };
     // bo2mc: the machine stands in the spawn room from the start.
-    if (25000..25000 + tick).contains(&now) && !crate::bo2mc::enabled() {
+    if shift == 0 && (25000..25000 + tick).contains(&now) && !crate::bo2mc::enabled() {
         let Some((trigger, m, _, _)) = machine(world) else {
             diag::warn!(Sim, "bo2zm t6 pap test: no machine");
             return;
@@ -2280,4 +3022,245 @@ fn orbit_look(world: &mut World, deg: f32) {
     let eye = [feet[0], feet[1], feet[2] + ps.view_height_current];
     super::teleport_player(world, client, feet);
     super::set_player_view(world, client, look(eye, head));
+}
+
+/// IW4L_T6_USE=<targetname>[:<seconds>] (default 10 s): at that time the
+/// player gets 10000 points and stands 40 units from the first use trigger
+/// with that targetname (on the first open side with a floor), looking at
+/// it; he holds use 1 s later for 0.5 s. `<seconds>+<again>+...`: he holds
+/// use again <again> s after he was placed, fires 3 s later for 2 s, and his
+/// weapons with their clips are logged before and after the shots (Pack-a-
+/// Punch: take the upgraded gun, fire it). IW4L_T6_USE_FLAG=<flag>: that
+/// level flag is logged 1 s before and 3 s after (a power switch's power_on).
+pub(crate) fn use_test(world: &mut World, now: i64) {
+    type Want = (String, Option<String>, i64, Vec<i64>);
+    static WANT: OnceLock<Vec<Want>> = OnceLock::new();
+    let list = WANT.get_or_init(|| {
+        std::env::var("IW4L_T6_USE")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let (name, secs) = v.split_once(':').unwrap_or((v, "10"));
+                let (name, note) = match name.split_once('/') {
+                    Some((n, k)) => (n.to_owned(), Some(k.to_owned())),
+                    None => (name.to_owned(), None),
+                };
+                let ms = |v: &str| (v.parse::<f32>().unwrap_or(10.0) * 1000.0) as i64;
+                let mut secs = secs.split('+');
+                let at = ms(secs.next().unwrap_or("10"));
+                (name, note, at, secs.map(ms).collect())
+            })
+            .collect()
+    });
+    for (want, note, at, again) in list {
+        use_one(world, now, want, note.as_deref(), *at, again);
+    }
+}
+
+fn use_one(world: &mut World, now: i64, want: &str, note: Option<&str>, at: i64, again: &[i64]) {
+    let client = ClientId(0);
+    let tick = i64::from(crate::MATCH_TICK_MS);
+    let log_flag = |world: &mut World, when: &str| {
+        let Ok(flag) = std::env::var("IW4L_T6_USE_FLAG") else {
+            return;
+        };
+        let on = with_vm(world, |vm, _| {
+            let (f, k) = (vm.intern("flag"), vm.intern(&flag));
+            match vm.raw_field(vm.level, f) {
+                gsc_t6::Value::Array(a) => a.get(&gsc_t6::Key::Str(k)).is_some_and(|v| gsc_t6::truthy(&v)),
+                _ => false,
+            }
+        })
+        .unwrap_or(false);
+        diag::info!(Sim, "bo2zm t6 use test {when}: flag {flag} {on}");
+    };
+    if (at - 1000..at - 1000 + tick).contains(&now) {
+        log_flag(world, "before");
+    }
+    // When he was put by it (it may be moving, as in an elevator: tried each
+    // tick for 15 s).
+    static PLACED: std::sync::Mutex<Vec<(String, i64)>> = std::sync::Mutex::new(Vec::new());
+    let key = format!("{want}/{}", note.unwrap_or(""));
+    let placed = |key: &str| {
+        PLACED.lock().ok().and_then(|l| l.iter().find(|(k, _)| k == key).map(|p| p.1))
+    };
+    if (at..at + tick).contains(&now) {
+        give_points(world, 10000);
+    }
+    if (at..at + 15000).contains(&now) && placed(&key).is_none() {
+        let trig = with_vm(world, |vm, world| {
+            let (tn, sn) = (vm.intern("targetname"), vm.intern("script_noteworthy"));
+            world
+                .resource::<Zm>()
+                .ents
+                .values()
+                .find(|e| {
+                    // Any trigger: a use press in a plain one does nothing
+                    // (Die Rise's escape pod: standing in it is the test).
+                    super::triggers::kind(&e.classname).is_some()
+                        && e.obj.is_some_and(|o| {
+                            vm.to_text(&vm.raw_field(o, tn)) == want
+                                && note.is_none_or(|k| vm.to_text(&vm.raw_field(o, sn)) == k)
+                        })
+                })
+                .cloned()
+        })
+        .flatten();
+        let Some(trig) = trig else {
+            if now + tick < at + 15000 {
+                return;
+            }
+            diag::warn!(Sim, "bo2zm t6 use test: no use trigger {want}");
+            return;
+        };
+        let c = super::triggers::center(world, &trig);
+        let (mins, maxs, mask) = (
+            crate::bullet_collision::PLAYER_MINS,
+            crate::bullet_collision::PLAYER_MAXS,
+            crate::bullet_collision::MASK_PLAYER_SOLID,
+        );
+        // Its centre, else the nearest of 8 sides (16..56 units out) the
+        // player fits on, over a floor (an elevator's too), touching the
+        // trigger (Die Rise's escape pod trigger: only its inside has room).
+        let feet = [0.0f32, 16.0, 24.0, 32.0, 40.0, 56.0].into_iter().find_map(|r| {
+            (0..8).find_map(|i| {
+                let a = (i as f32) * std::f32::consts::FRAC_PI_4;
+                let from = [c[0], c[1], c[2] + 10.0];
+                let to = [c[0] + r * a.cos(), c[1] + r * a.sin(), c[2] + 10.0];
+                let down = [to[0], to[1], to[2] - 160.0];
+                let feet: [f32; 3] = {
+                    let f = frame(world);
+                    // A centre inside something solid (a perk machine's
+                    // own collision) only rules out walls between.
+                    let side = f.trace_world(from, to, mins, maxs, mask);
+                    if side.fraction < 1.0 && side.startsolid == 0 {
+                        return None;
+                    }
+                    let t = f.trace_world(to, down, mins, maxs, mask);
+                    if t.fraction >= 1.0 || t.startsolid != 0 {
+                        return None;
+                    }
+                    std::array::from_fn(|k| to[k] + (down[k] - to[k]) * t.fraction)
+                };
+                let lo = std::array::from_fn(|k| feet[k] + mins[k]);
+                let hi = std::array::from_fn(|k| feet[k] + maxs[k]);
+                super::triggers::touches(world, &trig, lo, hi).then_some(feet)
+            })
+        });
+        let Some(feet) = feet else {
+            if now + tick < at + 15000 {
+                return;
+            }
+            diag::warn!(Sim, "bo2zm t6 use test: no room by {want} at ({:.0} {:.0} {:.0})", c[0], c[1], c[2]);
+            return;
+        };
+        if let Ok(mut l) = PLACED.lock() {
+            l.push((key.clone(), now));
+        }
+        let eye = [feet[0], feet[1], feet[2] + 60.0];
+        super::teleport_player(world, client, feet);
+        super::set_player_view(world, client, look(eye, c));
+        diag::info!(
+            Sim,
+            "bo2zm t6 use test: {want} {} brush {:?} radius {} box {:?} at ({:.0} {:.0} {:.0}); player at ({:.0} {:.0} {:.0})",
+            trig.classname,
+            trig.brush,
+            trig.radius,
+            trig.box_dims,
+            c[0],
+            c[1],
+            c[2],
+            feet[0],
+            feet[1],
+            feet[2]
+        );
+    }
+    let Some(at) = placed(&key) else {
+        return;
+    };
+    if (at + 800..at + 800 + tick).contains(&now) {
+        let hint = world.resource::<Zm>().hints.get(&0).cloned().unwrap_or_default();
+        diag::info!(Sim, "bo2zm t6 use test: hint {hint:?}");
+    }
+    if (at + 1000..at + 1500).contains(&now) {
+        press_use(world, client);
+    }
+    if [4000, 8000].iter().any(|d| (at + d..at + d + tick).contains(&now)) {
+        log_flag(world, "after");
+        let names: Vec<String> = {
+            let f = frame(world);
+            crate::script_player::weapons(&f, client, crate::script_player::WeaponList::All)
+                .into_iter()
+                .map(|w| crate::script_player::weapon_name(&f, w))
+                .collect()
+        };
+        let score = frame(world).client_meta(client).map_or(0, |m| m.score);
+        diag::info!(Sim, "bo2zm t6 use test {want} after: points {score}, weapons {names:?}");
+    }
+    for &d in again {
+        if (at + d - 200..at + d - 200 + tick).contains(&now) {
+            let hint = world.resource::<Zm>().hints.get(&0).cloned().unwrap_or_default();
+            diag::info!(Sim, "bo2zm t6 use test: hint again {hint:?}");
+        }
+        if (at + d..at + d + 500).contains(&now) {
+            press_use(world, client);
+        }
+        for (dt, when) in [(2800, "before shots"), (5500, "after shots")] {
+            if (at + d + dt..at + d + dt + tick).contains(&now) {
+                let clips: Vec<(String, i32)> = {
+                    let f = frame(world);
+                    crate::script_player::weapons(&f, client, crate::script_player::WeaponList::All)
+                        .into_iter()
+                        .map(|w| {
+                            let n = crate::script_player::weapon_name(&f, w);
+                            (n, crate::script_player::ammo_clip(&f, client, w))
+                        })
+                        .collect()
+                };
+                diag::info!(Sim, "bo2zm t6 use test {want} again {when}: clips {clips:?}");
+            }
+        }
+        if (at + d + 3000..at + d + 5000).contains(&now) {
+            let mut req = world.resource_mut::<crate::step::StepRequest>();
+            for (id, cmd) in &mut req.input.cmds {
+                if *id == client {
+                    cmd.buttons |= buttons::ATTACK;
+                }
+            }
+        }
+    }
+}
+
+/// IW4L_T6_ENTLOG=<targetname>[,...]: every 5 s each entity with that
+/// targetname logs its origin (Die Rise's escape pod going down and back).
+pub(crate) fn ent_log(world: &mut World, now: i64) {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        std::env::var("IW4L_T6_ENTLOG")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
+    if names.is_empty() || now % 5000 >= i64::from(crate::MATCH_TICK_MS) {
+        return;
+    }
+    let found = with_vm(world, |vm, world| {
+        let tn = vm.intern("targetname");
+        world
+            .resource::<Zm>()
+            .ents
+            .iter()
+            .filter_map(|(n, e)| {
+                let name = vm.to_text(&vm.raw_field(e.obj?, tn));
+                names.contains(&name).then(|| (name, *n, e.origin))
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    for (name, n, o) in found {
+        diag::info!(Sim, "bo2zm t6 entlog {}s: {name} ent{n} at ({:.0} {:.0} {:.0})", now / 1000, o[0], o[1], o[2]);
+    }
 }

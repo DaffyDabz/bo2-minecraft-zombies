@@ -330,7 +330,7 @@ fn run_players_system(ecs: &mut World) {
             let (melee_delay_ms, melee_charge_delay_ms) = facts
                 .map(|f| (f.melee_delay_ms, f.melee_charge_delay_ms))
                 .unwrap_or((0, 0));
-            let context = pmove_context(
+            let mut context = pmove_context(
                 old_buttons,
                 scales,
                 ads_allowed,
@@ -350,6 +350,13 @@ fn run_players_system(ecs: &mut World) {
                     .and_then(|m| m.shellshock.as_ref())
                     .is_some_and(|shock| shock.movement),
             );
+            // bo2mc: Stamin-Up sprints twice as long and moves 7% faster.
+            if ps.perks[0] & weapon_iw4::bo2_perks::PERK_BO2_LONGERSPRINT != 0 {
+                context.sprint.weapon_max_sprint_time = (context.sprint.weapon_max_sprint_time
+                    * weapon_iw4::bo2_perks::LONGERSPRINT_SPRINT_SCALE)
+                    .min(0x3fff);
+                context.walk.weapon_move_scale *= weapon_iw4::bo2_perks::LONGERSPRINT_MOVE_SCALE;
+            }
             crate::script::player_commands(world.ecs(), id.0, cmd.buttons, old_buttons);
             let mut cmd = *cmd;
             crate::script_player::constrain_cmd(&mut world, *id, &mut cmd);
@@ -385,6 +392,9 @@ fn run_players_system(ecs: &mut World) {
                 blockers: &blockers,
                 model_brushes: &model_brushes,
             };
+            if crate::voxel::PROBE_EXTRA.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                probe_extra_collision(&backend);
+            }
             let script = world.player_anim_script();
             let mantle = world.xanims();
             let (
@@ -409,6 +419,20 @@ fn run_players_system(ecs: &mut World) {
                     ps.pm_flags &= !playerstate_iw4::pm_flags::SHELLSHOCKED;
                 }
                 let moved_from = ps.origin;
+                // Minecraft Zombies: swimming in Minecraft water.
+                let swim = crate::bo2mc::enabled().then(crate::bo2mc::player_water).filter(|w| w.0);
+                let dry = (ps.gravity, ps.speed);
+                // Minecraft Zombies: creative's flight (double tap Jump) and the spectator's.
+                crate::bo2mc::creative_jump(cmd.buttons & buttons::JUMP != 0, cmd.server_time);
+                let fly = crate::bo2mc::flying();
+                let swim = swim.filter(|_| !fly);
+                if fly {
+                    ps.gravity = 0;
+                }
+                if swim.is_some() {
+                    ps.gravity = crate::bo2mc::SWIM_GRAVITY;
+                    ps.speed = dry.1 / 2;
+                }
                 let result = pmove(
                     ps,
                     &mut cmd,
@@ -417,6 +441,14 @@ fn run_players_system(ecs: &mut World) {
                     mantle.as_ref(),
                     mantle.as_ref(),
                 );
+                if let Some((_, eye_wet)) = swim {
+                    (ps.gravity, ps.speed) = dry;
+                    swim_move(ps, &cmd, eye_wet);
+                }
+                if fly {
+                    ps.gravity = dry.0;
+                    fly_move(ps, &cmd, result.pml.msec, moved_from);
+                }
                 let pml = result.pml;
                 let anim_movetype = pml.mantle_movetype.or_else(|| {
                     footsteps_anim_move_type(
@@ -1917,6 +1949,68 @@ fn clip_move_to_blockers(
     hit
 }
 
+/// bo2mc test: walks a player-wide box a cell east and a cell north from
+/// every cell round the house and logs what stops it that is not a block
+/// (BO2 entity brushes, model brushes, turned boxes).
+fn probe_extra_collision(backend: &ClipBackend<'_>) {
+    let (mut free, mut extra) = (0, 0);
+    for dx in -30..=70 {
+        for dz in -26..=14 {
+            for dy in 0..=3 {
+                let c = [dx as f32 * 36.0, -(dz as f32) * 36.0, dy as f32 * 36.0 + 18.0];
+                for (dir, step) in [("east", [36.0, 0.0]), ("south", [0.0, -36.0])] {
+                    let input = GroundTraceInput {
+                        start: c,
+                        end: [c[0] + step[0], c[1] + step[1], c[2]],
+                        mins: [-15.0, -15.0, -8.0],
+                        maxs: [15.0, 15.0, 8.0],
+                        tracemask: crate::bullet_collision::MASK_PLAYER_SOLID,
+                    };
+                    let world_hit = clip_trace(
+                        backend.brushes,
+                        backend.bsp,
+                        backend.mesh,
+                        input.start,
+                        input.end,
+                        input.mins,
+                        input.maxs,
+                        input.tracemask,
+                        &|_| true,
+                    );
+                    if world_hit.startsolid != 0 || world_hit.fraction < 1.0 {
+                        continue;
+                    }
+                    free += 1;
+                    let bm = clip_move_to_bmodels(world_hit, backend.cmodels, &backend.bsp.leafbrushes, backend.brushes, backend.linked_brushes, input);
+                    let md = clip_move_to_model_brushes(bm, backend.model_brushes, input);
+                    let bl = clip_move_to_blockers(md, backend.blockers, input);
+                    let layer = if bm.fraction < 1.0 {
+                        "entity brush"
+                    } else if md.fraction < 1.0 {
+                        "model brush"
+                    } else if bl.fraction < 1.0 {
+                        "turned box"
+                    } else {
+                        continue;
+                    };
+                    extra += 1;
+                    if extra <= 60 {
+                        diag::info!(World, "bo2mc extra collision: cell ({dx}, {dy}, {dz}) going {dir} stops at {:.2} on {layer} (entity {})", bl.fraction, bl.hit_id);
+                    }
+                }
+            }
+        }
+    }
+    diag::info!(
+        World,
+        "bo2mc extra collision: {free} free moves, {extra} stopped by non-blocks; {} entity brushes, {} model brushes, {} turned boxes, {} cmodels",
+        backend.linked_brushes.len(),
+        backend.model_brushes.len(),
+        backend.blockers.len(),
+        backend.cmodels.len()
+    );
+}
+
 impl CollisionBackend for ClipBackend<'_> {
     fn trace(&self, input: GroundTraceInput) -> Trace {
         let world_hit = clip_trace(
@@ -2352,4 +2446,67 @@ pub(crate) fn arm_held_weapon(
     }
     seed_ps_ammo_tables(ps, weapon, facts, clip0, clip1, last_hand >= 1, stock);
     (clip0, stock)
+}
+
+/// Minecraft Zombies' swimming, after BO2's move (the next move carries it):
+/// Jump swims up, Crouch dives, otherwise he sinks slowly; off the bottom the
+/// move keys steer him toward where he looks; at the surface Jump keeps him
+/// afloat and Jump with Forward hops him out.
+/// Minecraft's flight: 10.9 blocks a second (double sprinting), 7.5 up
+/// (Jump) and down (Crouch), easing in and out. A spectator goes through
+/// blocks; creative lands, and landing ends the flight.
+fn fly_move(ps: &mut PlayerState, cmd: &playerstate_iw4::UserCmd, msec: i32, from: [f32; 3]) {
+    let up = cmd.buttons & buttons::JUMP != 0;
+    let down = cmd.buttons & buttons::CROUCH != 0;
+    let sprint = cmd.buttons & buttons::SPRINT != 0;
+    let speed = if sprint { 784.0 } else { 392.0 };
+    let yaw = ps.viewangles[1].to_radians();
+    let (f, r) = (f32::from(cmd.forwardmove) / 127.0, f32::from(cmd.rightmove) / 127.0);
+    let wish = [f * yaw.cos() + r * yaw.sin(), f * yaw.sin() - r * yaw.cos()];
+    let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt().max(1.0);
+    let rise = f32::from(u8::from(up)) - f32::from(u8::from(down));
+    let target = [wish[0] / len * speed, wish[1] / len * speed, rise * 270.0];
+    for (v, t) in ps.velocity.iter_mut().zip(target) {
+        *v += (t - *v) * 0.3;
+    }
+    if crate::bo2mc::game_mode() == crate::bo2mc::SPECTATOR {
+        let dt = msec.max(0) as f32 * 0.001;
+        for i in 0..3 {
+            ps.origin[i] = from[i] + ps.velocity[i] * dt;
+        }
+        ps.ground_entity_num = playerstate_iw4::ENTITYNUM_NONE;
+    } else if ps.ground_entity_num != playerstate_iw4::ENTITYNUM_NONE && !up {
+        crate::bo2mc::set_flying(false);
+    }
+}
+
+fn swim_move(ps: &mut PlayerState, cmd: &playerstate_iw4::UserCmd, eye_wet: bool) {
+    use crate::bo2mc::{SWIM_HOP, SWIM_SINK, SWIM_SPEED, SWIM_UP};
+    let up = cmd.buttons & buttons::JUMP != 0;
+    let down = cmd.buttons & buttons::CROUCH != 0;
+    let v = &mut ps.velocity;
+    if up && !eye_wet && cmd.forwardmove > 0 {
+        v[2] = v[2].max(SWIM_HOP);
+    } else if up && eye_wet {
+        v[2] = v[2].max(SWIM_UP);
+    } else if up {
+        v[2] = v[2].max(SWIM_UP * 0.4);
+    } else if down {
+        v[2] = v[2].min(-SWIM_UP);
+    } else {
+        v[2] = v[2].max(-SWIM_SINK);
+    }
+    if up {
+        ps.ground_entity_num = playerstate_iw4::ENTITYNUM_NONE;
+    }
+    if ps.ground_entity_num == playerstate_iw4::ENTITYNUM_NONE {
+        let yaw = ps.viewangles[1].to_radians();
+        let (f, r) = (f32::from(cmd.forwardmove) / 127.0, f32::from(cmd.rightmove) / 127.0);
+        let wish = [f * yaw.cos() + r * yaw.sin(), f * yaw.sin() - r * yaw.cos()];
+        let len = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt().max(1.0);
+        for i in 0..2 {
+            let target = wish[i] / len * SWIM_SPEED;
+            v[i] += (target - v[i]) * 0.15;
+        }
+    }
 }

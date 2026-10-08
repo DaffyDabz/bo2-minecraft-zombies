@@ -11,6 +11,9 @@ use super::T6PathNode;
 pub(crate) const NODE_PATH: u32 = 1;
 pub(crate) const NODE_NEGOTIATION_BEGIN: u32 = 17;
 pub(crate) const NODE_NEGOTIATION_END: u32 = 18;
+/// Spawnflag of a node placed on a mover, its `target` naming the entity
+/// (Die Rise's elevator cars and escape pod): it moves with it.
+pub(crate) const NODE_ON_MOVER: u32 = 0x100;
 
 const CELL: f32 = 256.0;
 
@@ -23,6 +26,9 @@ pub(crate) struct Nav {
     /// pile), by entity, until its `connectpaths`; both directions.
     cut_by: HashMap<u32, Vec<(u32, u32)>>,
     cut: HashSet<(u32, u32)>,
+    /// Nodes on movers: (node, entity, its place in the entity's own space
+    /// once first seen).
+    movers: Vec<(u32, u32, Option<[f32; 3]>)>,
 }
 
 /// Does the segment a -> b pass through the box?
@@ -80,6 +86,7 @@ fn cell(p: [f32; 3]) -> (i32, i32) {
 
 impl Nav {
     pub(crate) fn new(nodes: Vec<T6PathNode>) -> Self {
+        dump(&nodes);
         let mut grid: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
         let mut by_targetname: HashMap<String, Vec<u32>> = HashMap::new();
         for (i, n) in nodes.iter().enumerate() {
@@ -285,10 +292,127 @@ impl Nav {
         None
     }
 
+    /// `nodesarelinked`: is there a link `a -> b`?
+    pub(crate) fn linked(&self, a: u32, b: u32) -> bool {
+        self.nodes
+            .get(a as usize)
+            .is_some_and(|n| n.links.iter().any(|l| u32::from(l.0) == b))
+    }
+
+    /// `linknodes`: a one-way link `a -> b` (Die Rise's escape pod doors).
+    pub(crate) fn link(&mut self, a: u32, b: u32) {
+        if self.linked(a, b) || b as usize >= self.nodes.len() || b > u32::from(u16::MAX) {
+            return;
+        }
+        let d = dist(self.nodes[a as usize].origin, self.nodes[b as usize].origin);
+        self.nodes[a as usize].links.push((b as u16, d, false));
+    }
+
+    /// `unlinknodes`: drop the link `a -> b`.
+    pub(crate) fn unlink(&mut self, a: u32, b: u32) {
+        if let Some(n) = self.nodes.get_mut(a as usize) {
+            n.links.retain(|l| u32::from(l.0) != b);
+        }
+    }
+
+    /// `deletepathnode`: no link leads to or from `n` any more.
+    pub(crate) fn delete(&mut self, n: u32) {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            if i as u32 == n {
+                node.links.clear();
+            } else {
+                node.links.retain(|l| u32::from(l.0) != n);
+            }
+        }
+    }
+
+    /// The nodes on the mover `targetname` (spawned as entity `ent`) are
+    /// carried by it from now on (`follow_movers`).
+    pub(crate) fn attach_movers(&mut self, targetname: &str, ent: u32) {
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.spawnflags & NODE_ON_MOVER != 0 && n.target.eq_ignore_ascii_case(targetname) {
+                self.movers.push((i as u32, ent, None));
+            }
+        }
+    }
+
+    /// Each tick: nodes on movers follow their entity's pose (kept at the
+    /// place in its own space they had when first seen), so the AI paths
+    /// into a car or the escape pod where it is now. Gives the nodes that
+    /// moved, with their new place.
+    pub(crate) fn follow_movers(
+        &mut self,
+        pose: impl Fn(u32) -> Option<([f32; 3], [f32; 3])>,
+    ) -> Vec<(u32, [f32; 3])> {
+        let mut moved = Vec::new();
+        for k in 0..self.movers.len() {
+            let (node, ent, local) = self.movers[k];
+            let Some((o, a)) = pose(ent) else {
+                continue;
+            };
+            let p = self.nodes[node as usize].origin;
+            let (f, r, u) = gsc_t6::math::angle_vectors(a);
+            let l = local.unwrap_or_else(|| {
+                let d = gsc_t6::math::sub(p, o);
+                [
+                    gsc_t6::math::dot(d, f),
+                    gsc_t6::math::dot(d, r),
+                    gsc_t6::math::dot(d, u),
+                ]
+            });
+            self.movers[k].2 = Some(l);
+            let to: [f32; 3] =
+                std::array::from_fn(|i| o[i] + f[i] * l[0] + r[i] * l[1] + u[i] * l[2]);
+            if dist(to, p) < 0.01 {
+                continue;
+            }
+            let (c0, c1) = (cell(p), cell(to));
+            if c0 != c1 {
+                if let Some(list) = self.grid.get_mut(&c0) {
+                    list.retain(|&i| i != node);
+                }
+                self.grid.entry(c1).or_default().push(node);
+            }
+            self.nodes[node as usize].origin = to;
+            moved.push((node, to));
+        }
+        moved
+    }
+
     /// Is `a -> b` a negotiation link (a traversal)?
     pub(crate) fn negotiation(&self, a: u32, b: u32) -> bool {
         self.nodes
             .get(a as usize)
             .is_some_and(|n| n.links.iter().any(|l| u32::from(l.0) == b && l.2))
     }
+}
+
+/// IW4L_T6_NAVDUMP=<file>: every path node as loaded, one line each
+/// (`index type spawnflags x y z targetname target | links`), for reading
+/// the map's paths offline.
+fn dump(nodes: &[T6PathNode]) {
+    let Some(path) = std::env::var_os("IW4L_T6_NAVDUMP") else {
+        return;
+    };
+    let mut out = String::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let links: Vec<String> = n.links.iter().map(|l| l.0.to_string()).collect();
+        out += &format!(
+            "{i} {} {:#x} {:.0} {:.0} {:.0} {} {} | {}
+",
+            n.ty,
+            n.spawnflags,
+            n.origin[0],
+            n.origin[1],
+            n.origin[2],
+            if n.targetname.is_empty() {
+                "-"
+            } else {
+                &n.targetname
+            },
+            if n.target.is_empty() { "-" } else { &n.target },
+            links.join(" ")
+        );
+    }
+    let _ = std::fs::write(path, out);
 }

@@ -11,6 +11,8 @@ struct Globe {
     v0: vec4<f32>,
     v2: vec4<f32>,
     color: vec4<f32>,
+    // x: the popup blur's width across the picture (0 sharp).
+    blur: vec4<f32>,
 }
 
 @group(1) @binding(0) var<uniform> globe: Globe;
@@ -19,11 +21,11 @@ struct Globe {
 @group(1) @binding(3) var day_tex: texture_2d<f32>;
 @group(1) @binding(4) var day_smp: sampler;
 
-@fragment
-fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
+// The globe at one point of its picture (premultiplied).
+fn shade(at: vec2<f32>) -> vec4<f32> {
     // BO2 reads the texture coordinates crossed (x from v, y from u).
-    let x = in.uv.y * 2.0 - 1.0;
-    let y = in.uv.x * 2.0 - 1.0;
+    let x = at.y * 2.0 - 1.0;
+    let y = at.x * 2.0 - 1.0;
     let zz = 1.0 - y * y - x * x;
     if zz < 0.0 {
         return vec4<f32>(0.0);
@@ -44,8 +46,8 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     let xf = y1 * sy + x2 * cy;
     // Longitude and latitude on the maps.
     let uv = vec2<f32>(atan2(zf, xf) * 0.159155 + 0.5, acos(clamp(-up, -1.0, 1.0)) * 0.318310);
-    var mesh = textureSample(mesh_tex, mesh_smp, uv);
-    let day = textureSample(day_tex, day_smp, uv);
+    var mesh = textureSampleLevel(mesh_tex, mesh_smp, uv, 0.0);
+    let day = textureSampleLevel(day_tex, day_smp, uv, 0.0);
     // The rim fades; each map shows below its reveal line.
     let rim = min(w * w * 20.0, 1.0);
     let h = 1.0 - up;
@@ -54,7 +56,29 @@ fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
     mesh.a = mesh.a * mesh_on;
     let day_a = day_on * day.a;
     let mesh_pm = mesh * mesh.a;
-    var out = (1.0 - day_a) * mesh_pm + day_a * vec4<f32>(day.rgb, day_a);
+    return (1.0 - day_a) * mesh_pm + day_a * vec4<f32>(day.rgb, day_a);
+}
+
+@fragment
+fn fragment(in: UiVertexOutput) -> @location(0) vec4<f32> {
+    var out = shade(in.uv);
+    // Under a popup's blur: the globe averaged over a disc (BO2 smears the
+    // menu behind a popup).
+    let r = globe.blur.x;
+    if r > 0.0 {
+        out = out * 0.0;
+        var n = 0.0;
+        for (var ring = 1; ring <= 4; ring++) {
+            let rad = r * f32(ring) / 4.0;
+            for (var k = 0; k < 8; k++) {
+                let a = (f32(k) + f32(ring) * 0.5) * 0.785398;
+                let wt = 1.0 - f32(ring) / 5.0;
+                out += shade(in.uv + vec2<f32>(cos(a), sin(a)) * rad) * wt;
+                n += wt;
+            }
+        }
+        out = (out + shade(in.uv)) / (n + 1.0);
+    }
     if out.a > 0.0 {
         out = vec4<f32>(out.rgb / out.a, out.a);
     }

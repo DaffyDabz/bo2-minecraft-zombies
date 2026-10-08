@@ -8,6 +8,8 @@ mod t6;
 mod t6_materials;
 // bo2zm M2: guns, effects and sound.
 mod t6_m2;
+// bo2mc: every Black Ops II perk's assets for the spawn room.
+mod t6_perks;
 mod t6_scripts;
 
 // bo2zm M4: Black Ops II's front end (no map).

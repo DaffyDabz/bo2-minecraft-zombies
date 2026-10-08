@@ -264,6 +264,23 @@ impl CubeMove {
     }
 }
 
+/// Minecraft Zombies: monsters hunt players as the round's zombies do,
+/// knowing where a player is within `HUNT_RANGE`, seen or not. Off in
+/// vanilla.
+pub static HUNT_PLAYERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How far a hunting monster knows where a player is.
+pub const HUNT_RANGE: f64 = 48.0;
+
+fn hunts(kind: MonsterKind) -> bool {
+    HUNT_PLAYERS.load(std::sync::atomic::Ordering::Relaxed)
+        && !matches!(kind, MonsterKind::Wolf | MonsterKind::IronGolem | MonsterKind::Enderman)
+}
+
+/// A hunting monster needs no sight of a player.
+fn hunts_player(ctx: &MonsterGoalContext, target: Target) -> bool {
+    matches!(target, Target::Player(_)) && (hunts(ctx.kind) || ctx.wolf.souls)
+}
+
 /// `Monster.createMonsterAttributes`: `FOLLOW_RANGE`'s base.
 pub const FOLLOW_RANGE: f64 = 16.0;
 /// `Zombie.createAttributes`: `FOLLOW_RANGE`'s base.
@@ -557,7 +574,13 @@ impl MonsterGoalContext {
         if self.kind == MonsterKind::Wolf && matches!(target.target, Target::Player(id) if self.wolf.owner == Some(id)) {
             return false;
         }
-        target.alive && target.player_ok && !(player && self.difficulty == 0)
+        target.alive && target.player_ok && !(player && self.difficulty == 0 && !self.wolf.souls)
+    }
+
+    /// `FOLLOW_RANGE` as its goals read it: a hunting monster's is
+    /// `HUNT_RANGE` at least, whatever its spawn set.
+    pub(crate) fn reach(&self) -> f64 {
+        if hunts(self.kind) || self.wolf.souls { self.follow_range.max(HUNT_RANGE) } else { self.follow_range }
     }
 
     /// `Mob.getTarget`: the target while it is still a valid one.
@@ -662,8 +685,8 @@ impl MonsterGoalContext {
     /// a third it can spare, less four per difficulty step below hard).
     pub(crate) fn profile(&self) -> WalkProfile {
         let mut profile = self.walk.clone();
-        if self.follow_range != self.walk.follow_range as f64 {
-            profile.max_path_length = Some(self.follow_range as f32);
+        if self.reach() != self.walk.follow_range as f64 {
+            profile.max_path_length = Some(self.reach() as f32);
         }
         let allowed = match (self.kind, self.target().is_some()) {
             (_, false) => 0.0,
@@ -740,6 +763,7 @@ impl MonsterAi {
             MonsterKind::Enderman => crate::enderman::FOLLOW_RANGE,
             MonsterKind::Wolf => crate::wolf::FOLLOW_RANGE,
         };
+        let follow_range = if hunts(kind) { follow_range.max(HUNT_RANGE) } else { follow_range };
         walk.follow_range = follow_range as f32;
         // An `Animal` keeps its own walk values (grass is best).
         if kind != MonsterKind::Wolf {
@@ -2214,13 +2238,13 @@ pub fn update_enderman_anger(ctx: &mut MonsterGoalContext) {
         ctx.enderman.anger_end_time = ctx.game_time + ticks;
     }
     let target = ctx.target();
-    let valid_player = target.is_some_and(|t| matches!(t.target, Target::Player(_)) && t.player_ok && ctx.difficulty != 0);
+    let valid_player = target.is_some_and(|t| matches!(t.target, Target::Player(_)) && t.player_ok && (ctx.difficulty != 0 || ctx.wolf.souls));
     if held.is_some() && !ctx.angry() && (target.is_none() || !valid_player) {
         ctx.stop_being_angry();
     }
     if let Some(Target::Player(id)) = held {
         if let Some(info) = ctx.info(Target::Player(id)) {
-            if !info.player_ok || ctx.difficulty == 0 {
+            if !info.player_ok || (ctx.difficulty == 0 && !ctx.wolf.souls) {
                 ctx.stop_being_angry();
             }
         }
@@ -2293,7 +2317,7 @@ impl Goal<MonsterGoalContext> for NearestTargetGoal {
         if ctx.random.next_int(self.interval) != 0 {
             return false;
         }
-        let (range, eye) = (ctx.follow_range.max(2.0), ctx.eye());
+        let (range, eye) = (ctx.reach().max(2.0), ctx.eye());
         let candidates: Vec<Target> = match self.prey {
             Prey::Player => ctx.players.iter().map(|p| Target::Player(p.id)).collect(),
             Prey::Villager => ctx.villagers.iter().map(|v| Target::Villager(v.id)).collect(),
@@ -2307,7 +2331,10 @@ impl Goal<MonsterGoalContext> for NearestTargetGoal {
         let mut best: Option<(f64, Target)> = None;
         for target in candidates {
             let Some(info) = ctx.info(target) else { continue };
-            if !ctx.can_attack(info) || ctx.body.position.distance_squared(info.position) > range * range || !ctx.sees(world, info) {
+            if !ctx.can_attack(info)
+                || ctx.body.position.distance_squared(info.position) > range * range
+                || !(hunts_player(ctx, target) || ctx.sees(world, info))
+            {
                 continue;
             }
             if self.max_dy.is_some_and(|dy| (info.position.y - ctx.body.position.y).abs() > dy) {
@@ -2351,11 +2378,11 @@ pub fn continue_target(ctx: &mut MonsterGoalContext, world: &dyn World, remember
     if !ctx.can_attack(target) {
         return false;
     }
-    if ctx.body.position.distance_squared(target.position) > ctx.follow_range * ctx.follow_range {
+    if ctx.body.position.distance_squared(target.position) > ctx.reach() * ctx.reach() {
         return false;
     }
     if let Some(memory) = memory {
-        if ctx.sees(world, target) {
+        if hunts_player(ctx, target.target) || ctx.sees(world, target) {
             *unseen_ticks = 0;
         } else {
             *unseen_ticks += 1;

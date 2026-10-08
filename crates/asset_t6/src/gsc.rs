@@ -1104,6 +1104,9 @@ pub struct MapScriptFacts {
     /// The default ambient room's tone (`declareambientroom(room, true)`,
     /// `setambientroomtone(room, alias, ...)`).
     pub room_tone: Option<String>,
+    /// The ambient rooms' echoes (`setambientroomreverb(room, preset, dry,
+    /// wet)`): room, preset, dry, wet; the default room first.
+    pub room_echoes: Vec<(String, String, f32, f32)>,
     /// Sounds a loop plays now and then at one of a few places
     /// (`wait randomintrange(a, b); playsound(0, alias, place[...])`):
     /// alias, wait range in seconds, places.
@@ -1182,6 +1185,21 @@ impl MapScriptFacts {
                     && let Some(alias) = call.args.get(1).and_then(GscValue::as_str)
                 {
                     facts.room_tone = Some(alias.to_owned());
+                }
+            }
+            for (_, call) in run.calls_named("setambientroomreverb") {
+                let (Some(room), Some(preset)) = (
+                    call.args.first().and_then(GscValue::as_str),
+                    call.args.get(1).and_then(GscValue::as_str),
+                ) else {
+                    continue;
+                };
+                let at = |i: usize| call.args.get(i).and_then(GscValue::as_f32).unwrap_or(1.0);
+                let row = (room.to_owned(), preset.to_owned(), at(2), at(3));
+                if Some(room) == default_room.as_deref() {
+                    facts.room_echoes.insert(0, row);
+                } else {
+                    facts.room_echoes.push(row);
                 }
             }
             for (_, call) in run.calls_named("snd_play_auto_fx") {

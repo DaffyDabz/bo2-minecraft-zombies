@@ -16,6 +16,8 @@ pub(crate) struct GlobeParams {
     pub v0: Vec4,
     pub v2: Vec4,
     pub color: Vec4,
+    /// x: how far a popup's blur smears it, across its picture (0 sharp).
+    pub blur: Vec4,
 }
 
 /// The globe: its values, the mesh (the grid) and the Earth's day map.

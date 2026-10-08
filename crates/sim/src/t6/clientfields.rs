@@ -14,6 +14,9 @@ use crate::EventAudience;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ClientFx {
     pending: Vec<Pending>,
+    /// Each entity's client field values as last set, for
+    /// `codegetclientfield` (Vulture Aid's bit fields, `anim_rate`).
+    values: std::collections::HashMap<(u32, String), i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,12 @@ const RISE_BURST: &str = "maps/zombie/fx_mp_zombie_hand_dirt_burst";
 const RISE_BILLOW: &str = "maps/zombie/fx_mp_zombie_body_dirt_billowing";
 const RISE_DUST: &str = "maps/zombie/fx_mp_zombie_body_dust_falling";
 const EYE_GLOW: &str = "misc/fx_zombie_eye_single";
+/// zm_nuked.csc zombie_eye_clientfield: after the moon transmission
+/// (round 25) every zombie's eyes glow blue.
+const EYE_GLOW_BLUE: &str = "maps/zombie/fx_zombie_eye_single_blue";
+const GUTS_EXPLOSION: &str = "maps/zombie/fx_zmb_tranzit_torso_explo";
+/// A standing zombie's J_SpineLower above its feet.
+const SPINE_LOWER: f32 = 40.0;
 const PERK_METEOR: &str = "maps/zombie/fx_zmb_trail_perk_meteor";
 const POWERUP: [&str; 4] = [
     "misc/fx_zombie_powerup_on",
@@ -90,6 +99,11 @@ fn rand_range(vm: &mut Vm<World>, lo: i32, hi: i32) -> f32 {
 /// An entity's field changed: its client script's effects.
 fn entity_field(vm: &mut Vm<World>, world: &mut World, ent: &Value, name: &str, value: i64) {
     let Some(n) = entnum(vm, ent) else { return };
+    world
+        .resource_mut::<Zm>()
+        .client_fx
+        .values
+        .insert((n, name.to_owned()), value);
     if name.starts_with("score_cf_") {
         score_field(world, n, name, value as i32);
         return;
@@ -139,17 +153,43 @@ fn entity_field(vm: &mut Vm<World>, world: &mut World, ent: &Value, name: &str, 
                 t += 300;
             }
         }
-        // createzombieeyes / deletezombieeyes.
-        "zombie_has_eyes" => queue(
+        // zombie_gut_explosion_cb: a grenade's kill bursts the body at
+        // J_SpineLower as the server ghosts it.
+        "zombie_gut_explosion" if value != 0 => queue(
+            world,
+            n,
+            0,
+            Step::At {
+                fx: GUTS_EXPLOSION,
+                offset: [0.0, 0.0, SPINE_LOWER],
+            },
+        ),
+        // zombie_wait_explode: the same burst two seconds on, where the
+        // thrown body lies (mature only).
+        "zombie_ragdoll_explode" if value != 0 && super::profile_mature() => queue(
+            world,
+            n,
+            2000,
+            Step::At {
+                fx: GUTS_EXPLOSION,
+                offset: [0.0, 0.0, SPINE_LOWER],
+            },
+        ),
+        // createzombieeyes / deletezombieeyes (level._override_eye_fx once
+        // the world field zombie_eye_change is set).
+        "zombie_has_eyes" => {
+            let blue = world.resource::<Zm>().wallbuys.world_fields.get("zombie_eye_change") == Some(&1);
+            queue(
             world,
             n,
             0,
             Step::Bolt {
-                fx: EYE_GLOW,
+                fx: if blue { EYE_GLOW_BLUE } else { EYE_GLOW },
                 tag: "j_eyeball_le",
                 stop: value == 0,
             },
-        ),
+        );
+        }
         // powerup_fx_callback: the glow by kind (no glow for 0).
         "powerup_fx" => {
             if let Some(fx) = usize::try_from(value - 1).ok().and_then(|i| POWERUP.get(i)) {
@@ -303,6 +343,20 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let value = arg(a, 2).as_int().map_or(0, i64::from);
         entity_field(vm, world, &ent, &name, value);
         Ok(Value::Undefined)
+    });
+    // maps/mp/_utility::getclientfield: the value as last set (0 before).
+    vm.bind("codegetclientfield", false, |vm, world, _, a| {
+        let name = vm.to_text(arg(a, 1));
+        let value = entnum(vm, arg(a, 0)).map_or(0, |n| {
+            world
+                .resource::<Zm>()
+                .client_fx
+                .values
+                .get(&(n, name))
+                .copied()
+                .unwrap_or(0)
+        });
+        Ok(Value::Int(value as i32))
     });
     // Scripts that call the method directly.
     vm.bind("setclientfield", true, |vm, world, s, a| {

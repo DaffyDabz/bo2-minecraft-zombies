@@ -387,6 +387,23 @@ fn movement_sound(
         origin_inches,
         snd_ent: Some(u32::from(identity.number())),
     });
+    // bo2zm: inside a step trigger (Nuketown's porches, the truck bed) the
+    // map's client script sets a sound each of his steps also plays.
+    if player_view
+        && let Some(step) = presented
+            .snapshot()
+            .and_then(|snap| snap.meta.script_dvars(local.0).string("bo2zm_step"))
+            .filter(|s| !s.is_empty() && *s != "none")
+    {
+        // Only the T6 sim sets this dvar, and the alias is in BO2's bank.
+        play.write(crate::AliasCommand::Play(PlayAlias {
+            namespace: asset_core::AssetNamespace::T6,
+            alias: step.to_owned(),
+            fallback: None,
+            origin_inches: None,
+            snd_ent: Some(u32::from(identity.number())),
+        }));
+    }
     gear.write(WeaponSound {
         namespace: asset_core::AssetNamespace::Iw4,
         alias: gear_rattle_alias(gait, player_view).to_owned(),

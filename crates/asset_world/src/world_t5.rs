@@ -547,6 +547,7 @@ pub fn build_t5_world_draw(
             t5_exposure_volume_count: geometry.exposure_volume_count as u32,
             t6_lights: Vec::new(),
             t6_fog_banks: Vec::new(),
+            t6_flicker: Vec::new(),
             t6_probes: Vec::new(),
             t6_layer_uvs: Vec::new(),
         },

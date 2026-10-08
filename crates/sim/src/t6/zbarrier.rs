@@ -30,6 +30,39 @@ pub(crate) struct Piece {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ZBarrier {
     pub pieces: Vec<Piece>,
+    /// The barrier type its `type` key names (window boards' tear states).
+    pub def: Option<std::sync::Arc<super::T6ZBarrierDef>>,
+}
+
+/// The barrier type a zbarrier entity's `type` key names, if the zones
+/// hold it.
+pub(crate) fn def_for(
+    world: &World,
+    keys: &[(String, String)],
+) -> Option<std::sync::Arc<super::T6ZBarrierDef>> {
+    let ty = keys
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("type"))?
+        .1
+        .to_ascii_lowercase();
+    let defs = &world.resource::<Zm>().zbarrier_defs;
+    if let Some(def) = defs.get(&ty) {
+        return Some(def.clone());
+    }
+    // A map may name another map's type (Declassified Verrückt's wall
+    // windows ask for zmcore_prototype_wallbarrier; its zone holds only
+    // zmcore_asylum_wallbarrier): take the one zone type of the same kind.
+    let kind = |n: &str| n.rsplit('_').next().unwrap_or_default().to_owned();
+    let same: Vec<_> = defs.iter().filter(|(n, _)| kind(n) == kind(&ty)).collect();
+    if let [(name, def)] = same.as_slice() {
+        diag::info!(
+            Sim,
+            "bo2zm t6: zbarrier type {ty} not in the zones, using {name}"
+        );
+        return Some((*def).clone());
+    }
+    diag::warn!(Sim, "bo2zm t6: zbarrier type {ty} not in the zones");
+    None
 }
 
 impl ZBarrier {
@@ -54,7 +87,7 @@ impl ZBarrier {
                 rise: Vec::new(),
             })
             .collect();
-        Self { pieces }
+        Self { pieces, def: None }
     }
 }
 
@@ -258,6 +291,22 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         });
         Ok(Value::bool(is))
     });
+    // Every zbarrier in the level, in entity order (Tranzit's survival
+    // start hides the bus's window boards through it).
+    vm.bind("getzbarrierarray", false, |vm, world, _, _| {
+        let mut found: Vec<(u32, gsc_t6::ObjRef)> = world
+            .resource::<Zm>()
+            .ents
+            .iter()
+            .filter(|(_, e)| e.zbarrier.is_some())
+            .filter_map(|(n, e)| e.obj.map(|o| (*n, o)))
+            .filter(|(_, o)| vm.alive(*o))
+            .collect();
+        found.sort_by_key(|(n, _)| *n);
+        Ok(list(
+            found.into_iter().map(|(_, o)| Value::Object(o)).collect(),
+        ))
+    });
     m!("getnumzbarrierpieces", |vm, world, s, _| {
         let n = entnum(vm, s)
             .and_then(|n| {
@@ -367,22 +416,57 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     ] {
         vm.bind(name, true, |_, _, _, _| Ok(Value::Undefined));
     }
-    for name in [
-        "zbarriersupportszombietaunts",
-        "zbarriersupportszombiereachthroughattacks",
-        "getzbarriernumattackslots",
-    ] {
-        vm.bind(name, true, |_, _, _, _| Ok(Value::Int(0)));
-    }
-    m!("getzbarrierattackslothorzoffset", |_, _, _, _| Ok(
-        Value::Float(0.0)
+    // The barrier type's facts (zero / "" when the zones lack the type).
+    m!("zbarriersupportszombietaunts", |vm, world, s, _| Ok(
+        Value::Int(i32::from(def(vm, world, s).is_some_and(|d| d.taunts)))
     ));
-    for name in [
-        "getzbarriertauntanimstate",
+    m!(
+        "zbarriersupportszombiereachthroughattacks",
+        |vm, world, s, _| Ok(Value::Int(i32::from(
+            def(vm, world, s).is_some_and(|d| d.reach_through)
+        )))
+    );
+    m!("getzbarriernumattackslots", |vm, world, s, _| Ok(
+        Value::Int(def(vm, world, s).map_or(0, |d| d.num_attack_slots as i32))
+    ));
+    m!("getzbarrierattackslothorzoffset", |vm, world, s, _| Ok(
+        Value::Float(def(vm, world, s).map_or(0.0, |d| d.attack_spot_horz_offset))
+    ));
+    m!("getzbarriertauntanimstate", |vm, world, s, _| {
+        let t = def(vm, world, s).map(|d| d.taunt_state.clone());
+        Ok(vm.string(&t.unwrap_or_default()))
+    });
+    m!(
         "getzbarrierreachthroughattackanimstate",
-        "getzbarrierpieceanimstate",
-        "getzbarrierpieceanimsubstate",
-    ] {
-        vm.bind(name, true, |vm, _, _, _| Ok(vm.string("")));
-    }
+        |vm, world, s, _| {
+            let t = def(vm, world, s).map(|d| d.reach_through_state.clone());
+            Ok(vm.string(&t.unwrap_or_default()))
+        }
+    );
+    m!("getzbarrierpieceanimstate", |vm, world, s, a| {
+        let t = board(vm, world, s, a).map(|b| b.0);
+        Ok(vm.string(&t.unwrap_or_default()))
+    });
+    m!("getzbarrierpieceanimsubstate", |vm, world, s, a| {
+        let t = board(vm, world, s, a).map(|b| b.1);
+        Ok(vm.string(&t.unwrap_or_default()))
+    });
+}
+
+fn def(vm: &Vm<World>, world: &World, s: &Value) -> Option<std::sync::Arc<super::T6ZBarrierDef>> {
+    let n = entnum(vm, s)?;
+    world
+        .resource::<Zm>()
+        .ents
+        .get(&n)?
+        .zbarrier
+        .as_ref()?
+        .def
+        .clone()
+}
+
+/// Piece `a[0]`'s board in the barrier type: (tear state, tear substate).
+fn board(vm: &Vm<World>, world: &World, s: &Value, a: &[Value]) -> Option<(String, String)> {
+    let i = usize::try_from(arg(a, 0).as_int()?).ok()?;
+    def(vm, world, s)?.boards.get(i).cloned()
 }

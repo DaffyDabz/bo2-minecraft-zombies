@@ -5,7 +5,21 @@
 //! entity world reports it.
 
 use glam::DVec3;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+
+/// The death ticks a dead mob stays before it is removed: vanilla's 20,
+/// longer where a game shows its body falling (Minecraft Zombies' ragdolls).
+static CORPSE_TICKS: AtomicI32 = AtomicI32::new(20);
+
+/// The death ticks a dead mob stays (vanilla 20).
+pub fn corpse_ticks() -> i32 {
+    CORPSE_TICKS.load(Ordering::Relaxed)
+}
+
+/// Keep dead mobs `ticks` death ticks (at least vanilla's 20).
+pub fn set_corpse_ticks(ticks: i32) {
+    CORPSE_TICKS.store(ticks.max(20), Ordering::Relaxed);
+}
 
 /// Deaths in the order they happen, across every entity world: loot rolls
 /// follow that order (each table draws from its own named sequence).
@@ -173,7 +187,7 @@ impl DamageState {
         if self.player_memory > 0 {
             self.player_memory -= 1;
         }
-        self.death_ticks >= 20
+        self.death_ticks >= corpse_ticks()
     }
 }
 

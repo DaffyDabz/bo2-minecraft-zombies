@@ -498,7 +498,10 @@ fn art_fog(capture: &asset_t6::ZoneCapture, path: &Path, map: &str) -> Option<as
             .and_then(|(_, bytes)| asset_t6::parse_art_fog(bytes))
     };
     find(capture).or_else(|| {
-        let patch = path.with_file_name(format!("{map}_patch.ff"));
+        let patch = asset_transport::t6_extra::file_in(
+            &asset_transport::t6_extra::install_zone_dir(path),
+            &format!("{map}_patch.ff"),
+        );
         asset_t6::capture_zone(&patch).ok().as_ref().and_then(find)
     })
 }
@@ -512,6 +515,52 @@ const SUN_FOG_SLOT: usize = 30;
 enum T6Fog {
     World(asset_t6::WorldFogRef),
     Art(asset_t6::ArtFog),
+}
+
+/// The map's flickering lamps: `light` entities whose targetname names one
+/// of the engine's built-in mixer behaviours (`_lights.csc` setup_mixer_lights
+/// -> `ismixerlightbehaviorhardcoded` -> `setmixerlightbehavior`), with the
+/// keys init_mixer_lights passes as mixer params. `pl#` is the primary light.
+fn flicker_lights(capture: &asset_t6::ZoneCapture, lights: usize) -> Vec<asset_world::T6Flicker> {
+    let num = |e: &asset_t6::MapEntity, key: &str| e.get(key).and_then(|v| v.trim().parse::<f32>().ok());
+    capture
+        .map_ents
+        .iter()
+        .flat_map(|text| asset_t6::parse_entities(text))
+        .filter(|e| e.classname() == "light")
+        .filter_map(|e| {
+            let electrical = match e.get("targetname")? {
+                "fire_flicker" => false,
+                "electrical_flicker" => true,
+                _ => return None,
+            };
+            let light = e.get("pl#")?.trim().parse::<u16>().ok()?;
+            if usize::from(light) >= lights {
+                return None;
+            }
+            let base = num(&e, "intensity").unwrap_or(1.0);
+            Some(asset_world::T6Flicker {
+                light,
+                electrical,
+                base,
+                min: num(&e, "script_intensity_min").unwrap_or(base * 0.25),
+                max: num(&e, "script_intensity_max").unwrap_or(base),
+                delay: [
+                    num(&e, "script_delay_min").unwrap_or(0.1),
+                    num(&e, "script_delay_max").unwrap_or(0.5),
+                ],
+                burst: [
+                    num(&e, "script_burst_min").unwrap_or(2.0),
+                    num(&e, "script_burst_max").unwrap_or(6.0),
+                ],
+                burst_time: num(&e, "script_burst_time").unwrap_or(0.1),
+                wait: [
+                    num(&e, "script_wait_min").unwrap_or(1.0),
+                    num(&e, "script_wait_max").unwrap_or(4.0),
+                ],
+            })
+        })
+        .collect()
 }
 
 /// The map's primary lights for the renderer's fallback draw, four vec4
@@ -753,7 +802,9 @@ impl ZoneLane for T6Lane {
         // Materials: every world surface's, linked into the lane's catalog
         // with its colour map decoded from the packs beside the zone.
         let stage = progress.begin_scoped(StageId::MapAssets, "materials", None);
-        let packs = match path.parent().map(asset_t6::PackSet::open_dir) {
+        let packs = match Some(asset_transport::t6_extra::install_zone_dir(path))
+            .map(|dir| asset_t6::PackSet::open_dir(&dir))
+        {
             Some(Ok(packs)) => Some(packs),
             Some(Err(error)) => {
                 report.push(format!("t6 image packs: {error}"));
@@ -906,6 +957,22 @@ impl ZoneLane for T6Lane {
                 report.push(format!("t6 fog: {fog:?}"));
                 draw.t6_lights = t6_light_table(&capture, fog);
                 draw.t6_fog_banks = fog_banks(world);
+                draw.t6_flicker = flicker_lights(&capture, draw.t6_lights.len().min(SUN_FOG_SLOT));
+                report.push(format!(
+                    "t6 flickering lamps: {}",
+                    draw.t6_flicker
+                        .iter()
+                        .map(|f| format!(
+                            "pl{} {} {}..{} of {}",
+                            f.light,
+                            if f.electrical { "electrical" } else { "fire" },
+                            f.min,
+                            f.max,
+                            f.base
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
                 report.push(format!(
                     "t6 fog banks: {:?}",
                     draw.t6_fog_banks
@@ -946,6 +1013,8 @@ impl ZoneLane for T6Lane {
                     super::t6_m2::load_t6_combat(path, &capture, &mut materials, packs.as_ref());
                 stage.done();
                 report.extend(combat.report);
+                let prepare = script_sound_aliases(&combat.scripts);
+                report.push(format!("t6 script sounds prepared at load: {}", prepare.len()));
                 let facts = crate::MapFacts {
                     t6_footsteps: combat.footsteps,
                     t6_hud_icons: combat.hud_icons,
@@ -955,6 +1024,7 @@ impl ZoneLane for T6Lane {
                     script_sound: asset_audio::MapScriptSoundFacts {
                         ambient_alias: combat.room_tone,
                         script: Some(format!("clientscripts/mp/{map}_amb.csc")),
+                        prepare,
                         ..Default::default()
                     },
                     ..Default::default()
@@ -1044,4 +1114,34 @@ impl ZoneLane for T6Lane {
             ..Default::default()
         }
     }
+}
+
+/// bo2zm: every sound alias a map script names as a whole string (the
+/// banks' aliases that appear in a script's string table).
+fn script_sound_aliases(scripts: &crate::script_sources::T6ScriptSet) -> Vec<String> {
+    let known: std::collections::HashSet<&str> =
+        scripts.sound_aliases.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = scripts
+        .objects
+        .iter()
+        .filter_map(|bytes| asset_t6::gsc::GscObject::parse(bytes).ok())
+        .flat_map(|g| g.strings.into_values())
+        .map(|s| s.to_ascii_lowercase())
+        .filter(|s| known.contains(s.as_str()))
+        .collect();
+    // Breakable props' break sounds (a mannequin's head popping off).
+    for d in &scripts.destructibles {
+        for p in &d.pieces {
+            for st in &p.stages {
+                if let Some(snd) = st.break_sound.as_ref().map(|s| s.to_ascii_lowercase())
+                    && known.contains(snd.as_str())
+                {
+                    out.push(snd);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }

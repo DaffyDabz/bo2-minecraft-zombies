@@ -259,7 +259,7 @@ pub(crate) fn sync_player_name(
         *sent = None;
         return;
     }
-    let name = entity_iw4::pack_client_state_name(&settings.player_name);
+    let name = entity_iw4::pack_client_state_name(&settings.shown_name());
     let next = (*generation, local.0, name);
     if sent.as_ref() == Some(&next) {
         return;

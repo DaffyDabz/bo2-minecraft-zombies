@@ -169,7 +169,7 @@ pub(super) fn world_box(world: &mut World, e: &Ent) -> Option<([f32; 3], [f32; 3
 
 /// A model entity's world box: its model's bounds turned by its angles,
 /// placed.
-fn model_box(world: &mut World, e: &Ent) -> Option<([f32; 3], [f32; 3])> {
+pub(super) fn model_box(world: &mut World, e: &Ent) -> Option<([f32; 3], [f32; 3])> {
     let (mid, half) = frame(world).model_capability(&e.model).flatten()?.bounds?;
     let (fw, rt, up) = gsc_t6::math::angle_vectors(e.angles);
     let left = [-rt[0], -rt[1], -rt[2]];

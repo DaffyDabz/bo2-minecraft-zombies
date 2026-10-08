@@ -15,6 +15,8 @@ mod options;
 mod plugin;
 mod screen;
 mod zm_hud; // bo2zm M4: the Zombies globe
+// bo2mc: Vulture Aid shows the machines and the box through walls.
+mod vulture_hud;
 
 pub use classes::equip_txn::{
     EquipTxnWatch, apply_pending_class_equip, resolve_class_equip_transaction,

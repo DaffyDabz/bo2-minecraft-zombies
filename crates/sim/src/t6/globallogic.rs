@@ -266,8 +266,17 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         end_game(vm, world, a);
         Ok(Value::Undefined)
     });
+    // The pause menu's End Game: the zombie scripts' game over (its
+    // screen, then the main menu) starts on the level's `end_game`, as
+    // when the last player goes down. His 10-08: "exit game does not
+    // exit the game like it should".
     b(vm, "forceend", |vm, world, _, _| {
+        if gsc_t6::truthy(&level_field(vm, "gameended")) {
+            return Ok(Value::Undefined);
+        }
         end_game(vm, world, &[]);
+        let lv = vm.level;
+        vm.notify_str(world, lv, "end_game", &[]);
         Ok(Value::Undefined)
     });
     b(vm, "getcurrentgamemode", |vm, _, _, _| {

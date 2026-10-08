@@ -2252,6 +2252,8 @@ pub struct EntityWorld {
     sounds: Vec<MobSound>,
     /// The `mob_drops` game rule.
     mob_drops: bool,
+    /// The Looting level on the player's kills (bo2mc's Vulture Aid).
+    pub looting: u32,
     /// The living mobs and players by entity section, for pushing.
     sections: pushing::Sections,
     /// The real players' boxes this tick, for pushing (`players_pickable`).
@@ -2340,6 +2342,7 @@ impl Default for EntityWorld {
             difficulty: 2,
             sounds: Vec::new(),
             mob_drops: true,
+            looting: 0,
             sections: pushing::Sections::default(),
             pushing_players: Vec::new(),
             level_random: LegacyRandom::new(0),
@@ -3487,7 +3490,7 @@ impl EntityWorld {
     /// the dead mob's random, which nothing draws from once it has died.
     pub fn take_deaths(&mut self) -> Vec<MobDeath> {
         let mut deaths = Vec::new();
-        let plain = EntityLootContext::default();
+        let plain = EntityLootContext { looting: self.looting, ..EntityLootContext::default() };
         let mob_drops = self.mob_drops;
         // Animals, bats and villagers drop their loot only as adults
         // (`LivingEntity.shouldDropLoot`); monsters as babies too.
@@ -4288,6 +4291,7 @@ impl EntityWorld {
             difficulty: 2,
             sounds: Vec::new(),
             mob_drops: self.mob_drops,
+            looting: self.looting,
             sections: self.sections.clone(),
             pushing_players: self.pushing_players.clone(),
             level_random: self.level_random.clone(),
@@ -6331,31 +6335,33 @@ impl EntityWorld {
                 horse.tick_animation();
             }
         }
+        // Dead mobs stay their corpse ticks; a slime splits and goes at 20.
+        let corpse = crate::health::corpse_ticks();
         self.bats
-            .retain(|entity| entity.bat.damage.death_ticks < 20);
+            .retain(|entity| entity.bat.damage.death_ticks < corpse);
         self.zombies
-            .retain(|entity| entity.zombie.damage.death_ticks < 20);
+            .retain(|entity| entity.zombie.damage.death_ticks < corpse);
         self.skeletons
-            .retain(|entity| entity.skeleton.damage.death_ticks < 20);
+            .retain(|entity| entity.skeleton.damage.death_ticks < corpse);
         self.creepers
-            .retain(|entity| !entity.creeper.exploded && entity.creeper.damage.death_ticks < 20);
-        self.spiders.retain(|entity| entity.spider.damage.death_ticks < 20);
+            .retain(|entity| !entity.creeper.exploded && entity.creeper.damage.death_ticks < corpse);
+        self.spiders.retain(|entity| entity.spider.damage.death_ticks < corpse);
         self.split_dead_slimes();
         self.slimes.retain(|entity| entity.slime.damage.death_ticks < 20);
-        self.endermen.retain(|entity| entity.enderman.damage.death_ticks < 20);
-        self.witches.retain(|entity| entity.witch.damage.death_ticks < 20);
-        self.iron_golems.retain(|entity| entity.golem.damage.death_ticks < 20);
-        self.wolves.retain(|entity| entity.wolf.damage.death_ticks < 20);
+        self.endermen.retain(|entity| entity.enderman.damage.death_ticks < corpse);
+        self.witches.retain(|entity| entity.witch.damage.death_ticks < corpse);
+        self.iron_golems.retain(|entity| entity.golem.damage.death_ticks < corpse);
+        self.wolves.retain(|entity| entity.wolf.damage.death_ticks < corpse);
         self.potions.retain(|entity| entity.potion.alive);
         self.villagers
-            .retain(|entity| entity.villager.damage.death_ticks < 20);
+            .retain(|entity| entity.villager.damage.death_ticks < corpse);
         self.cows
-            .retain(|entity| entity.cow.damage.death_ticks < 20);
-        self.sheep.retain(|entity| entity.damage.death_ticks < 20);
+            .retain(|entity| entity.cow.damage.death_ticks < corpse);
+        self.sheep.retain(|entity| entity.damage.death_ticks < corpse);
         self.pigs
-            .retain(|entity| entity.pig.damage.death_ticks < 20);
+            .retain(|entity| entity.pig.damage.death_ticks < corpse);
         self.chickens
-            .retain(|entity| entity.chicken.damage.death_ticks < 20);
+            .retain(|entity| entity.chicken.damage.death_ticks < corpse);
         self.arrows.retain(|entity| entity.arrow.alive);
         let alive_ids: HashSet<_> = self
             .bats

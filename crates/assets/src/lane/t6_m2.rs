@@ -58,7 +58,7 @@ pub(crate) struct T6Combat {
 
 /// The Zombies HUD's icons: the perks a Nuketown machine sells and the
 /// power-ups that last a while (their materials' colour maps).
-const HUD_ICONS: [&str; 41] = [
+const HUD_ICONS: [&str; 47] = [
     "specialty_juggernaut_zombies",
     "specialty_quickrevive_zombies",
     "specialty_fastreload_zombies",
@@ -90,6 +90,11 @@ const HUD_ICONS: [&str; 41] = [
     // CDC and CIA (Nuketown's teamset).
     "faction_cdc",
     "faction_cia",
+    // Nuketown's desert map behind its start locations: GameMapZombie
+    // builds the name ("menu_" .. GetUIMapName() .. "_map", and "_blur"),
+    // so no script names it whole.
+    "menu_zm_nuked_map",
+    "menu_zm_nuked_map_blur",
     // BO2's Xbox button pictures (code_post_gfx_zm): the pad's prompts in
     // its menus and hints (frame::BO2_XBOX_GLYPHS).
     "xenonbutton_a",
@@ -111,6 +116,13 @@ const HUD_ICONS: [&str; 41] = [
     "xenonbutton_dpad_down",
     "xenonbutton_dpad_left",
     "xenonbutton_dpad_right",
+    // BO2 on PC: its menu tabs' arrows (frame::bo2_cycle_glyph).
+    "ui_arrow_left",
+    "ui_arrow_right",
+    // The lobby rows' speaker (the engine's VoipImage, code_post_gfx_zm):
+    // muted, and talking (its left half is the quiet one).
+    "voice_off",
+    "voice_on",
 ];
 
 /// The HUD's fonts by the Lua scripts' names and their files, as
@@ -445,7 +457,11 @@ fn hud_icons(
         return crate::T6HudIcons(icons);
     };
     // The materials the UI scripts name, beside the hand-picked ones.
-    let mut wanted: Vec<String> = HUD_ICONS.iter().map(|s| (*s).to_owned()).collect();
+    let mut wanted: Vec<String> = HUD_ICONS
+        .iter()
+        .chain(super::t6_perks::HUD_ICONS.iter())
+        .map(|s| (*s).to_owned())
+        .collect();
     let mut seen: std::collections::BTreeSet<String> = wanted.iter().cloned().collect();
     // bo2mc: every weapon's kill icon and HUD icon (its picture as an item).
     for c in captures {
@@ -470,7 +486,11 @@ fn hud_icons(
     for name in &wanted {
         let name = name.as_str();
         let mut add = false;
-        let found = captures.iter().find_map(|c| {
+        // A patch zone's copy replaces the one it patches (`patch_ui_zm`'s
+        // Theater frame is silver with light cracks, `ui_zm`'s dull).
+        let patched = captures.iter().filter(|c| c.zone.starts_with("patch_"));
+        let rest = captures.iter().filter(|c| !c.zone.starts_with("patch_"));
+        let found = patched.chain(rest).find_map(|c| {
             let m = c.materials.iter().find(|m| m.name == name)?;
             add = super::t6_materials::is_additive(m);
             let t = super::t6_materials::colour_texture(m, c)?;
@@ -498,6 +518,13 @@ fn hud_icons(
                     }
                     None => img,
                 };
+                // The lobby's quiet speaker: BO2 draws `voice_on` without
+                // its sound waves while nobody talks.
+                if name == "voice_on" {
+                    if let Some(quiet) = super::t6_materials::left_part(&img, 0.5) {
+                        icons.push(("voice_quiet".to_owned(), std::sync::Arc::new(quiet)));
+                    }
+                }
                 icons.push((name.to_owned(), std::sync::Arc::new(img)));
             }
             Err(e) => {
@@ -579,6 +606,7 @@ const NUKETOWN_WEAPONS: [&str; 40] = [
 #[allow(clippy::too_many_arguments)]
 fn census(
     captures: &[&ZoneCapture],
+    weapons: &[&str],
     weapon_refs: &HashMap<String, &asset_t6::WeaponRef>,
     models_missing: &[String],
     xanims: &XAnimBuild,
@@ -644,7 +672,7 @@ fn census(
             }
         }
     };
-    for name in NUKETOWN_WEAPONS {
+    for &name in weapons {
         let Some(w) = weapon_refs.get(name) else {
             missing_weapons.push(format!("{name}: not in the zones"));
             continue;
@@ -783,7 +811,7 @@ fn census(
         format!(
             "t6 census: {} missing weapons of {} (models, first person, animations){}",
             missing_weapons.len(),
-            NUKETOWN_WEAPONS.len(),
+            weapons.len(),
             if missing_weapons.is_empty() {
                 String::new()
             } else {
@@ -868,6 +896,7 @@ fn map_scripts(
             loop_sounds.push(asset_audio::CreateFxLoopSound {
                 soundalias: alias.clone(),
                 origin_inches: [0, 1, 2].map(|a| p.origin[a] + off[a]),
+                line_end_inches: None,
             });
         }
     }
@@ -875,9 +904,10 @@ fn map_scripts(
         loop_sounds.push(asset_audio::CreateFxLoopSound {
             soundalias: alias.clone(),
             origin_inches: *origin,
+            line_end_inches: None,
         });
     }
-    let random_sounds: Vec<asset_audio::RandomPointSound> = facts
+    let mut random_sounds: Vec<asset_audio::RandomPointSound> = facts
         .random_sounds
         .iter()
         .map(|(alias, wait, places)| asset_audio::RandomPointSound {
@@ -886,10 +916,15 @@ fn map_scripts(
             places_inches: places.clone(),
         })
         .collect();
+    let (structs_random, structs_loop) =
+        map_sound_structs(captures, &mut random_sounds, &mut loop_sounds);
     let unresolved = shown
         .iter()
         .filter(|p| !facts.effects.contains_key(&p.fxid))
         .count();
+    report.push(format!(
+        "t6 map sound structs: {structs_random} now-and-then (wind gusts, creaks), {structs_loop} loops (power lines, wind lines, arcs)"
+    ));
     report.push(format!(
         "t6 map scripts: {} placed effects ({} shown at load, {} exploders wait for the game, {unresolved} without an effect table entry); {} loop sounds ({} on effects, {} at points); {} now-and-then sounds; room tone {}",
         facts.placed.len(),
@@ -901,18 +936,104 @@ fn map_scripts(
         random_sounds.len(),
         facts.room_tone.as_deref().unwrap_or("none"),
     ));
+    report.push(format!("t6 map rooms (room, echo, dry, wet): {:?}", facts.room_echoes));
     (
         asset_audio::ScriptedMapFx {
             oneshots,
             loop_sounds,
             random_sounds,
+            rooms: facts.room_echoes.clone(),
         },
         facts.room_tone,
     )
 }
 
+/// The map's sound structs, which every map's client script
+/// (clientscripts/mp/_audio.csc) starts: a "random" one plays its sound at
+/// its place every `randomfloatrange(script_wait_min, script_wait_max)` s
+/// (1 to 3 by default), a "looper" loops it there, a "line_emitter" loops
+/// it along the line to its target. Returns (random, loops) added.
+fn map_sound_structs(
+    captures: &[&ZoneCapture],
+    random: &mut Vec<asset_audio::RandomPointSound>,
+    loops: &mut Vec<asset_audio::CreateFxLoopSound>,
+) -> (usize, usize) {
+    let Some(ents) = captures.iter().rev().find(|c| !c.map_ents.is_empty()) else {
+        return (0, 0);
+    };
+    let ents: Vec<_> = ents
+        .map_ents
+        .iter()
+        .flat_map(|e| asset_t6::parse_entities(e))
+        .collect();
+    let (mut nr, mut nl) = (0, 0);
+    for e in &ents {
+        if e.classname() != "script_struct" {
+            continue;
+        }
+        let (Some(alias), Some(origin)) = (e.get("script_sound"), e.vec3("origin")) else {
+            continue;
+        };
+        let alias = alias.to_owned();
+        match e.get("script_label") {
+            Some("random") => {
+                let f = |k: &str, d: f32| e.get(k).and_then(|v| v.trim().parse().ok()).unwrap_or(d);
+                random.push(asset_audio::RandomPointSound {
+                    soundalias: alias,
+                    wait_secs: [f("script_wait_min", 1.0), f("script_wait_max", 3.0)],
+                    places_inches: vec![origin],
+                });
+                nr += 1;
+            }
+            Some("looper") => {
+                loops.push(asset_audio::CreateFxLoopSound {
+                    soundalias: alias,
+                    origin_inches: origin,
+                    line_end_inches: None,
+                });
+                nl += 1;
+            }
+            Some("line_emitter") => {
+                let end = e.get("target").and_then(|t| {
+                    ents.iter()
+                        .find(|o| o.get("targetname") == Some(t))
+                        .and_then(|o| o.vec3("origin"))
+                });
+                loops.push(asset_audio::CreateFxLoopSound {
+                    soundalias: alias,
+                    origin_inches: origin,
+                    line_end_inches: end,
+                });
+                nl += 1;
+            }
+            _ => {}
+        }
+    }
+    (nr, nl)
+}
+
 /// bo2zm M3: every XModel the zones carry whose name a server script
 /// (as a string constant) or a map entity (`"model"`) names.
+/// What a bullet shows on a model's bone boxes: its paint's surface (a
+/// mannequin's is plastic), the one most of its surfaces use; 0 (blood) when
+/// none has one.
+fn model_surface_flags(capture: &ZoneCapture, model: &asset_t6::XModelRef) -> u32 {
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for srf in &model.lod0 {
+        let flags = srf
+            .material
+            .and_then(|k| capture.material(k))
+            .map_or(0, |m| m.surface_flags);
+        if flags != 0 {
+            *counts.entry(flags).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map_or(0, |(flags, _)| flags)
+}
+
 fn script_model_names(captures: &[&ZoneCapture]) -> BTreeSet<String> {
     let models: BTreeSet<&str> = captures
         .iter()
@@ -942,6 +1063,16 @@ fn script_model_names(captures: &[&ZoneCapture]) -> BTreeSet<String> {
                 take(m);
             }
         }
+        // The pieces a breakable prop throws (a mannequin's head and arms).
+        for d in &c.destructibles {
+            for p in &d.pieces {
+                for st in &p.stages {
+                    for m in st.spawn_models.iter().flatten() {
+                        take(m);
+                    }
+                }
+            }
+        }
         for ents in &c.map_ents {
             for e in asset_t6::parse_entities(ents) {
                 if let Some(m) = e.get("model").filter(|m| !m.starts_with('*')) {
@@ -961,7 +1092,10 @@ fn script_model_names(captures: &[&ZoneCapture]) -> BTreeSet<String> {
 
 /// The zones around the map zone, in load order, that exist beside it.
 fn zone_paths(map_path: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    let dir = map_path.parent().unwrap_or(Path::new("."));
+    // bo2zm: a map from an extra folder (`IW4L_T6_EXTRA`) still loads the
+    // install's common zones.
+    let dir = asset_transport::t6_extra::install_zone_dir(map_path);
+    let dir = dir.as_path();
     let stem = map_path
         .file_stem()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
@@ -974,7 +1108,27 @@ fn zone_paths(map_path: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if stem == "zm_nuked" {
         pre.push(dir.join("dlczm0_load_zm.ff"));
     }
-    let post = vec![dir.join(format!("{stem}_patch.ff"))];
+    // A map from an extra folder (Zombies Declassified) loads its mod's
+    // zones (weapons, string tables, menus) before the map, as its game does.
+    if map_path.parent() != Some(dir) {
+        pre.extend(
+            ["mod.ff", "mod_load.ff", "mod_patch.ff"]
+                .iter()
+                .filter_map(|z| asset_transport::t6_extra::extra_file(z)),
+        );
+    }
+    // The mode zone (`so_zclassic_zm_buried.ff`: the map's zombie types,
+    // their characters and animstatedefs, the mode's extra entities), then
+    // the patch. Nuketown plays zstandard and has none.
+    let mode = if stem == "zm_nuked" {
+        "zstandard"
+    } else {
+        "zclassic"
+    };
+    let post = vec![
+        asset_transport::t6_extra::file_in(dir, &format!("so_{mode}_{stem}.ff")),
+        asset_transport::t6_extra::file_in(dir, &format!("{stem}_patch.ff")),
+    ];
     let exists = |v: Vec<PathBuf>| v.into_iter().filter(|p| p.is_file()).collect();
     (exists(pre), exists(post))
 }
@@ -1187,6 +1341,7 @@ pub(crate) fn load_t6_combat(
 ) -> T6Combat {
     let mut report = Vec::new();
     let (pre, post) = zone_paths(map_path);
+    let zone_dir = asset_transport::t6_extra::install_zone_dir(map_path);
     let capture = |path: &PathBuf, report: &mut Vec<String>| match asset_t6::capture_zone(path) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -1199,8 +1354,23 @@ pub(crate) fn load_t6_combat(
         .iter()
         .filter_map(|p| capture(p, &mut report))
         .collect();
-    let captures: Vec<&ZoneCapture> = pre_caps
+    // bo2mc: the other perks' assets from the other maps' zones, first
+    // (the map's own zones win a name they share).
+    let perk_caps: Vec<ZoneCapture> = if super::t6_perks::wanted(
+        &map_path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
+    ) {
+        let base: Vec<&ZoneCapture> = pre_caps
+            .iter()
+            .chain(std::iter::once(map_capture))
+            .chain(post_caps.iter())
+            .collect();
+        super::t6_perks::extra_captures(map_path, &base, &mut report)
+    } else {
+        Vec::new()
+    };
+    let captures: Vec<&ZoneCapture> = perk_caps
         .iter()
+        .chain(pre_caps.iter())
         .chain(std::iter::once(map_capture))
         .chain(post_caps.iter())
         .collect();
@@ -1261,6 +1431,15 @@ pub(crate) fn load_t6_combat(
     for arms in T6_OTHER_ARMS {
         model_names.insert(arms.to_owned());
     }
+    // Every other map's player arms (`c_zom_reporter_viewhands` in
+    // Buried's mode zone): whatever viewhands its zones carry.
+    for c in &captures {
+        for m in c.xmodels.iter() {
+            if real(&m.name) && m.name.contains("_viewhands") {
+                model_names.insert(m.name.clone());
+            }
+        }
+    }
     // bo2zm M3: models the map's own scripts and entities name (perk
     // machines, the box, power-ups, zombie bodies and heads...), drawn as
     // script models and actors from the same catalog.
@@ -1270,6 +1449,10 @@ pub(crate) fn load_t6_combat(
         script_models.len()
     ));
     model_names.extend(script_models);
+    // bo2mc: the perk machines only the engine names (Deadshot's, PhD's).
+    if !perk_caps.is_empty() {
+        model_names.extend(super::t6_perks::MODELS.iter().map(|m| (*m).to_owned()));
+    }
 
     // Third-person gun models too (a weapon cannot be given without one).
     let mut world_names: BTreeSet<String> = BTreeSet::new();
@@ -1369,7 +1552,10 @@ pub(crate) fn load_t6_combat(
             continue;
         };
         match asset_model::capture_model_skel_t6(model, |k| catalog_material(ci, k)) {
-            Some(skel) => fpv.insert_in(asset_core::AssetNamespace::T6, skel, Some(materials)),
+            Some(mut skel) => {
+                skel.surface_flags = model_surface_flags(captures[ci], model);
+                fpv.insert_in(asset_core::AssetNamespace::T6, skel, Some(materials))
+            }
             None => fpv_missing.push(format!("{name} (unreadable)")),
         }
     }
@@ -1596,8 +1782,7 @@ pub(crate) fn load_t6_combat(
     let map = map_path
         .file_stem()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    let sound_dir = map_path
-        .parent()
+    let sound_dir = Some(zone_dir.as_path())
         .and_then(Path::parent)
         .and_then(Path::parent)
         .map(|install| install.join("sound"));
@@ -1605,8 +1790,7 @@ pub(crate) fn load_t6_combat(
     // The language zones beside zone/all (zone/english/en_*.ff): the
     // English strings (hints, perk and power-up names) and the voices'
     // aliases (the announcer's, the players').
-    let lang_dir = map_path
-        .parent()
+    let lang_dir = Some(zone_dir.as_path())
         .and_then(Path::parent)
         .map(|d| d.join("english"));
     let lang_caps: Vec<ZoneCapture> = [
@@ -1619,7 +1803,7 @@ pub(crate) fn load_t6_combat(
     ]
     .iter()
     .filter_map(|z| {
-        let path = lang_dir.as_ref()?.join(format!("en_{z}.ff"));
+        let path = asset_transport::t6_extra::file_in(lang_dir.as_ref()?, &format!("en_{z}.ff"));
         if !path.is_file() {
             return None;
         }
@@ -1660,6 +1844,13 @@ pub(crate) fn load_t6_combat(
                 globals.map_or(0, |g| g.curves.len())
             ));
             catalog.scripted_map_fx = Some(map_fx);
+            let mut echoes: Vec<String> = catalog
+                .radverbs
+                .iter()
+                .map(|(name, v)| format!("{name} {v:?}"))
+                .collect();
+            echoes.sort();
+            report.push(format!("t6 sound: {} room echoes: {}", echoes.len(), echoes.join("; ")));
             Ok(catalog)
         }
         _ => Err("Black Ops II sound folder not found beside the zones".to_owned()),
@@ -1669,8 +1860,15 @@ pub(crate) fn load_t6_combat(
         .chain(world_missing.iter())
         .cloned()
         .collect();
+    // bo2mc: the other maps' weapons it loads whole are counted too.
+    let census_weapons: Vec<&str> = NUKETOWN_WEAPONS
+        .iter()
+        .copied()
+        .chain(super::t6_perks::WEAPONS.iter().copied().filter(|_| !perk_caps.is_empty()))
+        .collect();
     let census_lines = census(
         &captures,
+        &census_weapons,
         &weapon_refs,
         &models_missing,
         &xanims,
@@ -1712,10 +1910,25 @@ pub(crate) fn load_t6_combat(
             }
         }
         scripts.entities.extend(c.map_ents.iter().cloned());
+        for d in c.destructibles.iter().filter(|d| real(&d.name)) {
+            scripts.destructibles.retain(|o| o.name != d.name);
+            scripts.destructibles.push(t5_destructible(d));
+        }
+        for z in &c.zbarriers {
+            scripts.zbarriers.retain(|o| !o.name.eq_ignore_ascii_case(&z.name));
+            scripts.zbarriers.push(z.clone());
+        }
         if !c.path_nodes.is_empty() {
             scripts.path_nodes = c.path_nodes.clone();
         }
         for (name, bytes) in &c.raw_files {
+            let lower = name.to_ascii_lowercase();
+            if let Some(shock) = lower.strip_prefix("shock/").and_then(|n| n.strip_suffix(".shock")) {
+                scripts.shocks.retain(|(n, _)| n != shock);
+                scripts
+                    .shocks
+                    .push((shock.to_owned(), String::from_utf8_lossy(bytes).into_owned()));
+            }
             if name.starts_with("animstatedefs/") && name.ends_with(".asd") {
                 let text = String::from_utf8_lossy(bytes).into_owned();
                 scripts.animstatedefs.retain(|(n, _)| n != name);
@@ -1742,9 +1955,23 @@ pub(crate) fn load_t6_combat(
     }
     scripts.anims = anim_facts.into_values().collect();
     let mut strings: HashMap<String, String> = HashMap::new();
-    for c in &lang_caps {
+    // bo2mc: the other maps' strings first (the perks' hints); the map's
+    // own win a name.
+    let perk_lang = if perk_caps.is_empty() {
+        Vec::new()
+    } else {
+        super::t6_perks::extra_lang_captures(lang_dir.as_deref(), &mut report)
+    };
+    for c in perk_lang.iter().chain(&lang_caps) {
         for (k, v) in &c.localize {
             strings.insert(k.clone(), v.clone());
+        }
+    }
+    // Strings a mod zone carries (Zombies Declassified's mod_load), where
+    // no language zone has the key.
+    for c in &captures {
+        for (k, v) in &c.localize {
+            strings.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
     scripts.strings = strings.into_iter().collect();
@@ -1757,14 +1984,15 @@ pub(crate) fn load_t6_combat(
             .collect();
     }
     report.push(format!(
-        "t6 scripts: {} server script objects, {} string tables, {} entity strings, {} path nodes, {} animations, {} animstatedefs, {} English strings",
+        "t6 scripts: {} server script objects, {} string tables, {} entity strings, {} path nodes, {} animations, {} animstatedefs, {} English strings, {} barrier types",
         scripts.objects.len(),
         scripts.tables.len(),
         scripts.entities.len(),
         scripts.path_nodes.len(),
         scripts.anims.len(),
         scripts.animstatedefs.len(),
-        scripts.strings.len()
+        scripts.strings.len(),
+        scripts.zbarriers.len()
     ));
     let ui_script_list = ui_scripts(&captures);
     let ui_names = ui_strings(&ui_script_list);
@@ -1782,8 +2010,7 @@ pub(crate) fn load_t6_combat(
     crate::bo2mc_frontend::add_minecraft_rows(&mut ui, &mut mc);
     report.extend(mc.into_iter().map(|l| format!("bo2mc hud: {l}")));
     // The font sheet's pixels are in the language's own image packs.
-    let lang_packs = map_path
-        .parent()
+    let lang_packs = Some(zone_dir.as_path())
         .and_then(Path::parent)
         .map(|d| d.join("english"))
         .and_then(|d| asset_t6::PackSet::open_dir(&d).ok());
@@ -1820,5 +2047,41 @@ pub(crate) fn load_t6_combat(
         ui,
         pen_table,
         report,
+    }
+}
+
+/// A BO2 `DestructibleDef` in the shape the server's destructibles run on
+/// (Black Ops' own, the same layout).
+fn t5_destructible(d: &asset_t6::m2::DestructibleRef) -> xmodel_runtime::T5DestructibleDef {
+    xmodel_runtime::T5DestructibleDef {
+        name: d.name.clone(),
+        model: d.model.clone(),
+        pieces: d
+            .pieces
+            .iter()
+            .map(|p| xmodel_runtime::T5DestructiblePiece {
+                stages: p.stages.clone().map(|st| xmodel_runtime::T5DestructibleStage {
+                    show_bone: st.show_bone,
+                    break_health: st.break_health,
+                    max_time: st.max_time,
+                    flags: st.flags,
+                    break_effect: st.break_effect,
+                    break_sound: st.break_sound,
+                    break_notify: st.break_notify,
+                    loop_sound: st.loop_sound,
+                    has_phys_preset: st.has_phys_preset,
+                    spawn_models: st.spawn_models,
+                }),
+                parent_piece: p.parent_piece,
+                parent_damage_percent: p.parent_damage_percent,
+                bullet_damage_scale: p.bullet_damage_scale,
+                explosive_damage_scale: p.explosive_damage_scale,
+                health: p.health,
+                // BO2's piece launch is not read yet.
+                launch: None,
+                hide_bones: p.hide_bones,
+            })
+            .collect(),
+        client_only: d.client_only,
     }
 }

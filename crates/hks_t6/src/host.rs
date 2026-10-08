@@ -31,6 +31,9 @@ pub struct EngineValues {
     pub dvars: HashMap<String, String>,
     /// `Engine.GetGametypeSetting(name)`.
     pub settings: HashMap<String, f32>,
+    /// The settings as the game starts them (`Engine.IsGametypeSettingDefault`:
+    /// Custom Games marks a row he changed).
+    pub default_settings: HashMap<String, f32>,
     /// The visibility bits that are set (`CoD.BIT_*` numbers).
     pub bits: HashSet<i32>,
     /// bo2zm: his last input was a pad (`Engine.LastInput_Gamepad`): BO2's
@@ -94,6 +97,10 @@ pub enum EngineCall {
     /// `Engine.PlayMenuMusic(alias)`: the menus' music (the front end's
     /// `mus_mp_frontend`).
     PlayMusic(String),
+    /// An event the engine sends the root when something it was asked for
+    /// is ready (Theater's film browser: `fileshare_slots_available`,
+    /// `fileshare_search_complete`), with its number fields.
+    Event(String, Vec<(String, f32)>),
 }
 
 /// One element as drawn: its rectangle in root units (0,0 = the root's top
@@ -155,6 +162,157 @@ fn script_key(name: &str) -> String {
     stem.chars()
         .filter(|c| !matches!(c, '/' | '\\' | '_' | '.'))
         .collect()
+}
+
+/// bo2zm M4: buttons the menus leave out, as (label, event): the main
+/// menu's Campaign (his 10-06 call: "No campaign button"; there is no
+/// campaign here), and the lobbies' COD TV and Leaderboards (his 10-06
+/// call: "COD TV, we can just remove that. Leaderboard, we could probably
+/// just remove that"; both need BO2's online service). Theater has its
+/// own COD TV (event `open_codtv`).
+const DROPPED_BUTTONS: [(&str, &str); 4] = [
+    ("MENU_SINGLEPLAYER_CAPS", "open_sp_switch_popup"),
+    ("MENU_COD_TV_CAPS", "open_cod_tv"),
+    ("MENU_COD_TV_CAPS", "open_codtv"),
+    ("MPUI_LEADERBOARDS_CAPS", "open_barracks"),
+];
+
+/// bo2zm M4: the gap the Zombies lobby puts above COD TV and Leaderboards
+/// goes with them (else two gaps meet above Options).
+const DROPPED_SPACERS: [&str; 1] = ["theaterSpacer"];
+
+/// A jump from `start` to `end` in place of the op at `start`: the run
+/// between becomes as if the script never had it.
+fn jump_over(p: &mut crate::Proto, start: usize, end: usize) {
+    let jmp = crate::OP_NAMES.iter().position(|n| *n == "JMP").unwrap_or(28) as u32;
+    let sbx = (end as i64 - (start as i64 + 1) + 0xFFFF) as u32 & 0x1_FFFF;
+    p.code[start] = (jmp << 25) | (sbx << 8);
+}
+
+/// bo2zm M4: leave out the menus' [`DROPPED_BUTTONS`] and
+/// [`DROPPED_SPACERS`] in `p` and every function inside it. BO2's scripts
+/// add a button as `buttonList:addButton(Engine.Localize(label), ...)`
+/// and give it its action with `setActionEventName(event)`; that run
+/// becomes one jump over it (the list lays out and links the rest as it
+/// does for any button it leaves out). A spacer is `body.<name> =
+/// buttonList:addSpacer(...)`; that run goes the same way, leaving the
+/// field empty.
+fn drop_buttons(p: &mut crate::Proto) {
+    let is_str = |p: &crate::Proto, k: usize, want: &str| {
+        matches!(p.consts.get(k), Some(crate::Const::String(s)) if s.as_slice() == want.as_bytes())
+    };
+    for (label, event) in DROPPED_BUTTONS {
+        let ops: Vec<crate::Ins> = p.code.iter().map(|w| crate::decode(*w)).collect();
+        let name = |i: usize| crate::op_name(ops[i].op);
+        let Some(l) = (0..ops.len())
+            .find(|&i| name(i) == "LOADK" && is_str(p, ops[i].bx as usize, label))
+        else {
+            continue;
+        };
+        let start = (0..l).rev().take(16).find(|&i| {
+            name(i).starts_with("GETFIELD") && is_str(p, ops[i].c as usize, "buttonList")
+        });
+        let end = (l..ops.len())
+            .take(40)
+            .find(|&i| name(i) == "LOADK" && is_str(p, ops[i].bx as usize, event))
+            .and_then(|e| {
+                (e..ops.len()).take(4).find(|&i| name(i).starts_with("CALL")).map(|i| i + 1)
+            });
+        if let (Some(start), Some(end)) = (start, end) {
+            jump_over(p, start, end);
+        }
+    }
+    for field in DROPPED_SPACERS {
+        let ops: Vec<crate::Ins> = p.code.iter().map(|w| crate::decode(*w)).collect();
+        let name = |i: usize| crate::op_name(ops[i].op);
+        let Some(set) = (0..ops.len())
+            .find(|&i| name(i).starts_with("SETFIELD") && is_str(p, ops[i].b as usize, field))
+        else {
+            continue;
+        };
+        let spacer = (0..set).rev().take(16).find(|&i| {
+            name(i) == "SELF" && is_str(p, (ops[i].c & 0xFF) as usize, "addSpacer")
+        });
+        let start = spacer.and_then(|k| {
+            (0..k).rev().take(4).find(|&i| {
+                name(i).starts_with("GETFIELD") && is_str(p, ops[i].c as usize, "buttonList")
+            })
+        });
+        if let Some(start) = start {
+            jump_over(p, start, set + 1);
+        }
+    }
+    // Theater's half-height gap above COD TV (no field: `addSpacer` just
+    // before its `Engine.IsBetaBuild()` check) goes with COD TV.
+    if p.consts.iter().any(|k| matches!(k, crate::Const::String(s) if s.as_slice() == b"open_codtv")) {
+        let ops: Vec<crate::Ins> = p.code.iter().map(|w| crate::decode(*w)).collect();
+        let name = |i: usize| crate::op_name(ops[i].op);
+        let gap = (0..ops.len()).find_map(|i| {
+            if !(name(i) == "SELF" && is_str(p, (ops[i].c & 0xFF) as usize, "addSpacer")) {
+                return None;
+            }
+            let end = (i..ops.len()).take(12).find(|&j| name(j).starts_with("CALL"))? + 1;
+            (end..ops.len()).take(4).find(|&j| {
+                name(j).starts_with("GETFIELD") && is_str(p, ops[j].c as usize, "IsBetaBuild")
+            })?;
+            let start = (0..i).rev().take(4).find(|&j| {
+                name(j).starts_with("GETFIELD") && is_str(p, ops[j].c as usize, "buttonList")
+            })?;
+            Some((start, end))
+        });
+        if let Some((start, end)) = gap {
+            jump_over(p, start, end);
+        }
+        // Its focus calls on the dropped buttons
+        // (`body.codtvButton:processEvent({name = "gain_focus"})`) go too.
+        loop {
+            let ops: Vec<crate::Ins> = p.code.iter().map(|w| crate::decode(*w)).collect();
+            let name = |i: usize| crate::op_name(ops[i].op);
+            let found = (0..ops.len()).find_map(|g| {
+                let dropped = ["codtvButton", "barracksButton"];
+                if !(name(g) == "GETFIELD_R1" && dropped.iter().any(|f| is_str(p, ops[g].c as usize, f))) {
+                    return None;
+                }
+                (g..ops.len()).take(4).find(|&i| {
+                    name(i) == "SELF" && is_str(p, (ops[i].c & 0xFF) as usize, "processEvent")
+                })?;
+                let start = (0..g).rev().take(4).find(|&i| {
+                    name(i).starts_with("GETFIELD") && is_str(p, ops[i].c as usize, "body")
+                })?;
+                let end = (g..ops.len()).take(10).find(|&i| name(i).starts_with("CALL"))? + 1;
+                Some((start, end))
+            });
+            let Some((start, end)) = found else { break };
+            jump_over(p, start, end);
+        }
+    }
+    // The lobby puts its list back together when the party changes
+    // (`buttonList:addElement(body.theaterSpacer)`): a dropped spacer is
+    // left out there too.
+    for field in DROPPED_SPACERS {
+        loop {
+            let ops: Vec<crate::Ins> = p.code.iter().map(|w| crate::decode(*w)).collect();
+            let name = |i: usize| crate::op_name(ops[i].op);
+            let found = (0..ops.len()).find_map(|g| {
+                if !(name(g) == "GETFIELD_R1" && is_str(p, ops[g].c as usize, field)) {
+                    return None;
+                }
+                let add = (0..g).rev().take(8).find(|&i| {
+                    name(i) == "SELF" && is_str(p, (ops[i].c & 0xFF) as usize, "addElement")
+                })?;
+                let start = (0..add).rev().take(4).find(|&i| {
+                    name(i).starts_with("GETFIELD") && is_str(p, ops[i].c as usize, "buttonList")
+                })?;
+                let end = (g..ops.len()).take(4).find(|&i| name(i).starts_with("CALL"))? + 1;
+                Some((start, end))
+            });
+            let Some((start, end)) = found else { break };
+            jump_over(p, start, end);
+        }
+    }
+    for c in p.protos.iter_mut() {
+        drop_buttons(std::rc::Rc::make_mut(c));
+    }
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -284,7 +442,8 @@ impl Host {
         // game's `zm/<x>`.
         let v = values.clone();
         let f = vm.native("TableLookup", move |_, a| {
-            let table = arg(&a, 1).to_string();
+            // The tables are kept by lowercase name ("mp/rankIconTable_zm.csv").
+            let table = arg(&a, 1).to_string().replace('\\', "/").to_ascii_lowercase();
             let rest: Vec<Value> = a.iter().skip(2).cloned().collect();
             let Some((ret, pairs)) = rest.split_last() else {
                 return Ok(vec![Value::str("")]);
@@ -313,6 +472,23 @@ impl Host {
             Ok(vec![Value::str(&hit)])
         });
         set_field(&ui, "TableLookup", f);
+        // FormatNumberWithCommas(controller, n): `1,234`.
+        let f = vm.native("FormatNumberWithCommas", |_, a| {
+            let n = arg(&a, 1).as_num().unwrap_or(0.0).round() as i64;
+            let digits = n.unsigned_abs().to_string();
+            let mut out = String::new();
+            for (i, c) in digits.chars().enumerate() {
+                if i > 0 && (digits.len() - i) % 3 == 0 {
+                    out.push(',');
+                }
+                out.push(c);
+            }
+            if n < 0 {
+                out.insert(0, '-');
+            }
+            Ok(vec![Value::str(&out)])
+        });
+        set_field(&ui, "FormatNumberWithCommas", f);
         // The maps table a zombies game reads (CoD.mapsTable).
         let f = vm.native("GetCurrentMapTableName", |_, _| {
             Ok(vec![Value::str("zm/mapstable.csv")])
@@ -362,6 +538,15 @@ impl Host {
         });
         set_field(&engine, "SetGametypeSetting", f);
         let v = values.clone();
+        let f = vm.native("IsGametypeSettingDefault", move |_, a| {
+            let name = arg(&a, 0).to_string();
+            let v = v.borrow();
+            Ok(vec![Value::Bool(
+                v.settings.get(&name) == v.default_settings.get(&name),
+            )])
+        });
+        set_field(&engine, "IsGametypeSettingDefault", f);
+        let v = values.clone();
         let f = vm.native("Localize", move |_, a| {
             let key = arg(&a, 0).to_string();
             let mut text = v
@@ -369,7 +554,7 @@ impl Host {
                 .localize
                 .get(&key.to_ascii_uppercase())
                 .cloned()
-                .unwrap_or(key);
+                .unwrap_or(key.clone());
             // "&&1".. take the arguments.
             for (i, x) in a.iter().enumerate().skip(1) {
                 text = text.replace(&format!("&&{i}"), &x.to_string());
@@ -410,12 +595,15 @@ impl Host {
             if on {
                 v.game_modes.push(m);
             }
+            party_size(&mut v);
             Ok(vec![])
         });
         set_field(&engine, "GameModeSetMode", f);
         let v = values.clone();
         let f = vm.native("GameModeResetModes", move |_, _| {
-            v.borrow_mut().game_modes.clear();
+            let mut v = v.borrow_mut();
+            v.game_modes.clear();
+            party_size(&mut v);
             Ok(vec![])
         });
         set_field(&engine, "GameModeResetModes", f);
@@ -472,6 +660,8 @@ impl Host {
         // service's fetches are done, every rating allowed.
         let truthy = vm.native("true", |_, _| Ok(vec![Value::Bool(true)]));
         set_field(&engine, "CheckNetConnection", truthy.clone());
+        // The lobby rows show his rank icon (not hidden as a stranger's).
+        set_field(&engine, "PartyShowTruePlayerInfo", truthy.clone());
         for name in ["IsFeatureBanned", "IsVacBanned", "WaitingForSteamTicket"] {
             set_field(&engine, name, falsy.clone());
         }
@@ -479,6 +669,8 @@ impl Host {
             set_field(&ui, name, one_pad.clone());
         }
         set_field(&ui, "IsAnyControllerMPRestricted", zero.clone());
+        // Not a LAN game: the lobby rows show his rank icon (alpha 0 there).
+        set_field(&ui, "SessionMode_IsSystemlinkGame", zero.clone());
         // His party (`xstartprivateparty`): he hosts it and is alone in it.
         for name in [
             "PrivatePartyHost",
@@ -495,10 +687,16 @@ impl Host {
         ] {
             set_field(&engine, name, one_pad.clone());
         }
-        // The party waits for him to start (the solo lobby's Start Match);
-        // a Custom Games host is ready, and Start Match starts it.
+        // The party waits for him to start (the solo lobby's Start Match).
+        // "Host is ready to start" means the match is already launching: every
+        // lobby greys Start Match and Map while it answers true.
         set_field(&engine, "PartyIsWaiting", truthy.clone());
-        set_field(&engine, "PartyHostIsReadyToStart", truthy.clone());
+        let f = vm.native("false", |_, _| Ok(vec![Value::Bool(false)]));
+        set_field(&engine, "PartyHostIsReadyToStart", f);
+        // The map he picked is valid and he owns it: without these the Custom
+        // Games lobby reset his map to TranZit and greyed Start Match and Map.
+        set_field(&engine, "IsMapValid", truthy.clone());
+        set_field(&engine, "DoesPartyHaveDLCForMap", truthy.clone());
         let c = calls.clone();
         let f = vm.native("PartyHostToggleStart", move |_, _| {
             c.borrow_mut().push(EngineCall::Exec("xpartygo".to_owned()));
@@ -545,9 +743,101 @@ impl Host {
             "GetTitleFriendsOfAllLocalPlayers",
             "GetFriendsOfAllLocalPlayers",
             "GetRecentPlayers",
+            // No league team: the lobby's player card skips the team row.
+            "GetLeagueTeamInfo",
         ] {
             set_field(&engine, name, empty.clone());
         }
+        // The player card (a row picked in the lobby's player list): him,
+        // with no status line.
+        let v = values.clone();
+        let f = vm.native("GetPlayerInfoByXuid", move |_, _| {
+            let m = lobby_members(&v.borrow());
+            let p = m.table().and_then(|t| t.borrow().get(&Value::Num(1.0)).table().cloned());
+            let p = p.unwrap_or_else(Table::new_ref);
+            p.borrow_mut().set_str("status", Value::str(""));
+            // A string, as the card reads it (it looks up rank - 1 in the
+            // rank icon table; "0" would become "1").
+            p.borrow_mut().set_str("rank", Value::str("1"));
+            Ok(vec![Value::Table(p)])
+        });
+        set_field(&engine, "GetPlayerInfoByXuid", f);
+        // His own card: nobody can join him from the card (no "Joinable" line).
+        let f = vm.native("IsPlayerJoinable", |_, _| {
+            let t = Table::new_ref();
+            t.borrow_mut().set_str("isJoinable", Value::Bool(false));
+            Ok(vec![Value::Table(t)])
+        });
+        set_field(&engine, "IsPlayerJoinable", f);
+        // Theater's Select Film (codtv.lua, root "recents"): folder 1 holds
+        // the three shelves of real 15b, Recent Games, Films and Edited
+        // Films (folders 2-4, Demonware ones). Each search finds nothing:
+        // the game's own "Empty" tile and "There are no items available in
+        // this category." No films are recorded here.
+        let f = vm.native("IsCodtvContentLoaded", |_, _| Ok(vec![Value::Bool(true)]));
+        set_field(&engine, "IsCodtvContentLoaded", f);
+        let f = vm.native("GetCodtvRoot", |_, a| {
+            Ok(vec![if arg(&a, 0).to_string() == "recents" {
+                Value::Num(1.0)
+            } else {
+                Value::Nil
+            }])
+        });
+        set_field(&engine, "GetCodtvRoot", f);
+        const SHELVES: [&str; 3] = [
+            "MENU_FILESHARE_RECENTGAMES_CAPS",
+            "MENU_FILMS_CAPS",
+            "MENU_EDITED_FILMS",
+        ];
+        let v = values.clone();
+        let f = vm.native("GetCodtvContent", move |_, a| {
+            let loc = |k: &str| v.borrow().localize.get(k).cloned().unwrap_or_else(|| k.to_owned());
+            let i = match a.first() {
+                Some(Value::Num(n)) => *n as usize,
+                _ => return Ok(vec![Value::Nil]),
+            };
+            let t = Table::new_ref();
+            if i == 1 {
+                let mut t = t.borrow_mut();
+                t.set_str("name", Value::str(&loc("MENU_FILESHARE_SELECT_FILM_CAPS")));
+                t.set_str("type", Value::str("folder"));
+                t.set_str("subfolderCount", Value::Num(SHELVES.len() as f32));
+                for (n, key) in SHELVES.iter().enumerate() {
+                    let c = Table::new_ref();
+                    c.borrow_mut().set_str("name", Value::str(&loc(key)));
+                    c.borrow_mut().set_str("folderIndex", Value::Num((n + 2) as f32));
+                    t.set(Value::Num((n + 1) as f32), Value::Table(c));
+                }
+            } else if let Some(key) = SHELVES.get(i.wrapping_sub(2)) {
+                let mut t = t.borrow_mut();
+                t.set_str("name", Value::str(&loc(key)));
+                t.set_str("type", Value::str("dwfolder"));
+                t.set_str("subfolderCount", Value::Num(0.0));
+            } else {
+                return Ok(vec![Value::Nil]);
+            }
+            Ok(vec![Value::Table(t)])
+        });
+        set_field(&engine, "GetCodtvContent", f);
+        let c = calls.clone();
+        let f = vm.native("LoadCodtvDWContent", move |_, a| {
+            // (controller, folderIndex, startIndex, userData)
+            let folder = match a.get(1) {
+                Some(Value::Num(n)) => *n,
+                _ => 0.0,
+            };
+            c.borrow_mut().push(EngineCall::Event(
+                "fileshare_search_complete".to_owned(),
+                vec![
+                    ("controller".to_owned(), 0.0),
+                    ("contextid".to_owned(), folder),
+                    ("numresults".to_owned(), 0.0),
+                    ("startIndex".to_owned(), 0.0),
+                ],
+            ));
+            Ok(vec![Value::Bool(true)])
+        });
+        set_field(&engine, "LoadCodtvDWContent", f);
         // A map's start locations and a start location's game modes, from
         // zm/gametypestable.csv: rows `5,index,map,ref,name,desc,picture`
         // and `6,index,map,location,mode,dlc` (Nuketown: `nuked`,
@@ -579,7 +869,7 @@ impl Host {
                 e.borrow_mut().set_str("name", Value::str(&shown));
                 e.borrow_mut()
                     .set_str("index", Value::Num(cell(r, 1).parse().unwrap_or(0.0)));
-                e.borrow_mut().set_str("playerCount", Value::Num(0.0));
+                e.borrow_mut().set_str("playerCount", Value::Num(LOBBY_COUNT));
                 n += 1.0;
                 t.borrow_mut().set(Value::Num(n), Value::Table(e));
             }
@@ -618,7 +908,7 @@ impl Host {
                 e.borrow_mut().set_str("name", Value::str(&shown));
                 e.borrow_mut()
                     .set_str("index", Value::Num(cell(r, 1).parse().unwrap_or(0.0)));
-                e.borrow_mut().set_str("playerCount", Value::Num(0.0));
+                e.borrow_mut().set_str("playerCount", Value::Num(LOBBY_COUNT));
                 n += 1.0;
                 t.borrow_mut().set(Value::Num(n), Value::Table(e));
             }
@@ -646,10 +936,11 @@ impl Host {
                 let solo = if r.filter == "solomatch" { "_solo" } else { "" };
                 e.borrow_mut()
                     .set_str("loadName", Value::str(&format!("{}{solo}", r.map)));
+                e.borrow_mut().set_str("name", Value::str(&r.map_name));
                 e.borrow_mut().set_str("filter", Value::str(r.filter));
                 e.borrow_mut()
                     .set_str("index", Value::Num(r.super_index as f32));
-                e.borrow_mut().set_str("playerCount", Value::Num(0.0));
+                e.borrow_mut().set_str("playerCount", Value::Num(LOBBY_COUNT));
                 t.borrow_mut()
                     .set(Value::Num(seen.len() as f32), Value::Table(e));
             }
@@ -683,10 +974,11 @@ impl Host {
                         let c = Table::new_ref();
                         c.borrow_mut().set_str("ref", Value::str(&cref));
                         c.borrow_mut().set_str("name", Value::str(&r.loc_name));
+                        c.borrow_mut().set_str("description", Value::str(&r.loc_desc));
                         c.borrow_mut().set_str("filter", Value::str(r.filter));
                         c.borrow_mut()
                             .set_str("index", Value::Num((cats.len() + 1) as f32));
-                        c.borrow_mut().set_str("playerCount", Value::Num(0.0));
+                        c.borrow_mut().set_str("playerCount", Value::Num(LOBBY_COUNT));
                         c.borrow_mut()
                             .set_str("playlists", Value::Table(Table::new_ref()));
                         cats.push((cref.clone(), c.clone()));
@@ -701,11 +993,8 @@ impl Host {
                     p.borrow_mut().set_str("index", Value::Num(r.id as f32));
                     p.borrow_mut().set_str("ref", Value::str(&r.mode));
                     p.borrow_mut().set_str("name", Value::str(&r.mode_name));
-                    // bo2mc: its description (the start location's: Solo's
-                    // mode list showed "nil" under SURVIVAL).
-                    p.borrow_mut()
-                        .set_str("description", Value::str(&r.loc_desc));
-                    p.borrow_mut().set_str("playerCount", Value::Num(0.0));
+                    p.borrow_mut().set_str("description", Value::str(&r.loc_desc));
+                    p.borrow_mut().set_str("playerCount", Value::Num(LOBBY_COUNT));
                     let n = list.borrow().len() + 1;
                     list.borrow_mut().set(Value::Num(n as f32), Value::Table(p));
                 }
@@ -820,6 +1109,14 @@ impl Host {
                 .rev()
                 .find_map(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default();
+            // Theater's film browser asks for its save slots: there are
+            // none to fill, but the answer comes (BO2 asks Demonware).
+            if cmd == "fileshareGetSlots" {
+                c.borrow_mut().push(EngineCall::Event(
+                    "fileshare_slots_available".to_owned(),
+                    vec![("controller".to_owned(), 0.0), ("valid".to_owned(), 1.0)],
+                ));
+            }
             c.borrow_mut().push(EngineCall::Exec(cmd));
             Ok(vec![])
         });
@@ -973,7 +1270,9 @@ impl Host {
                         r.get(i).and_then(|c| c.parse::<f32>().ok()).unwrap_or(0.0) / 255.0
                     })
                 })
-                .unwrap_or([0.0, 0.502, 1.0]);
+                // No faction (the front-end lobby's free team): his
+                // lobby row's bar stays dark, as in the real lobby.
+                .unwrap_or([0.0, 0.0, 0.0]);
             Ok(rgb.into_iter().map(Value::Num).collect())
         });
         set_field(&engine, "GetFactionColor", f);
@@ -1019,12 +1318,24 @@ impl Host {
                     .and_then(|i| a.get(i + 1))
                     .and_then(Value::as_num)
                     .map_or(0, |n| n as usize);
-                let key = v
-                    .borrow()
-                    .binds
-                    .get(&cmd)
-                    .and_then(|keys| keys.get(index).cloned())
-                    .unwrap_or_default();
+                let vb = v.borrow();
+                let mut keys = vb.binds.get(&cmd).cloned().unwrap_or_default();
+                // Left and right Shift are one SHIFT on the page.
+                let mut seen = std::collections::HashSet::new();
+                keys.retain(|k| seen.insert(k.to_uppercase()));
+                // The Controls page's long form (9 arguments) lists every key
+                // ("V OR MOUSE 5") and says UNBOUND; HUD prompts take one key.
+                if a.len() > 3 {
+                    let word = |k: &str| vb.localize.get(k).cloned();
+                    let text = if keys.is_empty() {
+                        word("KEY_UNBOUND").unwrap_or_else(|| "UNBOUND".into())
+                    } else {
+                        let or = word("KEY_OR").unwrap_or_else(|| "or".into());
+                        keys.join(&format!(" {or} "))
+                    };
+                    return Ok(vec![Value::str(&text.to_uppercase())]);
+                }
+                let key = keys.get(index).cloned().unwrap_or_default();
                 Ok(vec![Value::str(&key.to_uppercase())])
             });
             set_field(table, name, f);
@@ -1135,8 +1446,14 @@ impl Host {
                 return Ok(vec![]);
             };
             loaded.borrow_mut().set_str(&module, Value::Bool(true));
-            let chunk =
+            let mut chunk =
                 crate::parse(&bytes).map_err(|e| LuaError::new(format!("{module}: {e}")))?;
+            if ["mainmenu", "mainlobby", "publicgamelobby", "theaterlobby"]
+                .iter()
+                .any(|m| stem.contains(m))
+            {
+                drop_buttons(&mut chunk.main);
+            }
             let f = vm.load(chunk.main);
             let r = vm.call(f, vec![])?;
             let v = r
@@ -1560,6 +1877,24 @@ fn set_field(t: &Value, name: &str, v: Value) {
 
 /// bo2zm M4: the lobby's members (`Engine.GetPlayersInLobby`, the lobby
 /// updates' `members`): him alone, host of his own party, ready.
+/// The engine's party size for the lobby he is in (`party_maxplayers`, the
+/// lobby list's "1 Player (N Max)"): a Custom Games lobby
+/// (CoD.GAMEMODE_PRIVATE_MATCH) holds `party_maxplayers_privatematch`, the
+/// Theater (CoD.GAMEMODE_THEATER) `party_maxplayers_theater` (4), the
+/// public lobby `party_maxplayers_partylobby` (8 in the real game).
+fn party_size(v: &mut EngineValues) {
+    let key = if v.game_modes.contains(&5.0) {
+        "party_maxplayers_theater"
+    } else if v.game_modes.contains(&1.0) {
+        "party_maxplayers_privatematch"
+    } else {
+        "party_maxplayers_partylobby"
+    };
+    if let Some(n) = v.dvars.get(key).cloned() {
+        v.dvars.insert("party_maxplayers".into(), n);
+    }
+}
+
 pub fn lobby_members(v: &EngineValues) -> Value {
     let m = Table::new_ref();
     {
@@ -1571,6 +1906,7 @@ pub fn lobby_members(v: &EngineValues) -> Value {
         };
         t.set_str("name", Value::str(name));
         t.set_str("gamertag", Value::str(name));
+        t.set_str("clean_gamertag", Value::str(name));
         t.set_str("clantag", Value::str(""));
         t.set_str("tagprefix", Value::str(""));
         // Rank 1's icon (mp/rankicontable_zm.csv, the menus' column).
@@ -1580,10 +1916,18 @@ pub fn lobby_members(v: &EngineValues) -> Value {
         t.set_str("clientNum", Value::Num(0.0));
         t.set_str("controller", Value::Num(0.0));
         t.set_str("team", Value::Num(v.team as f32));
-        t.set_str("rank", Value::Num(0.0));
+        // No rank number: the real Zombies lobby row shows only the rank
+        // icon (the card adds the rank, below). The score ("0") only in a
+        // Custom Games lobby (CoD.GAMEMODE_PRIVATE_MATCH), not the public one.
         t.set_str("prestige", Value::Num(0.0));
-        t.set_str("score", Value::Num(0.0));
-        t.set_str("isLocal", Value::Bool(true));
+        if v.game_modes.contains(&1.0) {
+            t.set_str("score", Value::Num(0.0));
+        }
+        // The player card's rank icon column (rankicontable_zm: 5 + days).
+        t.set_str("daysPlayedInLast5Days", Value::Num(0.0));
+        // A number, not a flag: the rows test `isLocal == 1` (his own row
+        // is gold, others blue) and sort by it.
+        t.set_str("isLocal", Value::Num(1.0));
         t.set_str("isHost", Value::Bool(true));
         t.set_str("isGuest", Value::Bool(false));
         t.set_str("isInParty", Value::Bool(true));
@@ -1596,6 +1940,10 @@ pub fn lobby_members(v: &EngineValues) -> Value {
     Value::Table(list)
 }
 
+/// The players the menus count in a playlist, a map or a start location
+/// (BO2 counts everyone online; here it is the one local lobby).
+const LOBBY_COUNT: f32 = 1.0;
+
 /// bo2zm M4: one playlist: its id, its map's super category (one per map
 /// and filter), the map, the filter (`playermatch` / `solomatch`), the
 /// start location and game mode (refs and shown names).
@@ -1606,10 +1954,36 @@ struct PlaylistRow {
     filter: &'static str,
     loc: String,
     loc_name: String,
-    /// bo2mc: the start location's description key.
+    /// The playlist's description, shown (`ZMUI_STANDARD_DESC_NUKED`).
     loc_desc: String,
+    /// The map's name (zm/mapstable.csv column 3, localized: `NUKETOWN`).
+    map_name: String,
     mode: String,
     mode_name: String,
+}
+
+/// BO2's loading screen words (the engine sets them as a map loads; the
+/// Loading menu shows them): `ls_mapname` NUKETOWN, `ls_maplocation` and
+/// `ls_gametype` from the playlist the lobby picked.
+pub fn set_loading_dvars(v: &mut EngineValues) {
+    let get = |n: &str| dvar_get(&v.dvars, n).unwrap_or_default();
+    let (map, loc, mode) = (get("ui_mapname"), get("ui_zm_mapstartlocation"), get("ui_gametype"));
+    let rows = playlist_rows(v);
+    let Some(row) = rows
+        .iter()
+        .find(|r| r.map == map && r.loc == loc && r.mode == mode)
+        .or_else(|| rows.iter().find(|r| r.map == map))
+    else {
+        return;
+    };
+    let words = [
+        ("ls_mapname", row.map_name.clone()),
+        ("ls_maplocation", row.loc_name.clone()),
+        ("ls_gametype", row.mode_name.clone()),
+    ];
+    for (name, value) in words {
+        dvar_set(&mut v.dvars, name, value);
+    }
 }
 
 /// The playlists the menus offer: every start location and game mode the
@@ -1628,11 +2002,16 @@ fn playlist_rows(v: &EngineValues) -> Vec<PlaylistRow> {
             .cloned()
             .unwrap_or(k)
     };
+    let maps = v.tables.get("zm/mapstable.csv").cloned().unwrap_or_default();
     let mut out = Vec::new();
     let mut super_index = 0;
     for filter in ["playermatch", "solomatch"] {
         for map in &v.maps {
             super_index += 1;
+            let map_name = maps
+                .iter()
+                .find(|r| cell(r, 0) == *map)
+                .map_or_else(|| map.clone(), |r| shown(cell(r, 3)));
             for loc in rows
                 .iter()
                 .filter(|r| cell(r, 0) == "5" && cell(r, 2) == *map)
@@ -1655,7 +2034,23 @@ fn playlist_rows(v: &EngineValues) -> Vec<PlaylistRow> {
                         filter,
                         loc: loc_ref.clone(),
                         loc_name: shown(cell(loc, 4)),
-                        loc_desc: cell(loc, 5),
+                        loc_desc: {
+                            // BO2's playlists describe a mode at a place:
+                            // `ZMUI_STANDARD_DESC_NUKED` ("Mass-energy
+                            // equivalence, ..."), the location's own line
+                            // when that is missing.
+                            let k = format!(
+                                "ZMUI_{}_DESC_{}",
+                                mode.trim_start_matches('z'),
+                                loc_ref
+                            )
+                            .to_ascii_uppercase();
+                            v.localize
+                                .get(&k)
+                                .cloned()
+                                .unwrap_or_else(|| shown(cell(loc, 5)))
+                        },
+                        map_name: map_name.clone(),
                         mode,
                         mode_name: shown(mode_key),
                     });

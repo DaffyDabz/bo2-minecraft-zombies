@@ -52,7 +52,7 @@ pub fn bo2_frontend() -> Option<&'static str> {
 /// bo2zm: the characters that stand for BO2's Xbox button pictures
 /// (`xenonbutton_*` in code_post_gfx_zm): private-use code points the BO2
 /// font draws as those pictures.
-pub const BO2_XBOX_GLYPHS: [(char, &str); 19] = [
+pub const BO2_XBOX_GLYPHS: [(char, &str); 21] = [
     ('\u{E100}', "xenonbutton_a"),
     ('\u{E101}', "xenonbutton_b"),
     ('\u{E102}', "xenonbutton_x"),
@@ -72,14 +72,27 @@ pub const BO2_XBOX_GLYPHS: [(char, &str); 19] = [
     ('\u{E110}', "xenonbutton_dpad_down"),
     ('\u{E111}', "xenonbutton_dpad_left"),
     ('\u{E112}', "xenonbutton_dpad_right"),
+    // BO2 on PC: its menu tabs' arrows (`^BBUTTON_CYCLE_LEFT^`, the shoulders).
+    ('\u{E113}', "ui_arrow_left"),
+    ('\u{E114}', "ui_arrow_right"),
 ];
 
 /// One-character strings of `BO2_XBOX_GLYPHS`, in its order.
-const BO2_XBOX_TEXT: [&str; 19] = [
+const BO2_XBOX_TEXT: [&str; 21] = [
     "\u{E100}", "\u{E101}", "\u{E102}", "\u{E103}", "\u{E104}", "\u{E105}", "\u{E106}", "\u{E107}",
     "\u{E108}", "\u{E109}", "\u{E10A}", "\u{E10B}", "\u{E10C}", "\u{E10D}", "\u{E10E}", "\u{E10F}",
-    "\u{E110}", "\u{E111}", "\u{E112}",
+    "\u{E110}", "\u{E111}", "\u{E112}", "\u{E113}", "\u{E114}",
 ];
+
+/// BO2 on PC: the menu tabs' arrow pictures (`BUTTON_CYCLE_LEFT`, `_RIGHT`
+/// and their `_ACTIVE` forms) as text the BO2 font draws.
+pub fn bo2_cycle_glyph(token: &str) -> Option<&'static str> {
+    match token.trim_end_matches("_ACTIVE") {
+        "BUTTON_CYCLE_LEFT" => Some(BO2_XBOX_TEXT[19]),
+        "BUTTON_CYCLE_RIGHT" => Some(BO2_XBOX_TEXT[20]),
+        _ => None,
+    }
+}
 
 /// bo2zm: a pad button as BO2 shows it: on an Xbox pad its picture; on a
 /// PlayStation pad the face shapes (□ ○ △ ×, drawn by the BO2 font), the

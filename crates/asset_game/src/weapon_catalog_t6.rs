@@ -304,7 +304,9 @@ fn t6_body_facts(w: &asset_t6::WeaponRef) -> WeaponBodyFacts {
     f.reload_ammo_add = w.def_i32(d::iReloadAmmoAdd);
     f.reload_start_add = w.def_i32(d::iReloadStartAdd);
     f.no_partial_reload = w.def_u8(d::bNoPartialReload) != 0;
+    f.unlimited_ammo = w.def_u8(d::unlimitedAmmo) != 0;
     f.bolt_action = w.def_u8(d::bBoltAction) != 0;
+    f.retrievable = w.def_u8(d::bRetrievable) != 0;
     f.segmented_reload = w.def_u8(d::bSegmentedReload) != 0;
     f.sprint_raise_time_ms = w.def_i32(d::sprintInTime);
     f.sprint_loop_time_ms = w.def_i32(d::sprintLoopTime);

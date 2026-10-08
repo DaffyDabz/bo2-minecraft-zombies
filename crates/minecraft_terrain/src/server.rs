@@ -621,6 +621,55 @@ impl ServerSim {
         Ok(())
     }
 
+    /// bo2mc's souls round: wild wolves, angry at the player from the start.
+    pub fn summon_souls_wolves(&mut self, positions: &[[f64; 3]]) {
+        for &p in positions {
+            let id = self.mobs.spawn_wolf(minecraftoss_entities::wolf::Wolf::new(glam::DVec3::from_array(p)), false);
+            if let Some(w) = self.mobs.wolf_mut(id) {
+                w.ai.state.wolf.souls = true;
+            }
+        }
+        self.keep_souls_angry();
+    }
+
+    /// A souls wolf snaps to `to` (a `snapTo`, as a tame wolf's teleport
+    /// to its owner): its path dropped, still angry.
+    pub fn move_souls_wolf(&mut self, id: u64, to: [f64; 3]) {
+        if let Some(w) = self.mobs.wolf_mut(id).filter(|w| w.ai.state.wolf.souls) {
+            let to = glam::DVec3::from_array(to);
+            w.wolf.body.position = to;
+            w.wolf.body.velocity = glam::DVec3::ZERO;
+            w.ai.state.body.position = to;
+            w.ai.state.navigation.stop();
+            w.previous_position = to;
+        }
+    }
+
+    /// The souls round is over: its wolves left alive die where they
+    /// stand (the world side strikes each with lightning).
+    pub fn end_souls_wolves(&mut self) {
+        let ids: Vec<u64> = self.mobs.wolves().iter().filter(|w| w.ai.state.wolf.souls && w.wolf.health > 0.0).map(|w| w.id).collect();
+        for id in ids {
+            if let Some(w) = self.mobs.wolf_mut(id) {
+                w.wolf.health = 0.0;
+                w.wolf.damage.dead = true;
+                w.ai.state.navigation.stop();
+            }
+        }
+    }
+
+    /// The souls wolves stay angry at the player until they die.
+    fn keep_souls_angry(&mut self) {
+        let ids: Vec<u64> = self.mobs.wolves().iter().filter(|w| w.ai.state.wolf.souls).map(|w| w.id).collect();
+        for id in ids {
+            if let Some(w) = self.mobs.wolf_mut(id) {
+                let state = &mut w.ai.state;
+                state.enderman.anger_target = Some(minecraftoss_entities::monster_ai::Target::Player(0));
+                state.enderman.anger_end_time = state.game_time + 400;
+            }
+        }
+    }
+
     /// Creeper blasts reach the level (`ServerLevel.explode` with
     /// `ExplosionInteraction.MOB`): blocks break when mobs may grief, with
     /// the drops decaying (`mob_explosion_drop_decay`), and items, TNT and
@@ -840,6 +889,11 @@ pub enum Command {
     /// `/summon` for a mob, with the command's NBT and the new mob's own
     /// random yaw.
     Summon { kind: String, position: [f64; 3], nbt: Option<minecraftoss_core::nbt::Tag>, y_rot: f32 },
+    /// bo2mc's souls round wolves.
+    SoulsWolves(Vec<[f64; 3]>),
+    /// A souls wolf that cannot reach the player, snapped to a spot by him.
+    MoveSoulsWolf { id: u64, to: [f64; 3] },
+    EndSoulsWolves,
     /// A player's hit (`attack`) or item use on a mob, with a copy of its
     /// inventory.
     MobAction { hit: minecraftoss_entities::world::MobHit, attack: Option<minecraftoss_entities::world::PlayerAttack>, inventory: Box<minecraftoss_player::inventory::Inventory>, selected: usize, infinite: bool },
@@ -875,6 +929,10 @@ pub struct TickInput {
     pub player_hurts: Vec<(Option<u64>, &'static str)>,
     /// The `spawn_mobs` game rule.
     pub spawn_mobs: bool,
+    /// bo2mc's souls round is dogs only: monsters go as in peaceful.
+    pub clear_monsters: bool,
+    /// bo2mc's Vulture Aid: the Looting level on the player's kills.
+    pub looting: u32,
 }
 
 /// What the server thread sends back after handling commands.
@@ -1029,6 +1087,18 @@ impl ServerHandle {
     /// mob's yaw comes from its own random (`LivingEntity`'s constructor:
     /// `nextFloat() * (float)(Math.PI * 2)`, in degrees), seeded here from
     /// the clock as a fresh entity's is.
+    pub fn summon_souls_wolves(&mut self, positions: Vec<[f64; 3]>) {
+        self.send(Command::SoulsWolves(positions));
+    }
+
+    pub fn move_souls_wolf(&mut self, id: u64, to: [f64; 3]) {
+        self.send(Command::MoveSoulsWolf { id, to });
+    }
+
+    pub fn end_souls_wolves(&mut self) {
+        self.send(Command::EndSoulsWolves);
+    }
+
     pub fn summon(&mut self, kind: String, position: [f64; 3], nbt: Option<minecraftoss_core::nbt::Tag>) {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64);
         let y_rot = minecraftoss_core::random::LegacyRandom::new(nanos).next_f32() * (std::f64::consts::PI * 2.0) as f32;
@@ -1112,6 +1182,9 @@ fn server_loop(mut sim: ServerSim, commands: std::sync::mpsc::Receiver<Command>,
                 Command::Summon { kind, position, nbt, y_rot } => {
                     out.summoned.push(sim.summon(&kind, position, nbt.as_ref(), y_rot).map(|()| kind));
                 }
+                Command::SoulsWolves(positions) => sim.summon_souls_wolves(&positions),
+                Command::MoveSoulsWolf { id, to } => sim.move_souls_wolf(id, to),
+                Command::EndSoulsWolves => sim.end_souls_wolves(),
                 Command::MobAction { hit, attack, inventory, selected, infinite } => {
                     out.mob_results.push(sim.mob_action(hit, attack, *inventory, selected, infinite));
                 }
@@ -1139,7 +1212,7 @@ fn server_loop(mut sim: ServerSim, commands: std::sync::mpsc::Receiver<Command>,
                     sim.tick();
                     let mobs_started = std::time::Instant::now();
                     sim.take_spawned();
-                    sim.despawn_mobs(&input.mob_players, input.difficulty);
+                    sim.despawn_mobs(&input.mob_players, if input.clear_monsters { 0 } else { input.difficulty });
                     // The player's fight memory: its `tickCount` moves on and
                     // the hurts the client took land in it.
                     sim.mobs.tick_player(0);
@@ -1152,6 +1225,8 @@ fn server_loop(mut sim: ServerSim, commands: std::sync::mpsc::Receiver<Command>,
                     // (`ShowTradesToPlayer`).
                     let held = input.pickup.as_ref().and_then(|(_, inventory, selected)| inventory.slots.get(*selected).and_then(Option::as_ref).map(|s| s.id.clone()));
                     sim.mobs.set_player_main_hand(0, held.as_deref());
+                    sim.mobs.looting = input.looting;
+                    sim.keep_souls_angry();
                     sim.tick_mobs(&input.mob_players, input.bright_outside);
                     sim.spawn_trade_experience();
                     out.merchant.extend(sim.check_merchant(&input.mob_players));

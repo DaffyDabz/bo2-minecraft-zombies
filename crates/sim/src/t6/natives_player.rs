@@ -87,7 +87,7 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     m!("giveweapon", |vm, world, s, a| {
         let id = client(vm, world, s)?;
         let name = text(vm, a, 0);
-        if ["knife", "bowie", "tazer", "sickle"]
+        if ["knife", "bowie", "tazer", "sickle", "spork", "spoon"]
             .iter()
             .any(|k| name.contains(k))
             && let Some(p) = world.resource_mut::<Zm>().players.get_mut(&id.0)
@@ -341,6 +341,8 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     // The stowed gun on his back (third person): not drawn yet.
     m!("setstowedweapon", |_, _, _, _| Ok(Value::Undefined));
     m!("clearstowedweapon", |_, _, _, _| Ok(Value::Undefined));
+    // Camo/lens/reticle options for giveweapon (Pack-a-Punch): none drawn yet.
+    m!("calcweaponoptions", |_, _, _, _| Ok(Value::Int(0)));
     vm.bind("getweaponstowedmodel", false, |vm, _, _, _| {
         Ok(vm.string(""))
     });
@@ -422,12 +424,19 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let st = text(vm, a, 0);
         if let Some(ps) = frame(world).player_mut(id) {
             use playerstate_iw4::eflags::{DUCK, PRONE};
+            use playerstate_iw4::pm_flags;
             ps.e_flags &= !(DUCK | PRONE);
-            ps.e_flags |= match st.as_str() {
-                "crouch" => DUCK,
-                "prone" => PRONE,
-                _ => 0,
+            ps.pm_flags &= !(pm_flags::CROUCH | pm_flags::PRONE);
+            let (e, pm, event) = match st.as_str() {
+                "crouch" => (DUCK, pm_flags::CROUCH, 7),
+                "prone" => (PRONE, pm_flags::PRONE, 8),
+                _ => (0, 0, 6),
             };
+            ps.e_flags |= e;
+            ps.pm_flags |= pm;
+            // The forced-stance event sets the client's own stance keys
+            // (else its next move stands straight back up).
+            movement_iw4::add_predictable_event(ps, event, 0);
         }
         Ok(Value::Undefined)
     });
@@ -437,10 +446,97 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             ps.ground_entity_num != playerstate_iw4::ENTITYNUM_NONE
         })))
     });
+    // The entity under the feet (any entity: Die Rise asks it of zombies,
+    // equipment, buildable pieces; Buried of a thrown grenade), undefined
+    // in the air. A script brush model or platform there is that entity
+    // (`riders::ground_ent`); the map itself is `level` (_zm_buildables
+    // checks `landed_on == level`), and `level getgroundent()` is level, so
+    // object_is_on_elevator's walk down stops. _zm_utility::is_jumping is
+    // !isdefined(getgroundent()): Afterlife's fake death waits on it.
+    m!("getgroundent", |vm, world, s, _| {
+        if s.as_obj() == Some(vm.level) {
+            return Ok(Value::Object(vm.level));
+        }
+        let Some(origin) = origin_of(vm, world, s) else {
+            return Ok(Value::Undefined);
+        };
+        let grounded = match client(vm, world, s) {
+            Ok(id) => frame(world)
+                .player(id)
+                .is_some_and(|ps| ps.ground_entity_num != playerstate_iw4::ENTITYNUM_NONE),
+            // Not a player: the map within a few units under it.
+            Err(_) => {
+                let down = [origin[0], origin[1], origin[2] - 12.0];
+                let t = frame(world).trace_world(
+                    [origin[0], origin[1], origin[2] + 2.0],
+                    down,
+                    [0.0; 3],
+                    [0.0; 3],
+                    crate::bullet_collision::MASK_PLAYER_SOLID,
+                );
+                t.fraction < 1.0 || t.startsolid != 0
+            }
+        };
+        if !grounded {
+            return Ok(Value::Undefined);
+        }
+        let under = super::riders::ground_ent(world, origin);
+        let zm = world.resource::<Zm>();
+        if let Some(n) = under
+            && std::env::var_os("IW4L_T6_RIDELOG").is_some()
+        {
+            // Once per (asker, ground) pair.
+            static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+            let me = entnum(vm, s).unwrap_or(u32::MAX);
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&(me, n)) {
+                seen.push((me, n));
+                diag::info!(
+                    Sim,
+                    "bo2zm t6 getgroundent ent{me} -> ent{n} {} at ({:.0} {:.0} {:.0})",
+                    zm.ents.get(&n).map_or("", |e| e.classname.as_str()),
+                    origin[0],
+                    origin[1],
+                    origin[2]
+                );
+            }
+        }
+        Ok(Value::Object(
+            under
+                .and_then(|n| zm.ents.get(&n))
+                .and_then(|e| e.obj)
+                .unwrap_or(vm.level),
+        ))
+    });
+    // The moving platform he stands on (`riders`), undefined off one:
+    // Tranzit counts the bus's riders by it.
+    m!("getmoverent", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        let zm = world.resource::<Zm>();
+        Ok(zm
+            .riders
+            .on
+            .get(&id.0)
+            .and_then(|n| zm.ents.get(n))
+            .and_then(|e| e.obj)
+            .map_or(Value::Undefined, Value::Object))
+    });
+    m!("isonladder", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        Ok(Value::bool(frame(world).player(id).is_some_and(|ps| {
+            ps.pm_flags & playerstate_iw4::pm_flags::LADDER != 0
+        })))
+    });
     m!("issprinting", |vm, world, s, _| {
         let id = client(vm, world, s)?;
         Ok(Value::bool(frame(world).player(id).is_some_and(|ps| {
             ps.pm_flags & playerstate_iw4::pm_flags::SPRINTING != 0
+        })))
+    });
+    m!("ismantling", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        Ok(Value::bool(frame(world).player(id).is_some_and(|ps| {
+            ps.pm_flags & playerstate_iw4::pm_flags::MANTLE != 0
         })))
     });
     macro_rules! button {
@@ -463,9 +559,70 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             "adsbuttonpressed" => ADS,
             "jumpbuttonpressed" => JUMP,
             "sprintbuttonpressed" => SPRINT,
+            "stancebuttonpressed" => STANCE_HELD | CROUCH | PRONE,
+            "throwbuttonpressed" => THROW,
         );
     }
+    // Buttons our commands do not carry (d-pad slots, inventory, vehicle
+    // seat): never held. Mob of the Dead's Afterlife polls them.
+    for name in [
+        "actionslotonebuttonpressed",
+        "actionslottwobuttonpressed",
+        "actionslotthreebuttonpressed",
+        "actionslotfourbuttonpressed",
+        "inventorybuttonpressed",
+        "changeseatbuttonpressed",
+    ] {
+        vm.bind(name, true, |_, _, _, _| Ok(Value::bool(false)));
+    }
+    m!("isfiring", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        let held = script_player::buttons(&mut frame(world), id);
+        Ok(Value::bool(held & playerstate_iw4::buttons::ATTACK != 0))
+    });
+    // Holding melee (Origins' staffs check it before a staff melee).
+    m!("ismeleeing", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        let held = script_player::buttons(&mut frame(world), id);
+        Ok(Value::bool(
+            held & playerstate_iw4::buttons::MELEE_CHARGE != 0,
+        ))
+    });
+    // self islinkedto(ent): linked (linkto / playerlinkto) to that entity.
+    m!("islinkedto", |vm, world, s, a| {
+        let (Some(me), Some(parent)) = (entnum(vm, s), entnum(vm, arg(a, 0))) else {
+            return Ok(Value::bool(false));
+        };
+        let zm = world.resource::<Zm>();
+        let to = zm
+            .players
+            .get(&me)
+            .and_then(|p| p.linked)
+            .or_else(|| zm.ents.get(&me).and_then(|e| e.link.map(|l| l.0)));
+        Ok(Value::bool(to == Some(parent)))
+    });
+    // Mob of the Dead's Afterlife saves the arms model and puts it back
+    // (setviewmodel is not drawn yet): any text keeps the scripts going.
+    m!("getviewmodel", |vm, _, _, _| Ok(vm.string("")));
     m!("geteye", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        let f = frame(world);
+        let (o, h) = f
+            .player(id)
+            .map_or(([0.0; 3], 60.0), |ps| (ps.origin, ps.view_height_current));
+        Ok(Value::Vec3([o[0], o[1], o[2] + h]))
+    });
+    // The eye without the view's bob (Buried ghosts' sight checks): the same eye.
+    m!("geteyeapprox", |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        let f = frame(world);
+        let (o, h) = f
+            .player(id)
+            .map_or(([0.0; 3], 60.0), |ps| (ps.origin, ps.view_height_current));
+        Ok(Value::Vec3([o[0], o[1], o[2] + h]))
+    });
+    // The view's place: the eye (no third-person or linked cameras here).
+    m!("getplayercamerapos", |vm, world, s, _| {
         let id = client(vm, world, s)?;
         let f = frame(world);
         let (o, h) = f
@@ -524,13 +681,20 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     });
     m!("getfractionmaxammo", |vm, world, s, a| {
         let id = client(vm, world, s)?;
-        let w = weapon(world, &text(vm, a, 0))?;
-        Ok(Value::Float(script_player::ammo_fraction(
-            &frame(world),
-            id,
-            w,
-            false,
-        )))
+        let name = text(vm, a, 0);
+        let w = weapon(world, &name)?;
+        let f = frame(world);
+        let frac = script_player::ammo_fraction(&f, id, w, false);
+        if std::env::var_os("IW4L_T6_HINTLOG").is_some() {
+            let eq = f.equipment_facts_for(w).map(|e| (e.clip_size, e.start_ammo));
+            diag::info!(
+                Sim,
+                "bo2zm t6 getfractionmaxammo {name}: {frac} (clip {} stock {}, clip size/start {eq:?})",
+                script_player::ammo_clip(&f, id, w),
+                script_player::ammo_stock(&f, id, w)
+            );
+        }
+        Ok(Value::Float(frac))
     });
     for name in [
         "setclientuivisibilityflag",
@@ -545,11 +709,6 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "openmenu",
         "closemenu",
         "closeingamemenu",
-        "setdepthoffield",
-        "setblur",
-        "startfadingblur",
-        "shellshock",
-        "stopshellshock",
         "setmovespeedscale",
         "enableinvulnerability",
         "disableinvulnerability",
@@ -590,14 +749,19 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "setlaststandprevweap",
         "setteamfortrigger",
         "setspawnerteam",
-        "vibrate",
         "setviewmodel",
+        "enableafterlife",
+        "disableafterlife",
         "useweaponhidetags",
         "dropscavengeritem",
         "setempjammed",
         "setfreecameralockonallowed",
         "luinotifyevent",
         "luinotifyeventtoplayer",
+        // Any entity (buildable pieces): hide it from demo playback.
+        "ghostindemo",
+        // Blood fx on hits to this entity ("none": Buried's ghosts don't bleed).
+        "bloodimpact",
     ] {
         vm.bind(name, true, |_, _, _, _| Ok(Value::Undefined));
     }
@@ -715,18 +879,117 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "playrumblelooponentity",
         "setclientuivisibilityflag",
         "setclientminiscoreboardhide",
-        "setblur",
-        "setdepthoffield",
         "setburn",
-        "shellshock",
-        "stopshellshock",
         "setelectrified",
         "setlowready",
+        "giveachievement",
     ] {
         vm.bind(name, true, |_, _, _, _| Ok(Value::Undefined));
     }
+    screen_effects(vm);
     let _ = arg;
     let _ = list;
+}
+
+fn now_ms(world: &World) -> i32 {
+    crate::level_time_ms(world.resource::<crate::step::StepRequest>().tick)
+}
+
+/// Blur, depth of field and shellshock (BO2's perk machines knock players
+/// flat with `shellshock("default", 1.5)`; the game-over rocket blurs).
+fn screen_effects(vm: &mut Vm<World>) {
+    vm.bind("setblur", true, |vm, world, s, a| {
+        let id = client(vm, world, s)?;
+        let to = super::num(a, 0)?.max(0.0);
+        let secs = super::num(a, 1).unwrap_or(0.0).max(0.0);
+        let now = now_ms(world);
+        let mut f = frame(world);
+        if f.client_meta(id).is_some() {
+            let view = &mut f.client_meta_mut(id).view_effects;
+            view.blur = Some(crate::ScriptBlur {
+                from: view.blur.map_or(0.0, |b| b.sample(now)),
+                to,
+                set_ms: now,
+                duration_ms: (secs * 1000.0).round() as i32,
+            });
+        }
+        Ok(Value::Undefined)
+    });
+    // `startfadingblur(blur, time)`: a blur that fades from `blur` to none.
+    vm.bind("startfadingblur", true, |vm, world, s, a| {
+        let id = client(vm, world, s)?;
+        let from = super::num(a, 0)?.max(0.0);
+        let secs = super::num(a, 1).unwrap_or(0.0).max(0.0);
+        let now = now_ms(world);
+        let mut f = frame(world);
+        if f.client_meta(id).is_some() {
+            f.client_meta_mut(id).view_effects.blur = Some(crate::ScriptBlur {
+                from,
+                to: 0.0,
+                set_ms: now,
+                duration_ms: (secs * 1000.0).round() as i32,
+            });
+        }
+        Ok(Value::Undefined)
+    });
+    vm.bind("setdepthoffield", true, |vm, world, s, a| {
+        let id = client(vm, world, s)?;
+        let v: Vec<f32> = (0..6).map(|i| super::num(a, i)).collect::<Result<_, _>>()?;
+        let (near_start, near_end, far_start, far_end) = (v[0], v[1], v[2], v[3]);
+        let near_blur = v[4].clamp(4.0, 10.0);
+        let far_blur = v[5].clamp(0.0, near_blur);
+        let (near_start, near_end) = if near_end <= near_start {
+            (0.0, 0.0)
+        } else {
+            (near_start.max(0.0), near_end)
+        };
+        let (far_start, far_end) = if far_end <= far_start || far_blur == 0.0 {
+            (0.0, 0.0)
+        } else {
+            (far_start.max(0.0), far_end)
+        };
+        let mut f = frame(world);
+        if f.client_meta(id).is_some() {
+            f.client_meta_mut(id).view_effects.depth_of_field = crate::ScriptDepthOfField {
+                near_start,
+                near_end,
+                far_start,
+                far_end,
+                near_blur,
+                far_blur,
+            };
+        }
+        Ok(Value::Undefined)
+    });
+    vm.bind("shellshock", true, |vm, world, s, a| {
+        let id = client(vm, world, s)?;
+        let name = text(vm, a, 0).to_ascii_lowercase();
+        let secs = super::num(a, 1).unwrap_or(0.0).max(0.0);
+        let now = now_ms(world);
+        let mut f = frame(world);
+        let Some(shock) = f.shock(&name).cloned() else {
+            diag::warn!(Sim, "bo2zm t6 shellshock '{name}': no shock file");
+            return Ok(Value::Undefined);
+        };
+        let Some(ps) = f.player_mut(id) else {
+            return Ok(Value::Undefined);
+        };
+        diag::info!(Sim, "bo2zm t6 shellshock {name} {secs}s");
+        ps.shellshock_index = 1;
+        ps.shellshock_time = now;
+        ps.shellshock_duration = (secs * 1000.0) as i32;
+        ps.pm_flags |= playerstate_iw4::pm_flags::SHELLSHOCKED;
+        f.client_meta_mut(id).shellshock = Some(shock);
+        Ok(Value::Undefined)
+    });
+    vm.bind("stopshellshock", true, |vm, world, s, _| {
+        let id = client(vm, world, s)?;
+        if let Some(ps) = frame(world).player_mut(id) {
+            ps.shellshock_duration = 0;
+            ps.pm_flags &= !playerstate_iw4::pm_flags::SHELLSHOCKED;
+        }
+        Ok(Value::Undefined)
+    });
 }
 
 fn weapon_list(

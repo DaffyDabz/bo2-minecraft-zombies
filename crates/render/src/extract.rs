@@ -1113,6 +1113,11 @@ const T6_EYE_OFFSET_PARMS: u32 = 0x0812_c0a9;
 /// fades as it turns edge-on to the eye.
 const T6_FALLOFF_PARMS: u32 = 0xbdde_5cf5;
 const T6_FALLOFF_END_COLOR: u32 = 0x6b1d_a6fa;
+/// bo2zm M4 retest 5: `alphaDissolveParms` (register slot from the t6shader
+/// dump of the `_ds` blood effects): their alpha is saturate(x * (texture
+/// alpha + vertex alpha - 1)), the texture's alpha a dissolve order, not a
+/// coverage (multiplied, its faint floor drew each sprite's whole square).
+const T6_ALPHA_DISSOLVE_PARMS: u32 = 0x8c1d_2f74;
 
 /// bo2zm: an effect material drawn with no colour map (white): logged once.
 fn t6_note_untextured(material: u32, name: &str) {
@@ -1151,15 +1156,20 @@ fn t6_append_model(
 ) -> Vec<[u32; 6]> {
     let skel = &item.skel;
     let mut out = Vec::new();
+    // Surfaces left out, by why: no material, not in the catalog, no BO2 draw.
+    let mut dropped = [0u32; 3];
     let ranges = skel.surface_vertex_ranges.iter().zip(&skel.surface_index_ranges);
     for (surface, (&(vbase, vn), &(ibase, icount))) in ranges.enumerate() {
         let Some(material) = item.materials.get(surface).copied().flatten() else {
+            dropped[0] += 1;
             continue;
         };
         let Some(m) = catalog.derived(assets::MaterialIndex::from_order(material as usize)) else {
+            dropped[1] += 1;
             continue;
         };
         let Some(draw) = m.t6_draw else {
+            dropped[2] += 1;
             continue;
         };
         if vbase + vn > skel.positions.len() || ibase + icount > skel.indices.len() {
@@ -1201,6 +1211,21 @@ fn t6_append_model(
             shine(asset_material::TS_NORMAL_MAP),
             shine(asset_material::TS_SPECULAR_MAP),
         ]);
+    }
+    // Once per model (the moving ones come through every frame).
+    static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if dropped.iter().any(|&n| n > 0)
+        && let Ok(mut told) = TOLD.lock()
+        && !told.contains(&skel.name)
+    {
+        told.push(skel.name.clone());
+        diag::info!(
+            World,
+            "t6 model {}: {} of {} surfaces drawn; left out (no material, not in catalog, no draw) {dropped:?}",
+            skel.name,
+            out.len(),
+            skel.surface_index_ranges.len()
+        );
     }
     out
 }
@@ -1396,6 +1421,7 @@ pub fn extract_t6_dynamic(
                         .find(|(hash, _)| *hash == want)
                         .map(|(_, bits)| bits.map(f32::from_bits))
                 };
+                let dissolve = constant(T6_ALPHA_DISSOLVE_PARMS).map_or(0.0, |p| p[0]);
                 let falloff = constant(T6_FALLOFF_PARMS).map(|p| {
                     let end = constant(T6_FALLOFF_END_COLOR).map_or(1.0, |c| c[0]);
                     [p[2], p[3], end]
@@ -1426,10 +1452,33 @@ pub fn extract_t6_dynamic(
                     instance[16..19].copy_from_slice(&f);
                     instance[19] = 1.0;
                 }
-                instance[20] = f32::from(eye_light.primary);
+                // Slot 20: the primary light (0 or more), or for a dissolve
+                // material (effect shaders, which read no primary light)
+                // minus its alphaDissolveParms.x.
+                instance[20] = if dissolve > 0.0 {
+                    -dissolve
+                } else {
+                    f32::from(eye_light.primary)
+                };
                 instance[21] = eye_light.visibility;
                 instance[22] = feather;
                 instance[23] = eye_offset;
+                // bo2zm M4 retest 5: a projected decal (a hit's blood on a
+                // zombie): its box from the world in the columns, the grid's
+                // light at the box.
+                if draw.projected_decal {
+                    let Some((box_from_world, at)) = mesh.model_boxes.get(&start) else {
+                        return None;
+                    };
+                    instance[..16].copy_from_slice(box_from_world);
+                    let lit = asset_world::t6_light_sampler()
+                        .map(|sampler| sampler.at(*at))
+                        .unwrap_or_default();
+                    for c in 0..3 {
+                        instance[16 + c] = lit.light[c] * exposure;
+                    }
+                    instance[19] = 0.0;
+                }
                 instances.push(instance);
                 Some([start, count, slot, draw.code(), instances.len() as u32 - 1, u32::MAX, u32::MAX])
             })

@@ -321,6 +321,37 @@ pub fn activate(brushes: &[SimBrush], origin: [f64; 3], shapes: Vec<Vec<[f32; 6]
     bump();
 }
 
+/// A dimension's block collision, set aside while the players are in
+/// another one.
+pub struct ParkedVoxels {
+    origin: [f64; 3],
+    chunks: HashMap<(i32, i32), VoxelChunk>,
+}
+
+impl ParkedVoxels {
+    /// Nothing yet, with the dimension's spawn block at map origin.
+    pub fn empty(origin: [f64; 3]) -> Self {
+        Self { origin, chunks: HashMap::new() }
+    }
+}
+
+/// A portal trip: the block world's chunks and origin swapped for `next`'s
+/// (the shape table stays, a shape id means the same in every dimension);
+/// the ones it held come back.
+pub fn exchange(next: ParkedVoxels) -> Option<ParkedVoxels> {
+    let parked = {
+        let mut world = WORLD.write().ok()?;
+        let world = world.as_mut()?;
+        ParkedVoxels {
+            origin: std::mem::replace(&mut world.origin, next.origin),
+            chunks: std::mem::replace(&mut world.chunks, next.chunks),
+        }
+    };
+    let _ = take_events();
+    bump();
+    Some(parked)
+}
+
 pub fn deactivate() {
     if let Ok(mut world) = WORLD.write() {
         *world = None;
@@ -719,6 +750,10 @@ pub(crate) fn trace(
         ..trace_iw4::Trace::default()
     }
 }
+
+/// bo2mc test (IW4L_BO2MC_TEST_COLLISION): set by the census; the next
+/// player move logs what else than blocks it bumps into round the house.
+pub static PROBE_EXTRA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// bo2mc: the block point at map origin, while a block world is active.
 pub fn origin() -> Option<[f64; 3]> {

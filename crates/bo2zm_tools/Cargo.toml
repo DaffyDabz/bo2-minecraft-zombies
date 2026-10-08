@@ -87,3 +87,7 @@ path = "src/bin/t6run.rs"
 [[bin]]
 name = "t6icon"
 path = "src/bin/t6icon.rs"
+
+[[bin]]
+name = "t6weap"
+path = "src/bin/t6weap.rs"

@@ -62,7 +62,10 @@ pub const BLOCK_TYPES: [BlockType; MAX_XFILE_COUNT] = [
     BlockType::Delay,
     BlockType::Normal,
     BlockType::Normal,
-    BlockType::Normal,
+    // The streamer reserve is reserved, not read: the Zombies Declassified
+    // zones' `shaderOverflowBuffer` memory block (835,488 bytes of
+    // streamMem) is followed at once by the next asset.
+    BlockType::Runtime,
 ];
 
 pub fn block_is_aliasable(block: u8) -> bool {

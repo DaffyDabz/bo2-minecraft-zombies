@@ -128,6 +128,7 @@ pub(crate) fn update(
                     base_gain: sound.vol_min.max(0.0),
                     pcm: pcm.add(audio),
                     live_pan: None,
+                    line_end_inches: None,
                 },
                 Transform::from_translation(Vec3::from_array(row.origin)),
             ))

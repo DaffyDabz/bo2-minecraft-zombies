@@ -118,6 +118,8 @@ pub struct WeaponAnimations {
     pub name: String,
 
     pub fire_time_ms: i32,
+    /// An offhand's wind-up (`holdFireTime`): the pull-back plays over it.
+    pub hold_fire_time_ms: i32,
 
     pub melee_time_ms: i32,
 
@@ -180,6 +182,7 @@ impl WeaponAnimations {
         Self {
             name: name.into(),
             fire_time_ms: 0,
+            hold_fire_time_ms: 0,
             melee_time_ms: 0,
             melee_charge_time_ms: 0,
             raise_time_ms: 0,
@@ -277,6 +280,7 @@ impl WeaponAnimations {
         Self {
             name,
             fire_time_ms: 0,
+            hold_fire_time_ms: 0,
             melee_time_ms: 0,
             melee_charge_time_ms: 0,
             raise_time_ms: 0,
@@ -309,6 +313,7 @@ impl WeaponAnimations {
             self.alternate_drop_time_ms = facts.alternate_drop_time_ms;
             self.melee_time_ms = facts.melee_time_ms;
             self.melee_charge_time_ms = facts.melee_charge_time_ms;
+            self.hold_fire_time_ms = facts.hold_fire_time_ms;
         }
         let (fire_time_ms, raise_time_ms) = registry.timers_of(index);
         let (drop_time_ms, quick_drop_time_ms, quick_raise_time_ms) =

@@ -36,8 +36,28 @@ pub(super) fn sound(world: &mut World, audience: EventAudience, alias: &str, ori
     if alias.is_empty() {
         return;
     }
+    // bo2mc: the hellhounds' bark is in no zombies zone; a Minecraft wolf
+    // growls in its place.
+    if crate::bo2mc::enabled() && alias.eq_ignore_ascii_case("aml_dog_bark") {
+        crate::bo2mc::push(crate::bo2mc::Request::Sound {
+            event: "minecraft:entity.wolf.growl".into(),
+            at: origin,
+            volume: 1.5,
+            pitch: 0.7,
+        });
+        return;
+    }
     // Black Ops II's own aliases (the client looks names up by game).
     let index = frame(world).sound_alias_index(&format!("t6:{}", alias.to_ascii_lowercase()));
+    // IW4L_T6_SNDLOG=<parts of names, comma-separated> (1 = all): each
+    // server sound, so a headless run shows the map's sounds play (the
+    // sign, the clock, the bus horn).
+    if let Ok(want) = std::env::var("IW4L_T6_SNDLOG")
+        && (want == "1" || want.split(',').any(|w| alias.contains(w)))
+    {
+        let now = world.resource::<Zm>().now_ms;
+        diag::info!(Sim, "bo2zm t6 sound {alias} index {index} at {origin:?} t={now}");
+    }
     event(
         world,
         audience,
@@ -284,6 +304,14 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             world.resource::<Zm>().sound_aliases.contains(&alias),
         ))
     });
+    // An alias' length in ms (the VO threads wait it out). Lengths are not
+    // known here: the same second playsound's notify uses; -1 when there is
+    // no such alias.
+    vm.bind("soundgetplaybacktime", false, |vm, world, _, a| {
+        let alias = text(vm, a, 0).to_ascii_lowercase();
+        let known = world.resource::<Zm>().sound_aliases.contains(&alias);
+        Ok(Value::Int(if known { 1000 } else { -1 }))
+    });
     vm.bind("playsound", true, |vm, world, s, a| {
         let alias = text(vm, a, 0);
         let origin = origin_of(vm, world, s).unwrap_or([0.0; 3]);
@@ -343,6 +371,22 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let alias = text(vm, a, 0);
         let origin = origin_of(vm, world, s).unwrap_or([0.0; 3]);
         sound(world, EventAudience::All, &alias, origin);
+        Ok(Value::Undefined)
+    });
+    // earthquake(scale, duration, origin, radius): the perks landing, the
+    // game-over nuke. Shares the iw4 screen shake.
+    vm.bind("earthquake", false, |_, world, _, a| {
+        let quake = crate::ScriptEarthquake {
+            id: 0,
+            scale: arg(a, 0).as_float().unwrap_or(0.0),
+            duration_ms: (arg(a, 1).as_float().unwrap_or(0.0) * 1000.0) as i32,
+            origin: arg(a, 2).as_vec3().unwrap_or([0.0; 3]),
+            radius: arg(a, 3).as_float().unwrap_or(0.0),
+            start_ms: 0,
+        };
+        if quake.valid() {
+            crate::script::push_earthquake(world, quake)?;
+        }
         Ok(Value::Undefined)
     });
     vm.bind("playsoundatposition", false, |vm, world, _, a| {

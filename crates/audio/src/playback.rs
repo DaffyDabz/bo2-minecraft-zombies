@@ -207,6 +207,7 @@ impl Plugin for PlayerSoundPlugin {
                     crate::destructible_loops::update
                         .before(crate::ambient::update_map_emitter_gain),
                     crate::zm_music::update.after(crate::bus_gain::sync),
+                    crate::room_echo::update.before(play_alias_messages),
                     crate::ambient::update_map_emitter_gain.after(crate::bus_gain::sync),
                     update_all_channels,
                 )
@@ -1411,6 +1412,22 @@ fn take_or_pending_clip(
     }
 }
 
+/// bo2zm: the room echo a Black Ops II alias's play sends into (its
+/// `reverbSend`), when the player is in a room that has one.
+fn room_echo_for(
+    namespace: AssetNamespace,
+    row: Option<&asset_audio::CapturedAlias>,
+) -> Option<(std::sync::Arc<crate::room_echo::EchoParams>, f32)> {
+    if namespace != AssetNamespace::T6 {
+        return None;
+    }
+    let send = row?.reverb_send;
+    if send <= 0.0 {
+        return None;
+    }
+    Some((crate::room_echo::current()?, send))
+}
+
 fn submit_prepared_oneshot(
     commands: &mut Commands,
     pcm_assets: &mut Assets<PcmAudio>,
@@ -1544,7 +1561,10 @@ fn submit_prepared_oneshot(
             pick.last_variant
                 .insert((namespace, alias.to_owned()), variant_index);
             let _ = shared.dry_handle(pcm_assets, clip, pcm.clone(), clips.as_deref());
-            let live = pcm.with_live_pan();
+            let live = match room_echo_for(namespace, Some(row)) {
+                Some((params, send)) => pcm.with_live_pan().with_echo(params, send),
+                None => pcm.with_live_pan(),
+            };
             let live_pan = live.live_pan().expect("with_live_pan").clone();
             live_pan.set(pan_l, pan_r);
             let handle = pcm_assets.add(live);
@@ -1604,7 +1624,13 @@ fn submit_prepared_oneshot(
             }
             pick.last_variant
                 .insert((namespace, alias.to_owned()), variant_index);
-            let handle = shared.dry_handle(pcm_assets, clip, pcm, clips.as_deref());
+            let handle = match room_echo_for(namespace, row) {
+                Some((params, send)) => {
+                    let _ = shared.dry_handle(pcm_assets, clip, pcm.clone(), clips.as_deref());
+                    pcm_assets.add(pcm.with_echo(params, send))
+                }
+                None => shared.dry_handle(pcm_assets, clip, pcm, clips.as_deref()),
+            };
             let lease = voice_lease(bank, channel, snd_ent);
             let entity = crate::backend::spawn_oneshot(
                 commands,

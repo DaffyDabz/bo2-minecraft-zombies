@@ -305,6 +305,23 @@ impl WorldVertexPayload {
     }
 }
 
+/// bo2zm: one flickering lamp: its primary light (`pl#`, the row of
+/// `WorldDraw::t6_lights`), its own intensity, and the script keys the
+/// client's `_lights.csc` hands the engine (`setmixerlightparam`): the
+/// intensity range, the delay between changes, and the electrical bursts.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct T6Flicker {
+    pub light: u16,
+    pub electrical: bool,
+    pub base: f32,
+    pub min: f32,
+    pub max: f32,
+    pub delay: [f32; 2],
+    pub burst: [f32; 2],
+    pub burst_time: f32,
+    pub wait: [f32; 2],
+}
+
 #[derive(Clone, Debug)]
 pub struct WorldDraw {
     pub batches: Vec<WorldBatch>,
@@ -399,6 +416,11 @@ pub struct WorldDraw {
     /// client scripts' `setworldfogactivebank`): per bank the two fog rows
     /// of `t6_lights` (slots 30 and 31) that bank draws with.
     pub t6_fog_banks: Vec<(u32, [[f32; 16]; 2])>,
+
+    /// bo2zm: the map's flickering lamps (map `light` entities whose
+    /// targetname is one of the engine's built-in mixer behaviours,
+    /// `fire_flicker` / `electrical_flicker`); empty elsewhere.
+    pub t6_flicker: Vec<T6Flicker>,
 
     /// bo2zm: per reflection probe, its `lightingSH` (three vec4) for the
     /// fallback draw's reflections; empty elsewhere.
@@ -946,6 +968,7 @@ pub fn build_world_draw(
             t5_exposure_volume_count: 0,
             t6_lights: Vec::new(),
             t6_fog_banks: Vec::new(),
+            t6_flicker: Vec::new(),
             t6_probes: Vec::new(),
             t6_layer_uvs: Vec::new(),
         },

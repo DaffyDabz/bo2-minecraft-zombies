@@ -623,8 +623,44 @@ pub fn update_stair_shapes(world: &mut impl World, changed: &[Pos]) -> Vec<Pos> 
     }
     positions
 }
+/// `BlockBehaviour.canBeReplaced` for a block placed by hand: plants,
+/// fluids, fire and a single snow layer give way to the new block.
+pub fn replaceable(block: &Block) -> bool {
+    let id = block.id.rsplit(':').next().unwrap_or(&block.id);
+    matches!(
+        id,
+        "air" | "cave_air" | "void_air" | "water" | "lava" | "short_grass" | "fern" | "dead_bush" | "vine"
+            | "fire" | "soul_fire" | "seagrass" | "glow_lichen"
+    ) || (id == "snow" && block.property("layers").unwrap_or("1") == "1")
+}
+
+/// The outline a look ray hits (`getShape`), where it differs from the
+/// collision boxes: snow layers are thin and plants can be aimed at.
+fn outline_shapes(block: &Block) -> Vec<Box3> {
+    let id = block.id.rsplit(':').next().unwrap_or(&block.id);
+    let px = |v: f64| v / 16.0;
+    match id {
+        "short_grass" | "fern" | "dead_bush" | "tall_grass" | "large_fern" => {
+            vec![Box3::new(DVec3::new(px(2.0), 0.0, px(2.0)), DVec3::new(px(14.0), px(13.0), px(14.0)))]
+        }
+        "sweet_berry_bush" => vec![Box3::new(DVec3::new(px(3.0), 0.0, px(3.0)), DVec3::new(px(13.0), px(16.0), px(13.0)))],
+        "wheat" | "carrots" | "potatoes" | "beetroots" | "melon_stem" | "pumpkin_stem" | "attached_melon_stem"
+        | "attached_pumpkin_stem" => {
+            let age = block.property("age").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let tall = (age + 1.0) * 2.0;
+            vec![Box3::new(DVec3::ZERO, DVec3::new(1.0, px(tall.min(16.0)), 1.0))]
+        }
+        _ => local_shapes(block),
+    }
+}
+
 fn local_shapes(block: &Block) -> Vec<Box3> {
     let id = block.id.rsplit(':').next().unwrap_or(&block.id);
+    // `SnowLayerBlock.SHAPE_BY_LAYER`: two pixels a layer.
+    if id == "snow" {
+        let layers = block.property("layers").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0).clamp(1.0, 8.0);
+        return vec![Box3::new(DVec3::ZERO, DVec3::new(1.0, layers * 2.0 / 16.0, 1.0))];
+    }
     if matches!(
         id,
         "air" | "cave_air" | "void_air" | "water" | "lava" | "short_grass" | "tall_grass" | "torch" | "fire" | "soul_fire" | "sweet_berry_bush" | "cobweb"
@@ -1719,7 +1755,7 @@ impl Player {
                         continue;
                     }
                     if let Some(block) = world.block(pos) {
-                        let mut shapes = local_shapes(&block);
+                        let mut shapes = outline_shapes(&block);
                         if fluid_ray != FluidRay::None {
                             let waterlogged = block.property("waterlogged") == Some("true");
                             let liquid =
@@ -1830,6 +1866,9 @@ impl Player {
         let hit = self.target(world, 5.0)?;
         let pos = if block.id.ends_with("_slab") {
             slab_placement_target(world, hit.pos, hit.face, hit.point.y, &block.id)
+        } else if world.block(hit.pos).is_some_and(|clicked| replaceable(&clicked)) {
+            // A single snow layer or grass gives way where it stands.
+            hit.pos
         } else {
             let (dx, dy, dz) = hit.face.offset();
             (hit.pos.0 + dx, hit.pos.1 + dy, hit.pos.2 + dz)
@@ -1841,7 +1880,7 @@ impl Player {
             });
         if replaced
             .as_ref()
-            .is_some_and(|existing| !local_shapes(existing).is_empty())
+            .is_some_and(|existing| !local_shapes(existing).is_empty() && !replaceable(existing))
             && !merge_slab
         {
             return None;

@@ -373,6 +373,16 @@ fn build_internal<S: Scene>(scene: &S, packs: &PackStack, preload_blocks: bool) 
     let mut textures = BTreeMap::<ResourceId, ()>::new();
     // A broken chest can remain as a dropped item after its block mesh is gone.
     textures.insert(ResourceId::parse("minecraft:entity/chest/normal")?, ());
+    // The End portal has no block model: its starfield is drawn here.
+    textures.insert(ResourceId::parse("minecraft:entity/end_portal/end_portal")?, ());
+    // Wall signs: the board and the ascii font of their text (a font
+    // keeps its own resolution, as an entity skin does).
+    for name in crate::sign_render::TEXTURES {
+        let id = ResourceId::parse(name)?;
+        if packs.texture(&id)?.is_some() {
+            textures.insert(id, ());
+        }
+    }
     textures.insert(ResourceId::parse("minecraft:entity/bat/bat")?, ());
     textures.insert(ResourceId::parse("minecraft:entity/zombie/zombie")?, ());
     textures.insert(ResourceId::parse("minecraft:entity/player/wide/steve")?, ());
@@ -1284,7 +1294,7 @@ pub fn make_atlas(packs: &PackStack, mut textures: Vec<ResourceId>) -> Result<At
     for id in &textures {
         let bytes = if id.path == "missingno" { None } else { packs.texture(id)? };
         let span = match &bytes {
-            Some(bytes) if id.path.starts_with("entity/") && packs.animation(id)?.is_none() => {
+            Some(bytes) if (id.path.starts_with("entity/") || id.path.starts_with("font/")) && packs.animation(id)?.is_none() => {
                 let (width, height) = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png).into_dimensions()?;
                 (width.div_ceil(tile).max(1), height.div_ceil(tile).max(1))
             }
@@ -1827,6 +1837,29 @@ pub(crate) fn append_block<'m, S: Scene>(
 ) -> Result<()> {
     if block.id.path == "chest" {
         // Chest block entities have a separately posed lid/lock.
+        return Ok(());
+    }
+    if block.id.path == "end_portal" {
+        // `TheEndPortalRenderer`: one face at 12/16 height, the black
+        // starfield, lit at full brightness. A 64-texel quarter of the
+        // texture per block keeps the stars at their in-game size and lets
+        // a 3x3 portal tile without seams.
+        let [u0, v0, u1, v1] = atlas.region(&ResourceId::parse("minecraft:entity/end_portal/end_portal")?);
+        let (cu, cv) = ((u1 - u0) / 4.0, (v1 - v0) / 4.0);
+        let (tu, tv) = (u0 + cu * x.rem_euclid(4) as f32, v0 + cv * z.rem_euclid(4) as f32);
+        let uv = [[tu, tv], [tu, tv + cv], [tu + cu, tv + cv], [tu + cu, tv]];
+        let start = mesh.vertices.len() as u32;
+        for (corner, uv) in corners("up", [0.0; 3], [1.0, 0.75, 1.0])?.iter().zip(uv) {
+            mesh.vertices.push(Vertex {
+                position: [x as f32 + corner[0], y as f32 + corner[1], z as f32 + corner[2]],
+                uv,
+                color: [1.0, 1.0, 1.0, 1.0],
+                sky_light: 15.0,
+                block_light: 15.0,
+            });
+        }
+        mesh.indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+        mesh.faces += 1;
         return Ok(());
     }
     if matches!(block.id.path.as_str(), "water" | "lava") {

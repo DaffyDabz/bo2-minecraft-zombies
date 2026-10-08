@@ -22,25 +22,42 @@ use crate::world::ClientId;
 
 mod actors;
 mod asd;
+mod audio_triggers;
 mod autoplay;
+mod build_test;
+mod autoplay_prison;
 mod brushes;
 mod clientfields;
+mod declassified;
 mod fields;
+mod fxanims;
 mod globallogic;
+mod grenades;
 mod hud;
+mod mc_dogs;
 mod mc_nav;
 mod mc_path;
+// bo2mc: every Black Ops II perk in the spawn room.
+mod mc_perks;
 mod mc_rules;
 mod movers;
 mod natives_ai;
 mod natives_ent;
+mod highrise;
 mod natives_fx;
 mod natives_game;
 mod natives_player;
 mod nav;
 mod players;
 mod presence;
+mod tomb_craft;
+mod tomb_tank;
+mod tomb_test;
+mod riders;
+mod transit;
 mod triggers;
+pub(crate) use triggers::{DamageKind, damage_triggers};
+mod use_test;
 mod vehicles;
 mod wallbuys;
 mod zbarrier;
@@ -78,6 +95,24 @@ pub struct T6Install {
     pub strings: std::collections::HashMap<String, String>,
     /// Every sound alias the banks hold (lower case).
     pub sound_aliases: BTreeSet<String>,
+    /// Props that break in stages (`destructibledef`), by name.
+    pub destructibles: Vec<Arc<xmodel_runtime::T5DestructibleDef>>,
+    /// Barrier types (`ZBarrierDef`) the map's zbarriers name by `type`.
+    pub zbarrier_defs: Vec<T6ZBarrierDef>,
+}
+
+/// A barrier type: the zombie animation states its windows ask for.
+#[derive(Clone, Debug, Default)]
+pub struct T6ZBarrierDef {
+    pub name: String,
+    pub taunts: bool,
+    pub reach_through: bool,
+    pub taunt_state: String,
+    pub reach_through_state: String,
+    pub num_attack_slots: u32,
+    pub attack_spot_horz_offset: f32,
+    /// Per board: (tear anim state, tear anim substate).
+    pub boards: Vec<(String, String)>,
 }
 
 /// An AI path node and its links (node, distance, negotiation).
@@ -126,6 +161,8 @@ pub(crate) struct Ent {
     pub map: bool,
     /// Brush model (`*N`) a map entity uses.
     pub brush: Option<String>,
+    /// The map's `destructibledef`: the prop breaks in stages as it is hit.
+    pub destructible: String,
     /// Trigger radius/height (`trigger_radius*`) or brush extents.
     pub radius: f32,
     pub height: f32,
@@ -148,6 +185,13 @@ pub(crate) struct Ent {
     pub invisible_to: BTreeSet<u32>,
     pub invisible_to_all: bool,
     pub trigger_off: bool,
+    /// Tags the scripts hid on its model (`hidepart`), lower case.
+    pub hidden_parts: Vec<String>,
+    /// `setmovingplatformenabled(1)`: players standing on it ride it
+    /// (`riders`).
+    pub platform: bool,
+    /// A script model's animation (`setanim`): clip and when it started.
+    pub anim: Option<(String, i64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -215,6 +259,10 @@ pub(crate) struct Zm {
     pub clips: std::collections::HashMap<String, Arc<xmodel_runtime::AnimClip>>,
     pub strings: std::collections::HashMap<String, String>,
     pub sound_aliases: BTreeSet<String>,
+    /// Props that break in stages, by lower-case name.
+    pub destructibles: std::collections::HashMap<String, Arc<xmodel_runtime::T5DestructibleDef>>,
+    /// Barrier types by lower-case name.
+    pub zbarrier_defs: std::collections::HashMap<String, Arc<T6ZBarrierDef>>,
     /// Script HUD elements (Game Over, Max Ammo...).
     pub huds: hud::Huds,
     /// Flying limbs and when they go.
@@ -223,6 +271,8 @@ pub(crate) struct Zm {
     pub client_fx: clientfields::ClientFx,
     /// Script vehicles on their paths (Nuketown's perk arrival).
     pub vehicles: vehicles::Vehicles,
+    /// Players standing on moving platforms (Tranzit's bus).
+    pub riders: riders::Riders,
     /// Wall buys' chalk and bought guns (BO2's client-script visuals).
     pub wallbuys: wallbuys::WallBuys,
     pub wallbuy_since: Option<i64>,
@@ -251,6 +301,14 @@ pub(crate) struct Zm {
     pub hints: BTreeMap<u32, String>,
     /// bo2mc: zombies on the block world.
     pub mc: mc_nav::McState,
+    /// The map's moving props (washing lines, shutters, wires, dust devils).
+    pub fxprops: fxanims::FxProps,
+    /// The map's sound triggers (bumping a car, the truck bed).
+    pub audio_trigs: audio_triggers::AudioTrigs,
+    /// Players' thrown grenades the scripts watch (the Monkey Bomb).
+    pub thrown: Vec<grenades::Thrown>,
+    /// Gone-off grenades freed a tick later.
+    pub thrown_free: Vec<(ObjRef, i64)>,
 }
 
 /// Entity numbers: players are their client number; the rest start here.
@@ -356,6 +414,7 @@ pub(crate) fn install(world: &mut World, inst: T6Install) -> Result<(), String> 
     // bo2mc: Nuketown's rules on the Minecraft world.
     if crate::bo2mc::enabled() {
         mc_rules::install(&mut vm);
+        mc_perks::install(&mut vm);
     }
     // IW4L_T6_TRACE=name,name: log those builtins' calls (debugging).
     if let Ok(names) = std::env::var("IW4L_T6_TRACE") {
@@ -374,9 +433,9 @@ pub(crate) fn install(world: &mut World, inst: T6Install) -> Result<(), String> 
         ("mapname", inst.map.as_str()),
         ("g_gametype", inst.gametype.as_str()),
         ("ui_gametype", inst.gametype.as_str()),
-        ("ui_zm_gamemodegroup", "zsurvival"),
+        ("ui_zm_gamemodegroup", zm_gamemodegroup(&inst.gametype)),
         ("ui_zm_mapstartlocation", location(&inst.map)),
-        ("zm_gamemodegroup", "zsurvival"),
+        ("zm_gamemodegroup", zm_gamemodegroup(&inst.gametype)),
         ("sv_maxclients", "4"),
         ("party_maxplayers", "4"),
         ("onlinegame", "0"),
@@ -526,6 +585,16 @@ pub(crate) fn install(world: &mut World, inst: T6Install) -> Result<(), String> 
             .map(|(k, v)| (k.to_ascii_uppercase(), v))
             .collect(),
         sound_aliases: inst.sound_aliases,
+        destructibles: inst
+            .destructibles
+            .into_iter()
+            .map(|d| (d.name.to_ascii_lowercase(), d))
+            .collect(),
+        zbarrier_defs: inst
+            .zbarrier_defs
+            .into_iter()
+            .map(|d| (d.name.to_ascii_lowercase(), Arc::new(d)))
+            .collect(),
         tables: Arc::new(inst.tables),
         next_entnum: FIRST_ENTNUM,
         nav: nav::Nav::new(nodes),
@@ -543,6 +612,25 @@ pub(crate) fn install(world: &mut World, inst: T6Install) -> Result<(), String> 
 #[derive(Resource)]
 struct PendingEntities(Vec<String>);
 
+/// The zombies game type a map starts in from Solo: Nuketown is
+/// `zstandard` only; the other Black Ops II maps play their full mode,
+/// `zclassic` (each map's `gamemode_callback_setup` registers it).
+pub fn zm_gametype(map: &str) -> &'static str {
+    match map {
+        "zm_nuked" => "zstandard",
+        _ => "zclassic",
+    }
+}
+
+/// The game mode group of a game type: `_zm_utility::is_classic` reads
+/// `ui_zm_gamemodegroup`, so a `zclassic` map must say `zclassic`.
+fn zm_gamemodegroup(gametype: &str) -> &'static str {
+    match gametype {
+        "zclassic" => "zclassic",
+        _ => "zsurvival",
+    }
+}
+
 fn location(map: &str) -> &'static str {
     match map {
         "zm_nuked" => "nuked",
@@ -551,6 +639,9 @@ fn location(map: &str) -> &'static str {
         "zm_prison" => "prison",
         "zm_buried" => "processing",
         "zm_tomb" => "tomb",
+        // Declassified: the map's own default_start_location (its Mule Kick
+        // is "zclassic_perks_default"; zzz_zm_location.gsc).
+        "zm_prototype" => "default",
         _ => "",
     }
 }
@@ -647,6 +738,7 @@ pub(crate) fn start(world: &mut World) {
         );
     });
     world.resource_mut::<Zm>().started = true;
+    declassified::start(world, &map);
     report(world);
 }
 
@@ -776,6 +868,7 @@ fn advance_inner(world: &mut World) {
         start(world);
     }
     let now = i64::from(tick.0) * i64::from(crate::MATCH_TICK_MS);
+    declassified::advance(world, now);
     world.resource_mut::<Zm>().now_ms = now;
     start_hang_tracer();
     TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -794,29 +887,77 @@ fn advance_inner(world: &mut World) {
     autoplay::glide_test(world, now);
     autoplay::only_spawn_test(world);
     autoplay::box_test(world, now);
+    autoplay_prison::shock_test(world, now);
+    autoplay_prison::door_sweep(world, now);
+    autoplay_prison::lives_watch(world, now);
+    autoplay_prison::brutus_test(world, now);
     autoplay::box_move_test(world, now);
     autoplay::dual_wield_test(world, now);
+    autoplay::ammo_log(world);
+    autoplay::mannequin_test(world, now);
+    autoplay::knife_at_test(world, now);
+    autoplay::view_test(world, now);
+    autoplay::bears_test(world, now);
+    autoplay::perk_drop_test(world, now);
+    autoplay::egg1_test(world, now);
     autoplay::game_over_test(world, now);
     autoplay::down_test(world, now);
     autoplay::nades_test(world, now);
+    autoplay::press_test(world, now);
     autoplay::sprint_log(world, now);
     autoplay::door_test(world, now);
+    autoplay::use_test(world, now);
+    build_test::build_test(world, now);
     autoplay::walk_test(world, now);
+    autoplay::ent_log(world, now);
     autoplay::floor_map(world, now);
     autoplay::kite_test(world, now);
     autoplay::face_test(world);
     autoplay::zombie_block_test(world, now);
     autoplay::solid_walk_test(world, now);
     autoplay::perk_test(world, now);
+    use_test::use_test(world, now);
+    use_test::build_test(world, now);
     autoplay::pap_test(world, now);
     autoplay::powerup_test(world, now);
     autoplay::fx_test(world, now);
     autoplay::look_test(world);
     autoplay::gib_test(world, now);
     timed("bo2mc", world, |world| mc_rules::tick(world, now));
+    mc_perks::tick(world, now);
+    tomb_test::generator_test(world, now);
+    tomb_test::dig_test(world, now);
+    tomb_craft::craft_test(world, now);
+    tomb_tank::tank_test(world, now);
+    grenades::advance(world, now);
     phase("vehicles+movers");
     vehicles::advance(world, crate::MATCH_TICK_MS as f32 / 1000.0);
     movers::advance(world, now);
+    riders::advance(world);
+    let moved = {
+        let mut zm = world.resource_mut::<Zm>();
+        let zm = &mut *zm;
+        let ents = &zm.ents;
+        zm.nav
+            .follow_movers(|n| ents.get(&n).map(|e| (e.origin, e.angles)))
+    };
+    // Their script `origin` too (Die Rise's escape pod links its door
+    // nodes to the nodes near node.origin once it has crashed).
+    if !moved.is_empty() {
+        let objs: Vec<(ObjRef, [f32; 3])> = {
+            let zm = world.resource::<Zm>();
+            moved
+                .iter()
+                .filter_map(|&(n, p)| zm.node_objs.get(n as usize).map(|&o| (o, p)))
+                .collect()
+        };
+        with_vm(world, |vm, _| {
+            let f = vm.intern("origin");
+            for (o, p) in objs {
+                vm.set_raw_field(o, f, Value::Vec3(p));
+            }
+        });
+    }
     zbarrier::advance(world, now);
     wallbuys::advance(world, now);
     timed("triggers", world, triggers::dispatch);
@@ -855,6 +996,8 @@ fn advance_inner(world: &mut World) {
     }
     timed("presence", world, |world| {
         presence::sync(world, now);
+        fxanims::advance(world, now);
+        audio_triggers::advance(world, now);
         brushes::sync(world, now);
         publish_melee_targets(world);
     });
@@ -950,7 +1093,83 @@ fn report(world: &mut World) {
             }
         }
     }
-    // IW4L_T6_EVAL=level.a.b,...: those values every 5 s (debugging).
+    // IW4L_T6_ROUND_JUMP=<n>: 10 s in, set level.round_number to n (a test
+    // aid for things that only start in a round-1 game, like the Nuketown
+    // transmission and blue eyes).
+    static ROUND_JUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(n) = std::env::var("IW4L_T6_ROUND_JUMP").ok().and_then(|v| v.parse::<i32>().ok())
+        && world.resource::<Zm>().now_ms >= 10_000
+        && !ROUND_JUMPED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        with_vm(world, |vm, world| {
+            let f = vm.intern("round_number");
+            let level = vm.level;
+            vm.set_field(world, level, f, Value::Int(n));
+        });
+        diag::info!(Sim, "bo2zm t6: round jumped to {n}");
+    }
+    // IW4L_T6_KILLS_ADD=<n>: 10 s in, n more kills on the books
+    // (level.total_zombies_killed): the population sign counts them down.
+    // IW4L_T6_DOOR_GRAB_AT=<n>: when the sign reads n, the player steps onto
+    // the power-up behind the door (Nuketown's first song egg).
+    static KILLS_ADDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(n) = std::env::var("IW4L_T6_KILLS_ADD").ok().and_then(|v| v.parse::<i32>().ok())
+        && world.resource::<Zm>().now_ms >= 10_000
+        && !KILLS_ADDED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        with_vm(world, |vm, world| {
+            let f = vm.intern("total_zombies_killed");
+            let level = vm.level;
+            let had = match vm.get_field(world, level, f) {
+                Value::Int(i) => i,
+                _ => 0,
+            };
+            vm.set_field(world, level, f, Value::Int(had + n));
+        });
+        diag::info!(Sim, "bo2zm t6: {n} kills added");
+    }
+    if let Some(want) = std::env::var("IW4L_T6_DOOR_GRAB_AT").ok().and_then(|v| v.parse::<i32>().ok()) {
+        let at = with_vm(world, |vm, world| {
+            let level = vm.level;
+            let f = vm.intern("population_count");
+            let pop = vm.get_field(world, level, f);
+            let f = vm.intern("door_powerup");
+            let pu = match vm.get_field(world, level, f) {
+                Value::Object(o) if vm.alive(o) => Some(o),
+                _ => None,
+            };
+            let f = vm.intern("origin");
+            let origin = pu.map(|o| vm.get_field(world, o, f));
+            (pop, origin)
+        });
+        if let Some((Value::Int(pop), Some(Value::Vec3(o)))) = at
+            && pop == want
+        {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                diag::info!(Sim, "bo2zm t6 test: sign at {pop}, grabbing the door power-up at {o:?}");
+            }
+            teleport_player(world, crate::world::ClientId(0), [o[0], o[1], o[2] - 40.0]);
+        }
+    }
+    // IW4L_T6_SETLEVEL=field=int,...: set on level at 15 s (a test aid:
+    // Die Rise's next_leaper_round=2 brings a Jumping Jack round early).
+    if let Ok(sets) = std::env::var("IW4L_T6_SETLEVEL") {
+        let now = world.resource::<Zm>().now_ms;
+        if (15000..15000 + i64::from(crate::MATCH_TICK_MS)).contains(&now) {
+            with_vm(world, |vm, _| {
+                for (k, v) in sets.split(',').filter_map(|kv| kv.split_once('=')) {
+                    let Ok(v) = v.parse::<i32>() else {
+                        continue;
+                    };
+                    let f = vm.intern(k);
+                    vm.set_raw_field(vm.level, f, Value::Int(v));
+                    diag::info!(Sim, "bo2zm t6 setlevel {k} = {v}");
+                }
+            });
+        }
+    }
+    // IW4L_T6_EVAL=level.a.b,...: those values every 5 s (debugging; roots level, anim, player).
     if let Ok(paths) = std::env::var("IW4L_T6_EVAL") {
         let now = world.resource::<Zm>().now_ms;
         if now % 5000 < i64::from(crate::MATCH_TICK_MS) {
@@ -961,6 +1180,10 @@ fn report(world: &mut World) {
                     let mut v = match parts.next() {
                         Some("level") => Value::Object(vm.level),
                         Some("anim") => Value::Object(vm.anim),
+                        Some("player") => match world.resource::<Zm>().players.get(&0) {
+                            Some(p) => Value::Object(p.obj),
+                            None => continue,
+                        },
                         _ => continue,
                     };
                     for p in parts {
@@ -1044,6 +1267,33 @@ fn report(world: &mut World) {
                     e.map_or("", |e| e.model.as_str())
                 );
             }
+            // IW4L_T6_ACTOR_FIELDS=a,b,...: those script fields of each actor too.
+            if let Ok(fields) = std::env::var("IW4L_T6_ACTOR_FIELDS") {
+                let objs: Vec<(u32, ObjRef)> = zm
+                    .actors
+                    .iter()
+                    .filter_map(|(n, a)| a.obj.map(|o| (*n, o)))
+                    .collect();
+                let lines = with_vm(world, |vm, world| {
+                    objs.iter()
+                        .map(|(n, o)| {
+                            let vals: Vec<String> = fields
+                                .split(',')
+                                .map(|f| {
+                                    let id = vm.intern(f);
+                                    let v = vm.get_field(world, *o, id);
+                                    format!("{f}={}", vm.to_text(&v))
+                                })
+                                .collect();
+                            format!("{n}: {}", vals.join(" "))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+                for l in lines {
+                    diag::info!(Sim, "bo2zm t6 actor fields at {now}ms {l}");
+                }
+            }
         }
     }
 }
@@ -1072,9 +1322,13 @@ pub(crate) fn player_hit(world: &mut World, hit: &crate::script_player::Hit) -> 
         .copied()
         .unwrap_or("none");
     let weapon = weapon_text(world, hit.weapon);
+    // A Minecraft mob's hit (bo2mc) comes as the player's own: BO2's
+    // callback drops self damage that is not explosive ("damage type
+    // verbotten"), so it goes with no attacker, like a fall. His 10-08:
+    // "the skeleton isn't doing damage to me".
+    let attacker_id = hit.attacker.filter(|a| *a != hit.victim);
     with_vm(world, |vm, world| {
-        let attacker = hit
-            .attacker
+        let attacker = attacker_id
             .and_then(|a| {
                 world
                     .resource::<Zm>()
@@ -1101,10 +1355,110 @@ pub(crate) fn player_hit(world: &mut World, hit: &crate::script_player::Hit) -> 
     true
 }
 
+/// A broken prop's piece (a mannequin's head, BO2's stage spawn model)
+/// flies off its bone, tumbling, lands on the floor below and lies there
+/// 20 s, as BO2's physics debris does.
+pub(crate) fn throw_debris(
+    world: &mut World,
+    model: &str,
+    from: [f32; 3],
+    direction: [f32; 3],
+    floor: f32,
+) {
+    if !world.contains_resource::<T6Runtime>() {
+        return;
+    }
+    let now = world.resource::<Zm>().now_ms;
+    let g = world.resource_mut::<Zm>().alloc_entnum();
+    // Out that way, a little to one side (by its number), and up: a short
+    // hop that lands within about 40 units.
+    let (fx, fy) = (direction[0], direction[1]);
+    let len = (fx * fx + fy * fy).sqrt().max(0.001);
+    let side = (g % 7) as f32 / 3.0 - 1.0;
+    let (hx, hy) = (fx / len - fy / len * side * 0.3, fy / len + fx / len * side * 0.3);
+    let vel = [hx * 55.0, hy * 55.0, 160.0];
+    // Flight time to the floor: z(t) = z0 + vz*t - 400*t^2.
+    let drop = (from[2] - floor).max(0.0);
+    let secs = ((vel[2] + (vel[2] * vel[2] + 1600.0 * drop).sqrt()) / 800.0).clamp(0.2, 3.0);
+    let yaw = fy.atan2(fx).to_degrees();
+    let obj = with_vm(world, |vm, _| vm.alloc_object(ObjKind::Entity(g)));
+    let Some(obj) = obj else {
+        return;
+    };
+    let spin = if g % 2 == 0 { 1.0 } else { -1.0 };
+    let mut zm = world.resource_mut::<Zm>();
+    zm.ents.insert(
+        g,
+        Ent {
+            obj: Some(obj),
+            classname: "script_model".into(),
+            origin: from,
+            angles: [0.0, yaw, 0.0],
+            model: model.to_owned(),
+            ..Default::default()
+        },
+    );
+    zm.movers.gravity(g, from, vel, now, secs);
+    zm.movers.rotate_to(g, [0.0, yaw, 0.0], [90.0 * spin, yaw + 200.0 * spin, 0.0], now, secs, 0.0, 0.0);
+    zm.gibs.push((g, now + (secs * 1000.0) as i64 + 20000));
+    let at = [from[0] + vel[0] * secs, from[1] + vel[1] * secs, floor];
+    diag::info!(Sim, "bo2zm t6 debris {model} thrown from {from:?}, lands in {secs:.2}s at {at:?}");
+}
+
 /// bo2zm M3: a bullet (or a knife, a blast) on a script model that shows a
 /// BO2 entity: an actor takes it through CodeCallback_ActorDamage with the
 /// hit location of the bone it struck (the weapon's location multiplier
 /// applied, as the engine does); false when the model isn't one of ours.
+/// A map prop's breakable piece broke (`destructibledef` stage with a
+/// break notify): the engine's `codecallback_destructibleevent("broken",
+/// notify, attacker, weapon)` on the prop (the Nuketown mannequin heads
+/// are "headless").
+pub(crate) fn destructible_broken(
+    world: &mut World,
+    target: crate::ScriptModelId,
+    notify: &str,
+    attacker: Option<ClientId>,
+    weapon: u32,
+) {
+    if !world.contains_resource::<T6Runtime>() {
+        return;
+    }
+    let Some(n) = world
+        .resource::<Zm>()
+        .presences
+        .by_ent
+        .iter()
+        .find(|(_, s)| s.id == target)
+        .map(|(n, _)| *n)
+    else {
+        return;
+    };
+    let Some(obj) = world.resource::<Zm>().ents.get(&n).and_then(|e| e.obj) else {
+        return;
+    };
+    let w = weapon_text(world, weapon);
+    diag::info!(Sim, "bo2zm t6 destructible ent{n} broken {notify}");
+    with_vm(world, |vm, world| {
+        let att = attacker
+            .and_then(|a| {
+                world
+                    .resource::<Zm>()
+                    .players
+                    .get(&a.0)
+                    .map(|p| Value::Object(p.obj))
+            })
+            .unwrap_or(Value::Undefined);
+        let args = vec![vm.string("broken"), vm.string(notify), att, vm.string(&w)];
+        vm.spawn_named(
+            world,
+            "maps/mp/zombies/_zm",
+            "codecallback_destructibleevent",
+            Value::Object(obj),
+            args,
+        );
+    });
+}
+
 pub(crate) fn entity_hit(world: &mut World, hit: &crate::script::EntityHit) -> bool {
     if !world.contains_resource::<T6Runtime>() {
         return false;
@@ -1138,11 +1492,24 @@ pub(crate) fn entity_hit(world: &mut World, hit: &crate::script::EntityHit) -> b
             .and_then(|c| c.bones.iter().find(|b| usize::from(b.bone) == bone))
             .map(|b| b.part_classification)
     });
+    // A blast strikes no bone: BO2 calls its location "none" and its point
+    // is the blast's centre, so the scripts tear off the limb nearest the
+    // blast (a grenade at the feet takes the legs: a crawler).
+    let blast = part.is_none() && hit.flags & 1 != 0;
     let part = part.unwrap_or(4);
-    let hitloc = T6_HITLOC_NAMES
-        .get(usize::from(part))
-        .copied()
-        .unwrap_or("none");
+    let hitloc = if blast {
+        "none"
+    } else {
+        T6_HITLOC_NAMES
+            .get(usize::from(part))
+            .copied()
+            .unwrap_or("none")
+    };
+    let point = if blast {
+        std::array::from_fn(|i| hit.point[i] - hit.dir[i])
+    } else {
+        hit.point
+    };
     // The weapon's location multiplier (not for a knife).
     let melee = hit.means == "MOD_MELEE";
     let scale = if melee {
@@ -1166,6 +1533,16 @@ pub(crate) fn entity_hit(world: &mut World, hit: &crate::script::EntityHit) -> b
             .unwrap_or_else(|| "knife_zm".to_owned())
     } else {
         weapon_text(world, hit.weapon)
+    };
+    // bo2mc: the vault's Golden Spork kills with one hit, like Mob of the
+    // Dead's, the Spork (its spoon) hits three times as hard as the knife
+    // (their weapon files are not in Nuketown's damage tables).
+    let amount = if melee && weapon.contains("spork") {
+        amount.max(1_000_000)
+    } else if melee && weapon.contains("spoon") {
+        amount * 3
+    } else {
+        amount
     };
     if melee || std::env::var("IW4L_T6_HITLOG").is_ok() {
         diag::info!(
@@ -1195,7 +1572,7 @@ pub(crate) fn entity_hit(world: &mut World, hit: &crate::script::EntityHit) -> b
             hit.flags,
             hit.means,
             &weapon,
-            hit.point,
+            point,
             hit.dir,
             hitloc,
         );

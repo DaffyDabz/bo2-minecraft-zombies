@@ -131,6 +131,7 @@ pub(crate) fn spawn_loading_screen(
     cameras: Query<Entity, With<LoadingCamera>>,
     leftover_overlay: Query<Entity, With<OverlayUiCamera>>,
     inflight_preview: Option<Res<LoadingPreviewTask>>,
+    (front, mut images): (Option<Res<assets::T6Frontend>>, ResMut<Assets<Image>>),
 ) {
     let Some(screen) = screen else {
         return;
@@ -157,6 +158,17 @@ pub(crate) fn spawn_loading_screen(
     for entity in stale {
         commands.entity(entity).try_despawn();
     }
+    // bo2zm: a Black Ops II map shows its own loading picture
+    // (`loadscreen_zm_nuked_zstandard_nuked`), read with the front end;
+    // bo2mc's own picture (loadscreen.png in the game folder, read with
+    // the map preview) comes first.
+    let own_picture = std::path::Path::new("loadscreen.png").exists();
+    let bo2_picture = zone_ff.as_deref().filter(|_| !own_picture).and_then(|source| {
+        let prefix = format!("loadscreen_{}", source.map_name);
+        let (name, image) = front.as_deref()?.icons.0.iter().find(|(n, _)| n.starts_with(&prefix))?;
+        diag::info!(Ui, "loading: bo2 picture `{name}`");
+        Some(images.add((**image).clone()))
+    });
 
     commands.spawn((
         Camera2d,
@@ -188,7 +200,15 @@ pub(crate) fn spawn_loading_screen(
             LoadingRoot,
             LoadingOverlayTitle(title.to_owned()),
         ))
+        .insert_if(
+            ImageNode::new(bo2_picture.clone().unwrap_or_default())
+                .with_mode(bevy::ui::widget::NodeImageMode::Stretch),
+            || bo2_picture.is_some(),
+        )
         .with_children(|root| {
+            if bo2_picture.is_some() {
+                return;
+            }
             root.spawn(Node {
                 width: Val::Percent(78.0),
                 margin: UiRect {
@@ -263,7 +283,7 @@ pub(crate) fn spawn_loading_screen(
         screen.title(),
         screen.mode_label()
     );
-    if let Some(source) = zone_ff {
+    if let Some(source) = zone_ff.filter(|_| bo2_picture.is_none()) {
         let same = inflight_preview
             .as_deref()
             .is_some_and(|task| task.identity.matches(&source));

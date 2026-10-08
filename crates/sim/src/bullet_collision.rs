@@ -152,6 +152,9 @@ pub type AuthorityDObjCollisionBone = xmodel_runtime::CollisionBone;
 pub struct AuthorityDObjCollision {
     pub bones: Vec<AuthorityDObjCollisionBone>,
     pub coll: Option<AuthorityDObjCollTrace>,
+    /// The boxes' surface where no collision surface says (the model's
+    /// paint: a mannequin is plastic); 0 plays blood.
+    pub surface_flags: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -635,7 +638,10 @@ impl AuthorityDObjState {
             self.world_from_model,
             MASK_BULLET_WORLD,
         ) {
-            Ok(bones) => {
+            Ok(mut bones) => {
+                // A hidden part (a mannequin's shot-off head) takes no hits.
+                let hide = &self.pose_request.hide_part_bits;
+                bones.retain(|b| !hide.get(usize::from(b.bone)));
                 let coll = coll_trace_from_capability(
                     capability,
                     &self.pose_request,
@@ -643,7 +649,11 @@ impl AuthorityDObjState {
                 );
                 match coll {
                     Ok(coll) => {
-                        self.current_collision = Some(AuthorityDObjCollision { bones, coll });
+                        self.current_collision = Some(AuthorityDObjCollision {
+                            bones,
+                            coll,
+                            surface_flags: capability.surface_flags,
+                        });
                         self.materialized_model_revision = Some(self.model_revision);
                         self.materialized_pose_revision = Some(self.pose_revision);
                         self.materialize_error = None;
@@ -706,6 +716,7 @@ impl AuthorityDObjState {
                 self.current_collision = Some(AuthorityDObjCollision {
                     bones: vec![bone],
                     coll: None,
+                    surface_flags: 0,
                 });
             }
         }
@@ -1435,11 +1446,25 @@ fn bullet_trace_filtered(
             DObjGeometryVerdict::Unavailable => {}
         }
         for bone in &dobj_geom.bones {
+            // A prop's box keeps its model's surface (a mannequin is
+            // plastic); a body's boxes have none and play blood.
+            let surface_flags = dobj_geom.coll.as_ref().map_or(0, |c| {
+                c.model
+                    .surfs
+                    .iter()
+                    .find(|s| s.bone_idx == i32::from(bone.bone) && s.surf_flags != 0)
+                    .map_or(0, |s| s.surf_flags)
+            });
+            let surface_flags = if surface_flags != 0 {
+                surface_flags
+            } else {
+                dobj_geom.surface_flags
+            };
             let collider = ColliderId::EntityDObjBone {
                 owner: geom.owner,
                 bone: bone.bone,
                 part_classification: bone.part_classification,
-                surface_flags: 0,
+                surface_flags,
             };
             match ray_obb(query.start, query.end, bone, collider) {
                 RayAabb::StartSolid => {
@@ -2762,6 +2787,7 @@ mod bo2zm_penetration {
                     half_size: [8.0, 12.0, 30.0],
                 }],
                 coll: None,
+                surface_flags: 0,
             }),
             dobj_contents: None,
             model_key: None,

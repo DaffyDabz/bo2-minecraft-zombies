@@ -229,6 +229,25 @@ fn weapons_report(
                     .collect::<Vec<_>>()
             );
         }
+        // T6M2_AMMO=1: one line per weapon of its ammo and fire rules.
+        if std::env::var_os("T6M2_AMMO").is_some() {
+            use fastfile_t6::layout::WeaponVariantDef as v;
+            println!(
+                "ammo {name}: type {} class {} fire {} clip {} start {} max {} unlimited {} clipOnly {} ammoName '{}' fireTime {} damage {} meleeDamage {}",
+                w.def_i32(d::weapType),
+                w.def_i32(d::weapClass),
+                w.def_i32(d::fireType),
+                w.var_i32(v::iClipSize),
+                w.def_i32(d::iStartAmmo),
+                w.def_i32(d::iMaxAmmo),
+                w.def_u8(d::unlimitedAmmo),
+                w.def_u8(d::bClipOnly),
+                w.ammo_name,
+                w.def_i32(d::iFireTime),
+                w.def_i32(d::damage),
+                w.def_i32(d::iMeleeDamage),
+            );
+        }
         // T6M2_AIM=1: one line per weapon of what aims, throws and sounds it.
         if std::env::var_os("T6M2_AIM").is_some() {
             let f = |o: usize| w.def_f32(o);

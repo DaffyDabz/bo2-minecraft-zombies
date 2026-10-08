@@ -7,17 +7,18 @@ our Black Ops II Zombies rebuild (bo2zm) and chasmlol's
 [2010 Rust Rewrite Mashup](https://github.com/chasmlol/2010-rust-rewrite-mashup) (the Minecraft world,
 from MinecraftOSS).
 
-**Status:** playable, work in progress (fix list from the first playtest partly done) · **Visibility:** private for now · **Last updated:** 2026-10-05
+**Status:** playable, work in progress · **Latest release:** 2026-10-08 · **Last updated:** 2026-10-08
 
 Hobby/modding project. Nothing from Activision or Mojang is in this repository: Black Ops II's files
 come from your own copy of the game, Minecraft's files are fetched from Mojang's servers on first run.
 
 ## Contents
-- [How it plays](#how-it-plays)
 - [Download and play](#download-and-play)
+- [Controls](#controls)
+- [Chat commands](#chat-commands)
+- [How it plays](#how-it-plays)
 - [Requirements](#requirements)
-- [Install](#install)
-- [Run / Play](#run--play)
+- [Build from source](#build-from-source)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
 - [Coming soon](#coming-soon)
@@ -25,46 +26,93 @@ come from your own copy of the game, Minecraft's files are fetched from Mojang's
 - [Credits and license](#credits-and-license)
 
 ## Download and play
-1. Download `MinecraftZombies-2026-10-05.zip` from this repository's **Releases** page.
-2. Unzip it anywhere (for example Documents).
-3. Double-click `Setup.bat`. It finds Black Ops II in your Steam libraries, writes the settings file (`.env`) and puts
-   a **Minecraft Zombies** shortcut on your desktop. If it can't find the game it asks for the Black Ops II folder.
-4. Open **Minecraft Zombies** > ONLINE > SOLO > pick **MINECRAFT** or **NUKETOWN** on the globe > START MATCH.
+1. Open this repository's **Releases** page (right side of the GitHub page) and download the newest zip,
+   `MinecraftZombies-2026-10-08.zip` (about 45 MB).
+2. Unzip it anywhere you like (for example Documents). Keep the files together in their folder.
+3. Double-click `Setup.bat`. It finds Black Ops II in your Steam libraries, writes the settings file (`.env`) and
+   puts a **Minecraft Zombies** shortcut on your desktop. If it can't find the game it asks you to paste the Black
+   Ops II folder (the one holding `zone`).
+4. Open **Minecraft Zombies** (or `Play.bat`) > ONLINE > SOLO > pick **MINECRAFT** on the globe > START MATCH.
+   **NUKETOWN** sits next to it on the same globe for plain Black Ops II Nuketown Zombies.
 
-You need your own Black Ops II (PC, Steam) with Zombies. The zip holds only this mod (`iw4l.exe`, the loading picture,
-the setup script); no Black Ops II or Minecraft files. Tested on the author's PC only, not yet on a fresh PC.
+Updating from an older zip: unzip the new one over the old folder (or into a new folder and run `Setup.bat` again).
+Your settings live in `iw4l-artifacts\` next to `iw4l.exe`.
+
+The first Minecraft game downloads Minecraft's own files from Mojang (about 125 MB, once). Windows SmartScreen may
+warn about an unknown program the first time; choose **More info > Run anyway**.
+
+You need your own Black Ops II (PC, Steam) with Zombies. The zip holds only this mod (`iw4l.exe`, the loading
+picture, the setup script, the license); no Black Ops II or Minecraft files. Tested on the author's PC only, not yet
+on a fresh PC.
+
+## Controls
+| Key | Does |
+|---|---|
+| W A S D, Space | Move, jump (crouch, sprint and the rest are Black Ops II's own binds) |
+| Left click | Shoot, or mine the block you look at (hold) |
+| Right click | Aim, or place the block in your hand |
+| Mouse wheel, 1-9 | Pick a hotbar slot (guns, grenades, knife, blocks, tools, food) |
+| E | Inventory (crafting, armor, furnace and chest when you open one) |
+| F | Use: doors, perk machines, the Mystery Box, wall chalks, putting window glass back |
+| T | Minecraft's chat; `/` opens it with a command started |
+| Esc | Pause menu (End Game, Exit Game back to the menus) |
+
+## Chat commands
+Press **T** (or **/**) and type. `/help` lists them in the game.
+
+| Command | Does |
+|---|---|
+| `/round <1-255>` | Jump to that round (between rounds it starts at once) |
+| `/points <amount>`, `/points set <amount>` | Give points, or set them |
+| `/time set <day\|noon\|night\|midnight\|ticks>` | Move the clock; `night` between rounds starts the next round |
+| `/time add <ticks>`, `/time query <daytime\|gametime\|day>` | Minecraft's own time commands |
+| `/gamemode <survival\|creative\|adventure\|spectator>` | Creative flies on a double jump; spectator flies through blocks |
+| `/give <item> [count]` | Any Minecraft item, for example `/give diamond_sword` |
+| `/summon <mob> [x y z]` | A Minecraft mob, for example `/summon creeper` |
+| `/tp <x> <y> <z>` | Teleport (`~` means where you stand) |
+| `/kill`, `/kill @e` | Kill yourself; kill every Minecraft mob within 64 blocks |
+| `/seed` | Show this world's seed |
 
 ## How it plays
-- The game starts at night, in the spawn room, round 1, with Black Ops II's pistol and knife (no free grenades: buy them at the chalk).
+- The game starts at night, in the spawn room, round 1, with Black Ops II's pistol and knife (no free grenades: buy
+  them at the chalk).
 - Every night is one zombies round. The sun stops at midnight until the last zombie of the round dies,
   then the day comes.
 - Every day is Minecraft: mine, farm, place blocks, build walls around yourself. Only animals by day.
 - At night Minecraft's monsters spawn too and hunt you like the zombies do: they know where you are within
-  48 blocks, seen or not. Daylight burns them.
-- The spawn room can't be broken. It holds the perk machines and the Mystery Box (one spot, it never moves).
-  Zombies can't break its doors: they come in through two glass windows, smashing the panes one by one.
-  Hold Use at a window to put the glass back (+10 points a pane), like Black Ops II's boards.
+  48 blocks, seen or not. Daylight burns them. A Minecraft mob that dies falls over as a ragdoll before it poofs.
+- The spawn room can't be broken. It holds the perk machines and the Mystery Box (one spot, it never moves; the
+  Minecraft compass at the top right of the screen points at it). Zombies can't break its doors: they come in
+  through two glass windows, smashing the panes one by one. Hold Use at a window to put the glass back (+10 points
+  a pane), like Black Ops II's boards.
 - Wall weapons are chalk drawings, each with a Minecraft sign above it giving the name and price: four inside
-  the house, eight on its outside end walls (guns, the Bowie Knife, Galvaknuckles, Semtex, frag grenades, claymores).
+  the house, eight on its outside end walls (guns, the Bowie Knife, Galvaknuckles, Semtex, frag grenades,
+  claymores, bread).
 - The vault: a second room across the road, 3,000 points to open. It holds the Nether portal, the End portal
   (twelve Eyes of Ender light it), Pack-a-Punch, and the rare wall weapons, hung on the wall itself until they
   get chalk outlines: the Blundergat (10,000), the Spork (5,000, three times the knife) and the Golden Spork
   (15,000, kills in one hit). Signs mark what comes next (Hell's Retriever, the Thunder Gun, more Mystery Boxes).
+- Every perk also works the Minecraft way: Speed Cola mines and places faster, Double Tap swings faster, Deadshot's
+  swings crit, Stamin-Up sprints without hunger, Quick Revive heals twice as fast, PhD Flopper takes no fall or
+  creeper damage, Vulture Aid loots, Electric Cherry shocks the mobs too, Juggernog adds golden hearts.
 - Every 5th round is a souls round, like Nacht der Untoten's dog rounds: no zombies, just hellhounds that arrive on
-  Minecraft lightning bolts and a pack of angry Minecraft wolves, in thick fog; the last one drops Max Ammo and the fog lifts.
+  Minecraft lightning bolts and a pack of angry Minecraft wolves, in thick fog; the last one drops Max Ammo and the
+  fog lifts.
 - Swimming works like Minecraft: slower in water, you sink slowly, Jump swims up, Crouch dives; Jump and Forward at
   the surface climbs out. Stay under too long and you drown.
 - Nether and End: zombie rounds keep going there; Nether zombies drop blaze rods, Eyes of Ender lead to the End.
 - Zombies rise from the ground around you and break any block to reach you, natural ground too. Blocks
   have health by their Minecraft hardness: leaves and dirt go fast, wood and stone slower, iron and obsidian
   hold for a long time, bedrock never breaks. Zombies go through the weakest way in. A
-  zombie that digs too long, gets stuck or falls behind rises again closer to you.
+  zombie that digs too long, gets stuck or falls behind rises again closer to you. Zombies drop rotten flesh and
+  bones; Minecraft swords and tools hurt them by their attack damage.
 - Underground when night falls: they rise right on top of you. A warning comes at sunset.
 - Going down works like Black Ops II: Quick Revive (solo) brings you back, otherwise game over and a
   new random world starts at round 1. Every game is a new world. Dying in the day ends the game too.
 - Carpenter gives you wood (planks and doors).
-- Survival items: Black Ops II guns, grenades and the knife are inventory items; you start with wooden tools; hearts and
-  hunger replace Black Ops II health (Juggernog adds golden hearts); armor, furnace and chest work; ammo station in the room.
+- Survival items: Black Ops II guns, grenades and the knife are inventory items; you start with wooden tools; hearts
+  and hunger replace Black Ops II health; armor, furnace and chest work; ammo station in the room; grenades and
+  claymores are bought from wall chalk, monkey bombs come from the box (3 per hit, stacking).
 - Black Ops II's own menus: the globe shows MINECRAFT next to NUKETOWN, so both maps are one click apart; Exit Game
   returns to the menus.
 
@@ -74,28 +122,28 @@ the setup script); no Black Ops II or Minecraft files. Tested on the author's PC
 - Internet once, the first time (Minecraft's files, about 125 MB, from Mojang).
 - To build: Rust (stable, MSVC), about 30 GB free for the build folder.
 
-## Install
-From source (the zip above is the easy way):
-1. Build: `cargo build -p launcher --profile play` (set `CARGO_TARGET_DIR` to a roomy drive).
-2. Make a play folder and copy `target/play/iw4l.exe` into it.
-3. In the play folder, create `.env`:
+## Build from source
+The release zip above is the easy way. To build it yourself:
+1. Install Rust (stable, MSVC toolchain) and clone this repository.
+2. Build: `cargo build -p launcher --profile play` (set `CARGO_TARGET_DIR` to a roomy drive).
+3. Make a play folder and copy `target/play/iw4l.exe` into it.
+4. In the play folder, create `.env`:
    ```
    IW4L_GAMES="<your Steam library>/steamapps/common/Call of Duty Black Ops II"
    IW4L_BO2MC=1
    IW4L_SKATE=off
-   IW4L_MINECRAFT_SEED=20261005
    WGPU_BACKEND=dx12
    ```
+5. From the play folder: `iw4l.exe frontend t6:zm_nuked` opens Black Ops II's own main menu (ONLINE > SOLO >
+   MINECRAFT > START MATCH). `iw4l.exe map t6:zm_nuked` skips the menu.
 
-## Run / Play
-From the play folder: `iw4l.exe frontend t6:zm_nuked` opens Black Ops II's own main menu (ONLINE > SOLO >
-map > Survival > START MATCH). `iw4l.exe map t6:zm_nuked` skips the menu. Use key (F) opens and closes doors;
-number keys pick hotbar items (blocks, doors); right click places, left click mines; E opens the inventory.
 Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
 
 ## Configuration
-- `IW4L_MINECRAFT_SEED`: the world (same seed = same world every restart).
+Lines in the play folder's `.env`:
+- `IW4L_MINECRAFT_SEED`: a fixed world (same seed = same world every game). Without it every game is a new world.
 - `IW4L_MINECRAFT_TIME`: start time of day (default nightfall, 13000).
+- `IW4L_BO2MC_RAGDOLL=0`: Minecraft mobs poof at once instead of falling over.
 - `IW4L_BO2MC_DAY_SPEED`: day clock multiplier (testing).
 - Settings (resolution, volume, sensitivity) live in the play folder's `iw4l-artifacts/settings.cfg`.
 
@@ -105,22 +153,27 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
   Black Ops II map instead of an MW2 one).
 - `crates/sim/src/bo2mc.rs` is the bridge between the Minecraft world (blocks, day clock, room, spawn spots)
   and the Black Ops II rules (zombies, rounds, perks, points).
+- `crates/render_anim/src/minecraft_world/bo2mc_world.rs` builds the spawn room and the vault, runs the day clock,
+  and carries out the chat commands (`bo2mc_world/chat.rs`).
 - Zombies plan over the blocks with A* (walk, climb one block, drop, dig through blocks), claw doors and
   blocks, and rise again closer when stuck or far.
 - Rounds follow the day clock: a round waits for nightfall, the clock waits for the round.
+- Minecraft's mobs, items and crafting run on MinecraftOSS (`third_party/minecraftoss`) on their own server thread;
+  Black Ops II weapons and perks reach them through events (shots, Electric Cherry, Vulture Aid).
 
 ## Coming soon
+- [ ] Ray gun bolts and explosions (grenades, claymores) hurt Minecraft mobs.
+- [ ] No way to dig up into the vault from below.
+- [ ] No hostile Minecraft mobs spawning in the day (stops the cave monsters digging up at you).
 - [ ] Chalk outlines for the Blundergat and both Sporks (they hang on the wall for now).
 - [ ] Hell's Retriever (the Mob of the Dead tomahawk) in the vault.
 - [ ] The Thunder Gun (Black Ops 1) in the vault.
 - [ ] Mob of the Dead and Origins Mystery Boxes in the vault.
-- [ ] Check on screen in a full playthrough: windows, souls rounds, swimming, the Nether and the End.
-- [ ] Check every first-playtest fix on screen: survival mining, hotbar scrolling, hearts/hunger, armor, brighter colours, 6-minute days.
-- [ ] Check on screen: farming, snow, saplings, night monsters, block health.
-- [ ] Zombies reaching a player on a one-block tower.
 - [ ] A fresh-PC install test of the release zip.
 
 ## Recent changes
+- 2026-10-08: release zip `MinecraftZombies-2026-10-08.zip` with everything below; README rewritten (download,
+  controls, chat commands).
 - 2026-10-08: chat commands for zombies: /round <1-255> jumps to that round (between rounds it starts at once),
   /points <amount> and /points set <amount>; /time set night between rounds now starts the next round at once.
 - 2026-10-08: playtest fixes: no invisible walls at spawn (the parked bus is solid only as its own body, so its
@@ -149,13 +202,16 @@ Settings, caches, logs and demos go to `iw4l-artifacts\` next to `iw4l.exe`.
   (claymores sell again once used up), monkey bombs from the box, 3 per hit, stacking; souls-round wolves die on
   lightning when the round ends; the End portal shows its starfield.
 - 2026-10-07: boarded windows into the spawn room (zombies tear boards off, you nail them back); the doors now
-  hold; souls round every 5 rounds with Minecraft lightning, hellhounds and wolves; swimming; endless rounds in the Nether and End.
+  hold; souls round every 5 rounds with Minecraft lightning, hellhounds and wolves; swimming; endless rounds in the
+  Nether and End.
 - 2026-10-07: a new world every game; animals by day, hunting monsters at night; farming (hoe, seeds, bone meal,
   saplings that need soil); snow breaks like Minecraft's and tools no longer place into it; blocks have their own
   health; Nuketown Zombies' current menus, zombies and weapons merged in.
 - 2026-10-05: release zip with one-click setup (finds Black Ops II, makes the desktop shortcut).
-- 2026-10-05: Black Ops II's front end with MINECRAFT next to NUKETOWN on the globe; new loading screen; Exit Game returns to the menus.
-- 2026-10-05: first-playtest fixes: doors you fit through, items for guns/grenades/knife, stacks, ammo station, real ammo, hearts and hunger, armor, furnace and chest.
+- 2026-10-05: Black Ops II's front end with MINECRAFT next to NUKETOWN on the globe; new loading screen; Exit Game
+  returns to the menus.
+- 2026-10-05: first-playtest fixes: doors you fit through, items for guns/grenades/knife, stacks, ammo station,
+  real ammo, hearts and hunger, armor, furnace and chest.
 - 2026-10-05: first playable build: Minecraft world under Black Ops II zombies, spawn room, doors, digging
   zombies, night rounds, Carpenter wood.
 

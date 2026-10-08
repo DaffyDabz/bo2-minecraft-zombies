@@ -282,10 +282,64 @@ pub(crate) fn decode(packs: &PackSet, image: &ImageRef) -> Result<Image, String>
             let iwi = ipak_t6::parse_iwi(&bytes).map_err(|e| e.to_string())?;
             gpu_image(&iwi)
         }
-        Some(ImageSource::Embedded) => Err("in-zone colour maps are not drawn yet".to_owned()),
+        Some(ImageSource::Embedded) => embedded_image(image),
         Some(ImageSource::Empty) => Err("no pixels".to_owned()),
         None => Err("in no pack".to_owned()),
     }
+}
+
+/// An image whose pixels ride in the zone itself (`GfxImageLoadDef`):
+/// Zombies Declassified keeps its fire, embers and chalk there. The data is
+/// each face's levels, largest first, as the GPU takes it.
+fn embedded_image(image: &ImageRef) -> Result<Image, String> {
+    let e = image.embedded.as_ref().ok_or("no pixels")?;
+    // DXGI formats: BC1-3 and BC5 (UNORM / SRGB), R8G8B8A8.
+    let (format, unit, block) = match e.dxgi_format {
+        71 | 72 => (TextureFormat::Bc1RgbaUnormSrgb, 8, 4),
+        74 | 75 => (TextureFormat::Bc2RgbaUnormSrgb, 16, 4),
+        77 | 78 => (TextureFormat::Bc3RgbaUnormSrgb, 16, 4),
+        83 => (TextureFormat::Bc5RgUnorm, 16, 4),
+        28 | 29 => (TextureFormat::Rgba8UnormSrgb, 4, 1),
+        other => return Err(format!("in-zone DXGI format {other} is not drawn yet")),
+    };
+    let (w, h) = (u32::from(image.width), u32::from(image.height));
+    let levels = u32::from(e.level_count.max(1));
+    let size = |l: u32| {
+        let (lw, lh) = ((w >> l).max(1), (h >> l).max(1));
+        (lw.div_ceil(block) * lh.div_ceil(block)) as usize * unit
+    };
+    let need: usize = (0..levels).map(size).sum();
+    if w == 0 || h == 0 || (block == 4 && (w % 4 != 0 || h % 4 != 0)) {
+        return Err(format!("in-zone {w}x{h} is not whole 4x4 blocks"));
+    }
+    if e.data.len() < need {
+        return Err(format!(
+            "in-zone pixels {} bytes, {need} needed",
+            e.data.len()
+        ));
+    }
+    let mut out = Image::new_uninit(
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        format,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    out.texture_descriptor.mip_level_count = levels;
+    out.data = Some(e.data[..need].to_vec());
+    out.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..Default::default()
+    });
+    Ok(out)
 }
 
 /// The texture a material is coloured with: its `colorMap`; else, among its
@@ -688,23 +742,56 @@ pub(crate) fn link_materials_with(
 /// (blend ONE/ONE, or SRC_ALPHA/ONE) - BO2's menu brackets and glows,
 /// black where nothing shows.
 pub(crate) fn is_additive(material: &asset_t6::MaterialRef) -> bool {
-    (0..36).filter_map(|t| material.draw_state(t)).any(|d| d.dst_blend == 2 && matches!(d.src_blend, 2 | 5))
+    (0..36)
+        .filter_map(|t| material.draw_state(t))
+        .any(|d| d.dst_blend == 2 && matches!(d.src_blend, 2 | 5))
 }
 
 /// bo2zm M4: an additive picture for a 2D layer that only alpha-blends: its
 /// top level as RGBA with the brightness as alpha (black = see-through),
 /// colour divided back out.
 pub(crate) fn additive_to_alpha(image: &Image) -> Option<Image> {
+    let (w, h, mut rgba) = top_level_rgba(image)?;
+    for px in rgba.chunks_exact_mut(4) {
+        let a = u32::from(px[0].max(px[1]).max(px[2]));
+        let alpha = a * u32::from(px[3]) / 255;
+        if a > 0 {
+            for c in &mut px[..3] {
+                *c = (u32::from(*c) * 255 / a).min(255) as u8;
+            }
+        }
+        px[3] = alpha as u8;
+    }
+    Some(rgba_image(image, w, h, rgba))
+}
+
+/// bo2zm M4: the left `keep` of a picture's columns, the rest see-through
+/// (the lobby's quiet speaker: `voice_on` without its sound waves).
+pub(crate) fn left_part(image: &Image, keep: f32) -> Option<Image> {
+    let (w, h, mut rgba) = top_level_rgba(image)?;
+    let cut = (w as f32 * keep).round() as usize;
+    for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        if i % w >= cut {
+            px[3] = 0;
+        }
+    }
+    Some(rgba_image(image, w, h, rgba))
+}
+
+/// A picture's top level as plain RGBA bytes (block-compressed ones
+/// decoded), with its size.
+fn top_level_rgba(image: &Image) -> Option<(usize, usize, Vec<u8>)> {
     let w = image.texture_descriptor.size.width as usize;
     let h = image.texture_descriptor.size.height as usize;
     let data = image.data.as_ref()?;
-    let (block, decode): (usize, fn(&[u8], &mut [u8], usize)) = match image.texture_descriptor.format {
-        TextureFormat::Bc1RgbaUnormSrgb | TextureFormat::Bc1RgbaUnorm => (8, bcdec_rs::bc1),
-        TextureFormat::Bc2RgbaUnormSrgb | TextureFormat::Bc2RgbaUnorm => (16, bcdec_rs::bc2),
-        TextureFormat::Bc3RgbaUnormSrgb | TextureFormat::Bc3RgbaUnorm => (16, bcdec_rs::bc3),
-        TextureFormat::Rgba8UnormSrgb => (0, |_, _, _| {}),
-        _ => return None,
-    };
+    let (block, decode): (usize, fn(&[u8], &mut [u8], usize)) =
+        match image.texture_descriptor.format {
+            TextureFormat::Bc1RgbaUnormSrgb | TextureFormat::Bc1RgbaUnorm => (8, bcdec_rs::bc1),
+            TextureFormat::Bc2RgbaUnormSrgb | TextureFormat::Bc2RgbaUnorm => (16, bcdec_rs::bc2),
+            TextureFormat::Bc3RgbaUnormSrgb | TextureFormat::Bc3RgbaUnorm => (16, bcdec_rs::bc3),
+            TextureFormat::Rgba8UnormSrgb => (0, |_, _, _| {}),
+            _ => return None,
+        };
     let mut rgba = vec![0u8; w * h * 4];
     if block == 0 {
         rgba.copy_from_slice(data.get(..w * h * 4)?);
@@ -728,16 +815,10 @@ pub(crate) fn additive_to_alpha(image: &Image) -> Option<Image> {
             }
         }
     }
-    for px in rgba.chunks_exact_mut(4) {
-        let a = u32::from(px[0].max(px[1]).max(px[2]));
-        let alpha = a * u32::from(px[3]) / 255;
-        if a > 0 {
-            for c in &mut px[..3] {
-                *c = (u32::from(*c) * 255 / a).min(255) as u8;
-            }
-        }
-        px[3] = alpha as u8;
-    }
+    Some((w, h, rgba))
+}
+
+fn rgba_image(like: &Image, w: usize, h: usize, rgba: Vec<u8>) -> Image {
     let mut out = Image::new(
         Extent3d {
             width: w as u32,
@@ -749,6 +830,6 @@ pub(crate) fn additive_to_alpha(image: &Image) -> Option<Image> {
         TextureFormat::Rgba8UnormSrgb,
         RenderAssetUsages::RENDER_WORLD,
     );
-    out.sampler = image.sampler.clone();
-    Some(out)
+    out.sampler = like.sampler.clone();
+    out
 }

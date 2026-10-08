@@ -108,6 +108,7 @@ fn hash_combat(h: &mut Digest, combat: &[WeaponCombatFacts]) {
         h.i32(row.reload_start_add_time_ms);
         h.i32(row.reload_start_add);
         h.bool(row.no_partial_reload);
+        h.bool(row.unlimited_ammo);
         h.bool(row.dual_mag.is_some());
         if let Some(q) = row.dual_mag {
             h.i32(q.reload_ms);

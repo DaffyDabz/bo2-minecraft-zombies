@@ -323,7 +323,9 @@ fn collect_t6_script_models(
 
 /// bo2zm M3: pose a composition (a zombie's body and head) with its
 /// animation tree's leaves and skin every model; `None` when it has no
-/// animation (it draws in bind pose).
+/// animation and no hidden parts (it draws in bind pose). A hidden part (a
+/// mannequin's shot-off head) shrinks to its bone's origin, as BO2 does: its
+/// mesh shares surfaces with the rest of the body, so no surface can drop.
 fn pose_t6_composition(
     fpv: &asset_model::FpvMeshCatalog,
     xanims: &asset_anim::XAnimCatalog,
@@ -331,13 +333,14 @@ fn pose_t6_composition(
     since_snapshot: f32,
 ) -> Option<Vec<Option<std::sync::Arc<PosedVerts>>>> {
     use xmodel_runtime::{AnimInstance, Attach, DObj, XAnimSemanticNodeKind};
-    let tree = state.tree.as_ref()?;
-    let leaves: Vec<_> = tree
-        .nodes
+    let hiding = state.hide_part_bits.words().iter().any(|w| *w != 0);
+    let leaves: Vec<_> = state
+        .tree
         .iter()
+        .flat_map(|tree| tree.nodes.iter())
         .filter(|n| n.kind == XAnimSemanticNodeKind::Leaf && n.clip.is_some())
         .collect();
-    if leaves.is_empty() {
+    if leaves.is_empty() && !hiding {
         return None;
     }
     let entries: Vec<&asset_model::FpvMeshEntry> = state
@@ -402,7 +405,7 @@ fn pose_t6_composition(
             Some((clip, tracks, frac * duration, weight))
         })
         .collect();
-    if clips.is_empty() {
+    if clips.is_empty() && !hiding {
         return None;
     }
     let instances: Vec<AnimInstance<'_>> = clips
@@ -415,8 +418,24 @@ fn pose_t6_composition(
             parts: None,
         })
         .collect();
-    let world = dobj.pose(&instances, &dobj.all_parts(), Mat4::IDENTITY);
-    let skin = dobj.skin_matrices(&world);
+    let world = if instances.is_empty() {
+        dobj.bones.iter().map(|b| b.bind_world).collect()
+    } else {
+        dobj.pose(&instances, &dobj.all_parts(), Mat4::IDENTITY)
+    };
+    let mut skin = dobj.skin_matrices(&world);
+    if hiding {
+        // Bones come parent first, so a hidden parent hides its children.
+        let mut hidden = vec![false; dobj.bones.len()];
+        for (g, bone) in dobj.bones.iter().enumerate() {
+            hidden[g] = state.hide_part_bits.get(g) || bone.parent.is_some_and(|p| hidden[p]);
+            if hidden[g]
+                && let (Some(m), Some(w)) = (skin.get_mut(g), world.get(g))
+            {
+                *m = Mat4::from_cols(Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, w.w_axis);
+            }
+        }
+    }
     Some(
         entries
             .iter()

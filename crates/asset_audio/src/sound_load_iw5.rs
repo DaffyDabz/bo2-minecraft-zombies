@@ -440,6 +440,7 @@ impl Iw5SoundCapture {
             envelop_percentage: s
                 .f32_at(row, s.layout(sz::SND_ALIAS_ENVELOP_PERCENTAGE_OFF, 136))
                 .unwrap_or(0.0),
+            reverb_send: 0.0,
             speaker_map: speaker_map_name(s, row),
             limit_count: None,
             entity_limit_count: None,

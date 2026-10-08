@@ -141,6 +141,18 @@ pub struct T6Draw {
     /// marks): a colour pulsing between the material's colorObjMin and
     /// colorObjMax, added on.
     pub objective: bool,
+    /// bo2zm M4 retest 5: an `mc_projecteddecal_*` technique (the blood a
+    /// hit paints on a zombie): its model is a box; the pixel shader (fxc
+    /// disassembly) reads the scene depth and paints the texture on what lies
+    /// inside the box, projected along its x axis.
+    pub projected_decal: bool,
+}
+
+/// A projected decal technique set (`mc_projecteddecal_*`).
+fn projected_decal_technique(name: &str) -> bool {
+    name.trim_start_matches(',')
+        .split('_')
+        .any(|t| t == "projecteddecal")
 }
 
 /// An objective technique set (`mc_objective_*`).
@@ -261,6 +273,7 @@ impl T6Draw {
             effect,
             cloud,
             objective,
+            projected_decal: projected_decal_technique(name),
         }
     }
 
@@ -311,6 +324,7 @@ impl T6Draw {
             effect: effect_technique(name),
             cloud: name.trim_start_matches(',').starts_with("particlecloud"),
             objective: objective_technique(name),
+            projected_decal: projected_decal_technique(name),
         }
     }
 
@@ -319,7 +333,7 @@ impl T6Draw {
     /// 1 back, 2 front), polygon offset in bits 10..11, the unlit colour
     /// scale's log2 in bits 12..14, a particle cloud in bit 15, the sort
     /// key in bits 16..23, extra layers 1 and 2 in bits 24..25 and 26..27, an
-    /// objective in bit 28. `NONE_CODE` marks a surface with no BO2 draw (no real code
+    /// objective in bit 28, a projected decal in bit 29. `NONE_CODE` marks a surface with no BO2 draw (no real code
     /// has a low nibble of 0xf).
     pub fn code(self) -> u32 {
         let blend: u32 = match self.blend {
@@ -348,6 +362,7 @@ impl T6Draw {
             | if self.effect { 0x20 } else { 0 }
             | if self.cloud { 0x8000 } else { 0 }
             | if self.objective { 0x1000_0000 } else { 0 }
+            | if self.projected_decal { 0x2000_0000 } else { 0 }
     }
 
     pub const NONE_CODE: u32 = 0xffff_ffff;

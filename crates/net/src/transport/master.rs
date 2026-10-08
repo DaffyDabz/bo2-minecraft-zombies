@@ -830,7 +830,7 @@ pub fn arm_master_bridge(
             if *role != frame::RuntimeRole::Listen || udp_hub.is_some() {
                 return;
             }
-            let relay = spawn_host(config.clone(), settings.player_name.clone());
+            let relay = spawn_host(config.clone(), settings.shown_name());
             diag::info!(
                 Net,
                 "master public lobby arming for {}",
@@ -842,7 +842,7 @@ pub fn arm_master_bridge(
             if *role != frame::RuntimeRole::Client || udp_link.is_some() {
                 return;
             }
-            let relay = spawn_join(config.clone(), settings.player_name.clone());
+            let relay = spawn_join(config.clone(), settings.shown_name());
             diag::info!(
                 Net,
                 "master joining lobby advert {} through {} ({}/{})",

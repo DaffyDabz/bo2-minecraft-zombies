@@ -31,6 +31,8 @@ pub(crate) struct Mining {
     particles: Option<BlockParticles>,
     tick_clock: f64,
     rng: u64,
+    /// The block the hand (or a held tool) is mining.
+    hand: Option<BlockPos>,
 }
 
 impl Default for Mining {
@@ -40,6 +42,7 @@ impl Default for Mining {
             particles: None,
             tick_clock: 0.0,
             rng: 0x2545_f491_4f6c_dd1d,
+            hand: None,
         }
     }
 }
@@ -59,6 +62,17 @@ impl Mining {
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         ((self.rng >> 40) as u32 as f32) / ((1u32 << 24) as f32)
+    }
+
+    /// The block the hand mines now, if any: the one it left loses its
+    /// progress at once (bullets' progress fades over `PROGRESS_SECONDS`).
+    pub(crate) fn hand_on(&mut self, pos: Option<BlockPos>) {
+        if self.hand != pos {
+            if let Some(old) = self.hand {
+                self.progress.remove(&old);
+            }
+            self.hand = pos;
+        }
     }
 
     /// Applies this tick's shots and explosions; the blocks they broke, each

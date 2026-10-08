@@ -94,7 +94,17 @@ pub(super) fn earthquake(world: &mut World, _: &Value, args: &[Value]) -> Result
     if !quake.valid() {
         return Err("invalid earthquake parameters".into());
     }
-    let mut runtime = world.resource_mut::<Runtime>();
+    push_earthquake(world, quake)?;
+    Ok(Value::Undefined)
+}
+
+/// Queues a screen shake for the snapshot (bo2zm: T6's earthquake too).
+pub(crate) fn push_earthquake(world: &mut World, mut quake: ScriptEarthquake) -> Result<(), String> {
+    let now = crate::level_time_ms(world.resource::<crate::step::StepRequest>().tick);
+    quake.start_ms = now;
+    let Some(mut runtime) = world.get_resource_mut::<Runtime>() else {
+        return Ok(());
+    };
     let engine = &mut runtime.engine;
     engine.earthquakes.retain(|quake| quake.active(now));
     if engine.earthquakes.len() >= crate::MAX_SCRIPT_EARTHQUAKES {
@@ -103,5 +113,5 @@ pub(super) fn earthquake(world: &mut World, _: &Value, args: &[Value]) -> Result
     quake.id = engine.next_earthquake;
     engine.next_earthquake = engine.next_earthquake.wrapping_add(1);
     engine.earthquakes.push(quake);
-    Ok(Value::Undefined)
+    Ok(())
 }

@@ -152,6 +152,7 @@ fn report_near(world: &mut World, now_ms: i64) {
 }
 
 pub(super) fn sync(world: &mut World, now_ms: i64) {
+    let parked_bus = super::mc_rules::parked_bus(world);
     report_near(world, now_ms);
     let now = now_ms as i32;
     let zm = world.resource::<Zm>();
@@ -206,6 +207,10 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
         .ents
         .iter()
         .filter(|(_, e)| e.solid && collision_only(&e.model))
+        // bo2mc: Nuketown's patch walls stood in the block world as
+        // invisible walls (his 10-08 "invisible blocks"); its houses are
+        // not there, so neither are they. Perk machines keep theirs.
+        .filter(|(_, e)| !(crate::bo2mc::enabled() && named_wall_size(&e.model).is_some()))
         .map(|(n, e)| (*n, e.origin, e.angles, e.model.clone()))
         .collect();
     // The Mystery Box is solid where it stands (any box piece shown there:
@@ -218,6 +223,27 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
             .find(|p| p.shown && p.model.contains("magic_box"))?;
         (!e.hidden).then(|| (*n, e.origin, e.angles, piece.model.clone()))
     }));
+    // Tranzit's bus: its body as boxes (`transit`). bo2mc's parked bus
+    // too (his 10-08 "invisible blocks at spawn": block-sized barriers
+    // stood off its sides and narrowed its doors).
+    let platform_ents: Vec<(u32, [f32; 3], [f32; 3], &'static [([f32; 3], [f32; 3])])> = zm
+        .ents
+        .iter()
+        .filter(|(n, e)| (e.platform || Some(**n) == parked_bus) && !e.hidden)
+        .filter_map(|(n, e)| {
+            let boxes = super::transit::platform_boxes(&e.model);
+            (!boxes.is_empty()).then(|| (*n, e.origin, e.angles, boxes))
+        })
+        .collect();
+    // Die Rise's elevator cars: their floor and roof (`highrise`).
+    let slab_ents: Vec<(u32, [f32; 3], [f32; 3], String)> = zm
+        .ents
+        .iter()
+        .filter(|(_, e)| {
+            e.platform && !e.hidden && !super::highrise::platform_slabs(&e.model).is_empty()
+        })
+        .map(|(n, e)| (*n, e.origin, e.angles, e.model.clone()))
+        .collect();
     let mut wanted: BTreeMap<u32, ([f32; 3], [f32; 3], String, Vec<(String, String)>, bool)> = zm
         .ents
         .iter()
@@ -262,6 +288,13 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
         let mut shown = match existing {
             Some(s) => s,
             None => {
+                let destructible = {
+                    let zm = world.resource::<Zm>();
+                    zm.ents
+                        .get(&n)
+                        .filter(|e| !e.destructible.is_empty())
+                        .and_then(|e| zm.destructibles.get(&e.destructible).cloned())
+                };
                 let serial = {
                     let mut zm = world.resource_mut::<Zm>();
                     let s = zm.presences.next;
@@ -275,11 +308,22 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
                     continue;
                 };
                 let capability = f.model_capability(&model).flatten();
+                // IW4L_T6_PRESLOG=<part of a model name>: a line as it shows.
+                if std::env::var("IW4L_T6_PRESLOG").is_ok_and(|w| model.contains(w.as_str())) {
+                    diag::info!(
+                        Sim,
+                        "bo2zm t6 presence ent{n} {model} hidden={hidden} capability={}",
+                        capability.is_some()
+                    );
+                }
+                let mut dobj = AuthorityDObjState::at_pose(&model, capability, origin, angles);
+                // A map prop that breaks in stages (a mannequin's head).
+                if let Some(def) = destructible.clone() {
+                    crate::t5_destructible::install_shown(&mut dobj, def);
+                }
                 f.insert_collision_owner(EntityCollisionCapabilities::current_tick(
                     crate::AuthorityModelOwner::ScriptModel(id),
-                    Some(AuthorityDObjState::at_pose(
-                        &model, capability, origin, angles,
-                    )),
+                    Some(dobj),
                     Vec::new(),
                 ));
                 Shown {
@@ -423,6 +467,7 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
             shown.model = model;
             shown.attachments = attachments;
         }
+        set_hidden_parts(world, n, shown.id);
         // Actors: bullets hit the living (their posed hit boxes), and the
         // playing animation goes out as the model row's one leaf.
         let alive_actor = world
@@ -442,7 +487,21 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
         } else {
             None
         };
-        {
+        // A breakable prop (the map's `destructibledef`: Nuketown's
+        // mannequins) keeps the hit shape its model builds, so bullets
+        // reach its pieces.
+        let breakable = !hidden
+            && world
+                .resource::<Zm>()
+                .ents
+                .get(&n)
+                .is_some_and(|e| !e.destructible.is_empty());
+        if breakable {
+            let mut f = frame(world);
+            if let Some(row) = f.collision_owner_mut(shown.id) {
+                row.solid = true;
+            }
+        } else {
             let mut f = frame(world);
             let packed = if boxes.is_some() { ZOMBIE_SOLID } else { 0 };
             if let Some(mover) = f.script_mover_mut_by_number(shown.number)
@@ -454,7 +513,11 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
                 row.solid = boxes.is_some();
                 if let Some(dobj) = row.dobj.as_mut() {
                     dobj.current_collision = boxes.map(|bones| {
-                        crate::bullet_collision::AuthorityDObjCollision { bones, coll: None }
+                        crate::bullet_collision::AuthorityDObjCollision {
+                            bones,
+                            coll: None,
+                            surface_flags: 0,
+                        }
                     });
                     dobj.materialized_model_revision = Some(dobj.model_revision);
                     dobj.materialized_pose_revision = Some(dobj.pose_revision);
@@ -471,7 +534,10 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
                 .and_then(|z| z.pieces.get(i))
                 .and_then(|p| super::zbarrier::piece_pose(p, now_ms).1)
         } else {
-            super::actors::present_anim(world, n, now_ms).or_else(|| super::mc_rules::puppet_anim(world, n, now_ms))
+            super::actors::present_anim(world, n, now_ms)
+                .or_else(|| super::fxanims::present(world, n, now_ms))
+                .or_else(|| super::mc_rules::puppet_anim(world, n, now_ms))
+                .or_else(|| script_anim(world, n, now_ms))
         };
         if let Some((clip, time, rate)) = anim {
             let mut f = frame(world);
@@ -532,6 +598,32 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
             })
         })
         .collect();
+    let mut blockers = blockers;
+    for (n, origin, angles, model) in &slab_ents {
+        let Some((mid, half)) = f.model_capability(model).flatten().and_then(|c| c.bounds) else {
+            continue;
+        };
+        let (fw, rt, up) = gsc_t6::math::angle_vectors(*angles);
+        for &(z0, z1) in super::highrise::platform_slabs(model) {
+            blockers.push(crate::OrientedBlocker {
+                entnum: *n as u16,
+                origin: *origin,
+                axis: [fw, [-rt[0], -rt[1], -rt[2]], up],
+                mins: [mid[0] - half[0], mid[1] - half[1], z0],
+                maxs: [mid[0] + half[0], mid[1] + half[1], z1],
+            });
+        }
+    }
+    for (n, origin, angles, boxes) in &platform_ents {
+        let (fw, rt, up) = gsc_t6::math::angle_vectors(*angles);
+        blockers.extend(boxes.iter().map(|&(mins, maxs)| crate::OrientedBlocker {
+            entnum: *n as u16,
+            origin: *origin,
+            axis: [fw, [-rt[0], -rt[1], -rt[2]], up],
+            mins,
+            maxs,
+        }));
+    }
     // IW4L_T6_BLOCKERLOG=1: each blocker when the list changes (test aid).
     if std::env::var_os("IW4L_T6_BLOCKERLOG").is_some()
         && f.oriented_blockers() != blockers.as_slice()
@@ -556,4 +648,51 @@ pub(super) fn sync(world: &mut World, now_ms: i64) {
         }
     }
     f.set_oriented_blockers(blockers);
+}
+
+/// The tags its scripts hid (`hidepart`) as the model's hide bits. Props
+/// that break in stages keep their own.
+fn set_hidden_parts(world: &mut World, n: u32, id: ScriptModelId) {
+    let parts = match world.resource::<Zm>().ents.get(&n) {
+        Some(e) if e.destructible.is_empty() => e.hidden_parts.clone(),
+        _ => return,
+    };
+    let mut f = frame(world);
+    let Some(dobj) = f.collision_owner_mut(id).and_then(|r| r.dobj.as_mut()) else {
+        return;
+    };
+    let mut words = [0u32; 6];
+    if let Some(cap) = &dobj.capability {
+        for (i, bone) in cap.pose.bone_names.iter().enumerate().take(192) {
+            if parts.iter().any(|p| p.eq_ignore_ascii_case(bone)) {
+                words[i / 32] |= 0x8000_0000 >> (i % 32);
+            }
+        }
+    }
+    let hide = xmodel_runtime::HidePartBits::from_words(words);
+    if hide != dobj.semantic_state.hide_part_bits {
+        dobj.semantic_state.hide_part_bits = hide;
+        dobj.pose_request.hide_part_bits = hide;
+        dobj.pose_revision = dobj.pose_revision.wrapping_add(1);
+        dobj.semantic_state.pose_revision = dobj.pose_revision;
+        dobj.current_collision = None;
+        dobj.materialized_pose_revision = None;
+    }
+}
+
+/// A script model's `setanim` clip: (clip, fraction, rate per second),
+/// looping when the clip loops, else held on its last frame.
+fn script_anim(world: &World, n: u32, now: i64) -> Option<(String, f32, f32)> {
+    let zm = world.resource::<Zm>();
+    let (clip, start) = zm.ents.get(&n)?.anim.clone()?;
+    let a = zm.anims.get(&clip)?;
+    let len = ((f32::from(a.numframes) / a.framerate.max(1.0)) * 1000.0).max(1.0) as i64;
+    let elapsed = (now - start).max(0);
+    Some(if a.looping {
+        (clip, (elapsed % len) as f32 / len as f32, 1000.0 / len as f32)
+    } else if elapsed >= len {
+        (clip, 1.0, 0.0)
+    } else {
+        (clip, elapsed as f32 / len as f32, 1000.0 / len as f32)
+    })
 }

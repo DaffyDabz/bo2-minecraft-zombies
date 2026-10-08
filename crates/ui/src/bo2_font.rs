@@ -21,7 +21,7 @@ pub(crate) struct Bo2Fonts {
 /// The characters drawn as button icons: the PlayStation shapes and BO2's
 /// Xbox button pictures (`frame::BO2_XBOX_GLYPHS`).
 pub(crate) fn is_button_icon(c: char) -> bool {
-    matches!(c, '□' | '○' | '△' | '×' | '\u{E100}'..='\u{E112}')
+    matches!(c, '□' | '○' | '△' | '×' | '\u{E100}'..='\u{E114}')
 }
 
 /// One PlayStation face button, 64 x 64: a dark disc with a light rim and

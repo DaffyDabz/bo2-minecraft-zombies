@@ -37,6 +37,9 @@ impl T6BankIndex {
         };
         let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).collect();
         paths.sort();
+        // bo2zm: then the extra folders' banks (`IW4L_T6_EXTRA`).
+        paths.extend(asset_transport::t6_extra::extra_files("sabl"));
+        paths.extend(asset_transport::t6_extra::extra_files("sabs"));
         for bank in banks {
             for path in &paths {
                 let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
@@ -170,6 +173,7 @@ fn alias_variant(
         envelop_min: f32::from(a.envelop_min),
         envelop_max: f32::from(a.envelop_max),
         envelop_percentage: f32::from(a.envelop_percentage) / 65535.0,
+        reverb_send: f32::from(a.reverb_send) / 65535.0,
         limit_count: Some(a.limit_count),
         entity_limit_count: Some(a.entity_limit_count),
         ..CapturedAlias::default()
@@ -198,6 +202,9 @@ pub fn build_t6_sound_catalog(
     catalog.set_capture_zone(zone);
     let mut census = T6SoundCensus::default();
     for bank in banks {
+        for r in &bank.radverbs {
+            catalog.radverbs.insert(r.name.clone(), r.values);
+        }
         for list in &bank.aliases {
             if list.name.is_empty() {
                 continue;

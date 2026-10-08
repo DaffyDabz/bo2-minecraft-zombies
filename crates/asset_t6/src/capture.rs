@@ -704,6 +704,21 @@ pub struct StringTableRef {
     pub cells: Vec<String>,
 }
 
+/// bo2zm: a window/box barrier type (`ZBarrierDef`, named by a map
+/// entity's `type` key): the zombie animation states it asks for.
+#[derive(Clone, Debug, Default)]
+pub struct ZBarrierDefRef {
+    pub name: String,
+    pub taunts: bool,
+    pub reach_through: bool,
+    pub taunt_state: String,
+    pub reach_through_state: String,
+    pub num_attack_slots: u32,
+    pub attack_spot_horz_offset: f32,
+    /// Per board: (tear anim state, tear anim substate).
+    pub boards: Vec<(String, String)>,
+}
+
 /// Everything one walk captured.
 #[derive(Default)]
 pub struct ZoneCapture {
@@ -720,6 +735,8 @@ pub struct ZoneCapture {
     pub raw_files: Vec<(String, Vec<u8>)>,
     /// bo2zm M3: every StringTable (`mp/zombiemode.csv`, ...).
     pub string_tables: Vec<StringTableRef>,
+    /// bo2zm: barrier types (window boards, the box).
+    pub zbarriers: Vec<ZBarrierDefRef>,
     /// bo2zm M3: every localized string (`ZOMBIE_WEAPON_M14` -> its text),
     /// from a language zone (`zone/english/en_*.ff`).
     pub localize: Vec<(String, String)>,
@@ -738,6 +755,8 @@ pub struct ZoneCapture {
     pub fonts: Vec<crate::m2::FontRef>,
     pub fx: Vec<crate::m2::FxEffectRef>,
     pub tracers: Vec<crate::m2::TracerRef>,
+    /// Props that break in stages (Nuketown's mannequins).
+    pub destructibles: Vec<crate::m2::DestructibleRef>,
     pub impact_tables: Vec<crate::m2::ImpactTableRef>,
     pub footstep_tables: Vec<crate::m2::FootstepTableRef>,
     pub footstep_fx_tables: Vec<crate::m2::FootstepFxTableRef>,
@@ -1976,6 +1995,32 @@ impl WalkSink for ZoneCapture {
                 });
                 None
             }
+            AssetType::ZBarrier => {
+                let sl = |off: usize| -> Result<String> {
+                    Ok(self.script_string(s.u16_at(body, off)?).to_owned())
+                };
+                let n = (s.u32_at(body, l::ZBarrierDef::numBoardsInBarrier)? as usize).min(6);
+                let mut boards = Vec::with_capacity(n);
+                for i in 0..n {
+                    let b = l::ZBarrierDef::boards + i * l::ZBarrierBoard::SIZE;
+                    boards.push((
+                        sl(b + l::ZBarrierBoard::zombieBoardTearStateName)?,
+                        sl(b + l::ZBarrierBoard::zombieBoardTearSubStateName)?,
+                    ));
+                }
+                let def = ZBarrierDefRef {
+                    name: string_field(s, body, l::ZBarrierDef::name)?,
+                    taunts: s.u32_at(body, l::ZBarrierDef::taunts)? != 0,
+                    reach_through: s.u32_at(body, l::ZBarrierDef::reachThroughAttacks)? != 0,
+                    taunt_state: sl(l::ZBarrierDef::zombieTauntAnimState)?,
+                    reach_through_state: sl(l::ZBarrierDef::zombieReachThroughAnimState)?,
+                    num_attack_slots: s.u32_at(body, l::ZBarrierDef::numAttackSlots)?,
+                    attack_spot_horz_offset: s.f32_at(body, l::ZBarrierDef::attackSpotHorzOffset)?,
+                    boards,
+                };
+                self.zbarriers.push(def);
+                None
+            }
             // Compiled scripts are kept with the rawfiles, named `script:`.
             AssetType::ScriptParseTree => {
                 let len = s.u32_at(body, l::ScriptParseTree::len)? as usize;
@@ -2041,6 +2086,11 @@ impl WalkSink for ZoneCapture {
                 self.fx.push(fx);
                 Some(self.fx.len() - 1)
             }
+            AssetType::DestructibleDef => {
+                let def = self.read_destructible(s, body)?;
+                self.destructibles.push(def);
+                None
+            }
             AssetType::Tracer => {
                 let tracer = self.read_tracer(s, body)?;
                 self.tracers.push(tracer);
@@ -2073,6 +2123,16 @@ impl WalkSink for ZoneCapture {
             AssetType::MapEnts => {
                 let len = s.u32_at(body, l::MapEnts::numEntityChars)? as usize;
                 let text = bytes_field(s, body, l::MapEnts::entityString, len)?;
+                let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+                self.map_ents
+                    .push(String::from_utf8_lossy(&text[..end]).into_owned());
+                None
+            }
+            // A mode zone's extra entities (`so_zclassic_zm_buried.ff`'s
+            // `maps/mp/so_zclassic_zm_buried.mapents`), after the map's.
+            AssetType::AddonMapEnts => {
+                let len = s.u32_at(body, l::AddonMapEnts::numEntityChars)? as usize;
+                let text = bytes_field(s, body, l::AddonMapEnts::entityString, len)?;
                 let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
                 self.map_ents
                     .push(String::from_utf8_lossy(&text[..end]).into_owned());

@@ -263,6 +263,7 @@ pub fn capture_model_skel_t6(
         contents: Some(model.contents),
         coll_lod: -1,
         coll_surfs: Vec::new(),
+        surface_flags: 0,
         lod: Some(crate::ModelLodSelector::T5 {
             num_lods: 1,
             lod_dist: [0.0; 4],

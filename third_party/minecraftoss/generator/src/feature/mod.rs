@@ -68,6 +68,8 @@ pub struct CommonBlocks {
     pub obsidian: BlockStateId,
     pub netherrack: BlockStateId,
     pub glowstone: BlockStateId,
+    /// bo2mc: leaf litter is never placed (his 10-08: "remove it completely").
+    pub leaf_litter: Option<BlockId>,
 }
 
 impl CommonBlocks {
@@ -92,6 +94,7 @@ impl CommonBlocks {
             obsidian: s("minecraft:obsidian")?,
             netherrack: s("minecraft:netherrack")?,
             glowstone: s("minecraft:glowstone")?,
+            leaf_litter: registries.blocks.block_by_name("minecraft:leaf_litter"),
         })
     }
 }
@@ -811,6 +814,10 @@ impl<W: World + ?Sized> Ctx<'_, W> {
 
     /// `LevelWriter.setBlock(pos, state, flags)`. Returns false outside the write radius.
     pub fn set_block_flags(&mut self, pos: BlockPos, state: BlockStateId, flags: u32) -> bool {
+        // bo2mc: leaf litter is left out; the feature carries on as if placed.
+        if self.lib.blocks.leaf_litter.is_some_and(|b| self.lib.registries.blocks.block_of(state) == b) {
+            return true;
+        }
         self.region.set_block_with_flags(self.lib, pos, state, flags)
     }
 

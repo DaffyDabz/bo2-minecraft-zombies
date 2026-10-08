@@ -1,6 +1,8 @@
 mod ammo;
 mod blood;
 mod breath_hint;
+mod minecraft_chat;
+mod minecraft_compass;
 mod chrome;
 mod compass;
 mod draw2d;

@@ -399,6 +399,7 @@ pub fn apply_prepared_match(
                 .collect(),
         );
         content.set_weapon_world_models(weapons.0.world_models_table());
+        content.set_weapon_display_names(weapons.0.display_names_table());
         content.set_weapon_projectile_models(weapons.0.projectile_models_table());
         content.set_weapon_melee_only(combat_table::melee_only_from_registry(&weapons.0));
         content.set_weapon_script_sounds(combat_table::script_sounds_from_registry(&weapons.0));
@@ -960,7 +961,7 @@ fn preflight_match_install(
     // bo2zm M3: a Black Ops II map's own compiled scripts.
     let t6_scripts = sources.0.t6.as_ref().map(|set| sim::T6Install {
         map: zone.to_owned(),
-        gametype: "zstandard".to_owned(),
+        gametype: sim::zm_gametype(zone).to_owned(),
         objects: set.objects.clone(),
         tables: set
             .tables
@@ -1020,6 +1021,21 @@ fn preflight_match_install(
             .collect(),
         strings: set.strings.iter().cloned().collect(),
         sound_aliases: set.sound_aliases.iter().cloned().collect(),
+        destructibles: set.destructibles.iter().cloned().map(std::sync::Arc::new).collect(),
+        zbarrier_defs: set
+            .zbarriers
+            .iter()
+            .map(|z| sim::T6ZBarrierDef {
+                name: z.name.clone(),
+                taunts: z.taunts,
+                reach_through: z.reach_through,
+                taunt_state: z.taunt_state.clone(),
+                reach_through_state: z.reach_through_state.clone(),
+                num_attack_slots: z.num_attack_slots,
+                attack_spot_horz_offset: z.attack_spot_horz_offset,
+                boards: z.boards.clone(),
+            })
+            .collect(),
         clips: set
             .anims
             .iter()

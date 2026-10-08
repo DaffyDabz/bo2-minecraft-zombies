@@ -365,6 +365,16 @@ pub fn game_main_for_zone(zone_ff: &Path) -> Result<PathBuf, String> {
             return Ok(main);
         }
     }
+    // bo2zm: a map zone from an extra folder (`IW4L_T6_EXTRA`) uses the
+    // install's game tree.
+    let install = crate::t6_extra::install_zone_dir(zone_ff);
+    if let Some(main) = install
+        .ancestors()
+        .map(|a| a.join("main"))
+        .find(|m| m.is_dir())
+    {
+        return Ok(main);
+    }
     Err(format!(
         "no game tree with a `main/` directory above {}",
         zone_ff.display()

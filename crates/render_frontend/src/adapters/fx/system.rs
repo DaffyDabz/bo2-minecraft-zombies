@@ -668,6 +668,11 @@ pub struct T6FxMesh {
     pub clouds: Vec<T6CloudDraw>,
     /// The box's first index this frame, once a cloud has appended it.
     cloud_box: Option<u32>,
+    /// bo2zm M4 retest 5: per effect model surface (by its first index), its
+    /// box from the world (columns: the surface's bounds to -1..1) and its
+    /// origin. A projected decal (`mc_projecteddecal_*`, the blood a hit
+    /// paints on a zombie) draws its box and paints what lies inside it.
+    pub model_boxes: std::collections::HashMap<u32, ([f32; 16], [f32; 3])>,
 }
 
 /// bo2zm: one Black Ops II particle cloud. Its vertex shader
@@ -733,6 +738,7 @@ impl T6FxMesh {
         self.viewmodel_draws.clear();
         self.clouds.clear();
         self.cloud_box = None;
+        self.model_boxes.clear();
     }
 
     /// bo2zm: one effect model (shell casing, debris), rigid: its bind
@@ -778,6 +784,25 @@ impl T6FxMesh {
                 self.indices.push(base + i.saturating_sub(vbase as u32));
             }
             self.draws.push((start, icount as u32, mat));
+            let (lo, hi) = skel.positions[vbase..vbase + vn].iter().fold(
+                (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                |(lo, hi), p| {
+                    let p = Vec3::from_array(*p);
+                    (lo.min(p), hi.max(p))
+                },
+            );
+            let world_from_local = Mat4::from_cols(
+                (ax * s).extend(0.0),
+                (ay * s).extend(0.0),
+                (az * s).extend(0.0),
+                o.extend(1.0),
+            );
+            let half = ((hi - lo) * 0.5).max(Vec3::splat(0.001));
+            let box_from_world = Mat4::from_scale(half.recip())
+                * Mat4::from_translation(-(lo + hi) * 0.5)
+                * world_from_local.inverse();
+            self.model_boxes
+                .insert(start, (box_from_world.to_cols_array(), origin));
         }
     }
 
@@ -1016,6 +1041,24 @@ fn commit_fx_transaction(
         return;
     };
     let mut zero_half = 0u32;
+    // bo2zm test aid: IW4L_FX_HIDE=<effect name part>:<element>[,<element>...]
+    // leaves those elements of that effect undrawn (which part draws what).
+    let mut out = out;
+    {
+        static HIDE: std::sync::OnceLock<Option<(String, Vec<u8>)>> = std::sync::OnceLock::new();
+        let hide = HIDE.get_or_init(|| {
+            let v = std::env::var("IW4L_FX_HIDE").ok()?;
+            let (name, list) = v.split_once(':')?;
+            Some((name.to_owned(), list.split(',').filter_map(|s| s.trim().parse().ok()).collect()))
+        });
+        if let Some((want, elems)) = hide {
+            let hidden = |name: &str, i: u8| name.contains(want.as_str()) && elems.contains(&i);
+            out.sprites.retain(|s| !hidden(&s.def_name, s.def_index));
+            out.trail_meshes.retain(|t| !hidden(&t.def_name, t.def_index));
+            out.models.retain(|m| !hidden(&m.def_name, m.def_index));
+            out.clouds.retain(|c| !hidden(&c.def_name, c.def_index));
+        }
+    }
 
     take_t6_marks(&host.0, mark_mesh.as_ref(), &runtime, &mut t6_marks);
     fill_mark_mesh_plan(&mut host.0, mark_mesh, &mut mark_plan, &runtime);
@@ -1256,6 +1299,22 @@ fn commit_fx_transaction(
                 .collect();
             if !rows.is_empty() {
                 diag::info!(World, "fx sprites {want}: {}", rows.join(" | "));
+            }
+            // Its trails (vertex count, first vertex) and models too.
+            let others: Vec<String> = out
+                .trail_meshes
+                .iter()
+                .filter(|t| t.def_name.contains(want.as_str()))
+                .map(|t| format!("trail e{} verts {} first {:?}", t.def_index, t.verts.len(), t.verts.first()))
+                .chain(
+                    out.models
+                        .iter()
+                        .filter(|m| m.def_name.contains(want.as_str()))
+                        .map(|m| format!("model e{} #{} scale {:.2} at {:?}", m.def_index, m.model_index, m.scale, m.origin)),
+                )
+                .collect();
+            if !others.is_empty() {
+                diag::info!(World, "fx others {want}: {}", others.join(" | "));
             }
             // IW4L_FX_SPRITE_LOG_STATE=1: every frame, the clock and each
             // matching effect's state and live parts (begin, life).

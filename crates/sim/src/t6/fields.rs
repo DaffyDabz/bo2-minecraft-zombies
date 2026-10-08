@@ -90,6 +90,10 @@ pub(super) fn get(
             "velocity" => Some(Value::Vec3(
                 frame(world).player(id).map_or([0.0; 3], |ps| ps.velocity),
             )),
+            // bo2mc: a dive to prone under way (PhD Flopper's explosion).
+            "divetoprone" => Some(Value::Int(frame(world).player(id).map_or(0, |ps| {
+                i32::from(ps.pm_flags & (movement_iw4::PMF_DIVE | movement_iw4::PMF_DIVE_SLIDE) != 0)
+            }))),
             s if STATS.contains(&s) => Some(Value::Int(
                 world
                     .resource::<Zm>()

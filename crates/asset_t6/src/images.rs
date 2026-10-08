@@ -116,6 +116,10 @@ impl PackSet {
             })
             .collect();
         paths.sort_by_key(|p| priority(p));
+        // bo2zm: then the extra folders' packs (`IW4L_T6_EXTRA`), after the install's.
+        let mut extra = asset_transport::t6_extra::extra_files("ipak");
+        extra.sort_by_key(|p| priority(p));
+        paths.extend(extra);
         let packs = paths
             .iter()
             .map(|p| Pack::open(p))

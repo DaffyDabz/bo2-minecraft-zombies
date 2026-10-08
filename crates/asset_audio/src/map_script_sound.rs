@@ -9,6 +9,10 @@ pub struct MapScriptSoundFacts {
     pub defenders: Option<String>,
 
     pub script: Option<String>,
+
+    /// bo2zm: sounds the map's scripts name (prepared at load, so a script
+    /// sound never arrives late).
+    pub prepare: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Resource)]
@@ -50,6 +54,7 @@ impl MapScriptSoundSource {
             attackers: attackers.map(str::to_owned),
             defenders: defenders.map(str::to_owned),
             script: Some(name.to_owned()),
+            prepare: Vec::new(),
         };
     }
 

@@ -684,7 +684,7 @@ pub(crate) fn advance_weapon_command(
                             *angle += offset.clamp(-45.0, 45.0);
                         }
                     }
-                    let last_shot = hand.clip == 0 && facts.fire_type != 5;
+                    let last_shot = hand.clip == 0 && facts.fire_type != 5 && !facts.unlimited_ammo;
                     world.push_entity_event(
                         tick,
                         EventAudience::All,
@@ -1081,6 +1081,11 @@ pub(crate) fn phase_emit(world: &FrameWorld, shots: &[AcceptedShot]) -> Vec<Emis
         }
         let mut rng = MatchRng::new(shot.combat_seed as u64);
         let pellet_count = facts.pellet_count().clamp(1, u16::MAX as i32) as u16;
+        // bo2mc: Double Tap II fires a second bullet with every one.
+        let double = world
+            .player(shot.attacker)
+            .is_some_and(|ps| ps.perks[0] & weapon_iw4::bo2_perks::PERK_BO2_ROF != 0);
+        let first = out.len();
         for pellet in 0..pellet_count {
             out.push(Emission {
                 combat_seed: shot.combat_seed,
@@ -1095,6 +1100,16 @@ pub(crate) fn phase_emit(world: &FrameWorld, shots: &[AcceptedShot]) -> Vec<Emis
                 max_range: facts.bullet_range(),
                 base_damage: facts.damage,
             });
+        }
+        if double {
+            for i in first..out.len() {
+                let mut twin = out[i];
+                twin.pellet = PelletId(twin.pellet.0 + pellet_count);
+                out.push(twin);
+            }
+            if shot_log() {
+                diag::info!(Sim, "bo2mc Double Tap II: shot {:?} fires {} bullets", shot.shot_id, out.len() - first);
+            }
         }
     }
     out
@@ -1210,6 +1225,24 @@ pub(crate) fn phase_trace(
             }
         }
         let entity_epoch = entity_collision_epoch(terminal, &query.entities.rows);
+        // BO2: a shot through a damage trigger fires it.
+        if world.publishes_snapshot() {
+            let to = segments
+                .iter()
+                .find(|s| s.collider.is_some())
+                .map_or(end, |s| s.end);
+            let d = (0..3).map(|i| (to[i] - em.origin[i]).powi(2)).sum::<f32>().sqrt();
+            crate::t6::damage_triggers(
+                world.ecs(),
+                em.origin,
+                to,
+                0.0,
+                bullet_damage_at_distance(&facts, d).max(1),
+                em.attacker,
+                em.weapon,
+                crate::t6::DamageKind::Bullet,
+            );
+        }
         let startsolid = segments.first().is_some_and(|s| s.startsolid);
         let impact_n = segments
             .iter()
@@ -1460,7 +1493,7 @@ pub(crate) fn phase_trace(
                     | ColliderId::EntityLinkedBrush { owner, .. },
                 ) => {
                     if let Some(ColliderId::EntityDObjBone { bone, .. }) = segment.collider
-                        && crate::t5_destructible::apply_hit(
+                        && let Some(notifies) = crate::t5_destructible::apply_hit(
                             world,
                             tick,
                             owner,
@@ -1469,6 +1502,21 @@ pub(crate) fn phase_trace(
                             Some(em.attacker),
                         )
                     {
+                        if std::env::var_os("IW4L_T6_HITLOG").is_some() {
+                            diag::info!(Sim, "destructible hit surface {}", segment.surf_type);
+                        }
+                        // BO2: the map's scripts hear each break.
+                        if let Some(target) = owner.script_model() {
+                            for notify in notifies {
+                                crate::t6::destructible_broken(
+                                    world.ecs(),
+                                    target,
+                                    &notify,
+                                    Some(em.attacker),
+                                    em.weapon,
+                                );
+                            }
+                        }
                         continue;
                     }
                     if let Some(target) = owner.script_model() {
@@ -1621,6 +1669,24 @@ fn fire_weapon_melee(
         best_frac = frac;
         best_hit = Some(*segment);
     }
+    // BO2: a knife through a damage trigger fires it (Nuketown's bunker
+    // hatch: Marlton).
+    if world.publishes_snapshot() {
+        let to = best_hit.map_or(
+            std::array::from_fn(|i| origin[i] + forward[i] * range),
+            |s| std::array::from_fn(|i| s.end[i] + forward[i] * 4.0),
+        );
+        crate::t6::damage_triggers(
+            world.ecs(),
+            origin,
+            to,
+            0.0,
+            facts.melee_damage,
+            attacker,
+            weapon,
+            crate::t6::DamageKind::Melee,
+        );
+    }
     let Some(segment) = best_hit else {
         return;
     };
@@ -1709,7 +1775,22 @@ fn fire_weapon_melee(
         }
         // bo2zm M3: the script entity (a zombie) takes the knife.
         Some(ColliderId::EntityDObjBone { owner, bone, .. }) => {
-            if let Some(target) = owner.script_model() {
+            // A breakable prop (a mannequin) takes the knife as a hit.
+            if let Some(notifies) =
+                crate::t5_destructible::apply_hit(world, tick, owner, bone, amount.max(0) as u32, Some(attacker))
+            {
+                if let Some(target) = owner.script_model() {
+                    for notify in notifies {
+                        crate::t6::destructible_broken(
+                            world.ecs(),
+                            target,
+                            &notify,
+                            Some(attacker),
+                            weapon,
+                        );
+                    }
+                }
+            } else if let Some(target) = owner.script_model() {
                 crate::script::damage_entity(
                     world.ecs(),
                     &crate::script::EntityHit {

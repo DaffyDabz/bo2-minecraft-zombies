@@ -54,6 +54,10 @@ pub(crate) fn player_damage(
     if *GOD.get_or_init(|| std::env::var("IW4L_T6_GOD").is_ok()) || super::autoplay::rounds_test() {
         return;
     }
+    // bo2mc: creative and spectator take no damage (the chat's /kill still kills).
+    if crate::bo2mc::invulnerable() && means != "MOD_SUICIDE" {
+        return;
+    }
     let Some(obj) = world.resource::<Zm>().players.get(&victim).map(|p| p.obj) else {
         return;
     };
@@ -200,6 +204,21 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let from = origin_of(vm, world, s).unwrap_or([0.0; 3]);
         let to = vec3(a, 0)?;
         Ok(actors::path_length(world, from, to).map_or(Value::Float(-1.0), Value::Float))
+    });
+    // findpath(start, end, ent, allow_negotiation, allow_partial): whether
+    // the path nodes join the two points (Mob's brutus_stuck_watcher counts
+    // a false as a stuck Brutus and teleports him after 4).
+    f!("findpath", |vm, world, _, a| {
+        let from = arg(a, 0)
+            .as_vec3()
+            .or_else(|| origin_of(vm, world, arg(a, 0)));
+        let to = arg(a, 1)
+            .as_vec3()
+            .or_else(|| origin_of(vm, world, arg(a, 1)));
+        Ok(Value::bool(match (from, to) {
+            (Some(from), Some(to)) => actors::path_length(world, from, to).is_some(),
+            _ => false,
+        }))
     });
     m!("isingoal", |vm, world, s, a| {
         let n = actor_n(vm, world, s)?;
@@ -376,6 +395,90 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             });
         Ok(Value::bool(has))
     });
+    // An ASD state's animation, for the scripts that measure it
+    // (Die Rise's Jumping Jacks: `_zm_ai_leaper::leaper_calc_anim_offsets`
+    // takes getmovedelta and getnotetracktimes of `zm_wall_up` ...). The
+    // value is the animation's name; the anim builtins below take it.
+    m!("getanimfromasd", |vm, world, s, a| {
+        let n = actor_n(vm, world, s)?;
+        let state = text(vm, a, 0);
+        let zm = world.resource::<Zm>();
+        let anim = zm
+            .actors
+            .get(&n)
+            .and_then(|x| zm.asds.get(&x.asd))
+            .and_then(|d| d.state(&state, false))
+            .and_then(|st| {
+                let i = int(a, 1).unwrap_or(0).max(0) as usize;
+                st.substates.get(i).or(st.substates.first())
+            })
+            .map(|(_, anim)| anim.to_ascii_lowercase());
+        Ok(anim.map_or(Value::Undefined, |anim| vm.string(&anim)))
+    });
+    f!("getmovedelta", |vm, world, _, a| {
+        let Some(anim) = anim_of(vm, world, arg(a, 0)) else {
+            return Ok(Value::Vec3([0.0; 3]));
+        };
+        let (from, to) = (num(a, 1).unwrap_or(0.0), num(a, 2).unwrap_or(1.0));
+        let (p, q) = (actors::anim_root(&anim, from), actors::anim_root(&anim, to));
+        Ok(Value::Vec3(std::array::from_fn(|i| q[i] - p[i])))
+    });
+    // Where an aligned animation (window board tear, Leroy's table eat)
+    // starts when played at `origin`/`angles`: its first root key, turned
+    // by the yaw (scripted anims play from there by root motion). Only
+    // translation is captured, so the start angles are the align angles.
+    f!("getstartorigin", |vm, world, _, a| {
+        let origin = vec3(a, 0).unwrap_or([0.0; 3]);
+        let yaw = vec3(a, 1).map_or(0.0, |v| v[1]);
+        let root = anim_of(vm, world, arg(a, 2)).map_or([0.0; 3], |anim| actors::anim_root(&anim, 0.0));
+        let (s, c) = yaw.to_radians().sin_cos();
+        Ok(Value::Vec3([
+            origin[0] + root[0] * c - root[1] * s,
+            origin[1] + root[0] * s + root[1] * c,
+            origin[2] + root[2],
+        ]))
+    });
+    f!("getstartangles", |_vm, _world, _, a| {
+        Ok(Value::Vec3(vec3(a, 1).unwrap_or([0.0; 3])))
+    });
+    f!("getnotetracktimes", |vm, world, _, a| {
+        let note = text(vm, a, 1);
+        let times = anim_of(vm, world, arg(a, 0))
+            .map(|anim| {
+                anim.notifies
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case(&note))
+                    .map(|(_, f)| Value::Float(*f))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(list(times))
+    });
+    f!("getanimlength", |vm, world, _, a| {
+        let ms = anim_of(vm, world, arg(a, 0)).map_or(1000, |anim| actors::anim_length_ms(&anim));
+        Ok(Value::Float(ms as f32 / 1000.0))
+    });
+    // The function runs as the actor's animscript: its AI picks no script
+    // until the thread ends.
+    m!("animcustom", |vm, world, s, a| {
+        let n = actor_n(vm, world, s)?;
+        let Some(obj) = s.as_obj() else {
+            return Ok(Value::Undefined);
+        };
+        if let Some(x) = world.resource_mut::<Zm>().actors.get_mut(&n) {
+            x.script = "custom".to_owned();
+            x.path.clear();
+        }
+        vm.notify_str(world, obj, "killanimscript", &[]);
+        let Value::Func(gsc_t6::FuncRef::Script(f)) = arg(a, 0).clone() else {
+            return Ok(Value::Undefined);
+        };
+        let t = vm.spawn(world, f, Value::Object(obj), vec![]);
+        if let Some(x) = world.resource_mut::<Zm>().actors.get_mut(&n) {
+            x.custom = Some(t);
+        }
+        Ok(Value::Undefined)
+    });
     m!("animscripted", |vm, world, s, a| {
         let n = actor_n(vm, world, s)?;
         let origin = vec3(a, 0)?;
@@ -383,6 +486,9 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         if let Some(x) = world.resource_mut::<Zm>().actors.get_mut(&n) {
             x.scripted = Some(actors::Scripted { origin, angles });
             x.path.clear();
+            // Each call starts zm_scripted afresh, even back to back (the
+            // window boards' tear in, loop and out).
+            x.script.clear();
         }
         // The engine hands the arguments to zm_scripted::init, then runs
         // zm_scripted::main (which calls startscriptedanim).
@@ -500,6 +606,8 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     });
     for name in [
         "setaimanimweights",
+        // Anim playback rate (Paralyzer slow-down, Buried ghost death): plays at 1.
+        "setentityanimrate",
         "setflashbanged",
         "enableaimassist",
         "disableaimassist",
@@ -684,6 +792,14 @@ pub(super) fn bind(vm: &mut Vm<World>) {
                 &hitloc,
             );
         } else if is_player(vm, world, s) {
+            // No attacker given is world damage: the scripts get undefined,
+            // not the player himself (_zm callback_playerdamage drops a
+            // player's own MOD_UNKNOWN damage, so Mob's out-of-mana
+            // `dodamage(1000, origin)` never killed).
+            let (attacker, inflictor) = match arg(a, 2) {
+                Value::Undefined => (Value::Undefined, arg(a, 3).clone()),
+                _ => (attacker, inflictor),
+            };
             player_damage(
                 vm, world, n, inflictor, attacker, amount, 0, &means, &weapon, point, [0.0; 3],
                 &hitloc,
@@ -965,7 +1081,9 @@ fn radius_damage(vm: &mut Vm<World>, world: &mut World, a: &[Value]) {
             1,
             &means,
             &weapon,
-            mid,
+            // BO2's point for a blast is its centre (the limb nearest it
+            // comes off).
+            origin,
             dir,
             "none",
         );
@@ -1003,7 +1121,7 @@ fn radius_damage(vm: &mut Vm<World>, world: &mut World, a: &[Value]) {
     }
 }
 
-fn set_goal(vm: &mut Vm<World>, world: &mut World, n: u32, goal: [f32; 3]) {
+pub(crate) fn set_goal(vm: &mut Vm<World>, world: &mut World, n: u32, goal: [f32; 3]) {
     let found = actors::plan(world, n, goal);
     let obj = {
         let mut zm = world.resource_mut::<Zm>();
@@ -1021,4 +1139,18 @@ fn set_goal(vm: &mut Vm<World>, world: &mut World, n: u32, goal: [f32; 3]) {
     if !found && let Some(o) = obj {
         super::natives_game::notify_later(vm, world, o, "bad_path", 50);
     }
+}
+
+/// The animation a script value names: `%anim` or an animation's name.
+fn anim_of(vm: &Vm<World>, world: &World, v: &Value) -> Option<super::T6Anim> {
+    let name = match v {
+        Value::Anim(i) => vm.str(vm.program.anims.get(*i as usize)?.1).to_owned(),
+        Value::Undefined => return None,
+        v => vm.to_text(v),
+    };
+    world
+        .resource::<Zm>()
+        .anims
+        .get(&name.to_ascii_lowercase())
+        .cloned()
 }

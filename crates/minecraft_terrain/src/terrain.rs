@@ -91,7 +91,8 @@ impl BlockStates {
                 _ => u32::MAX,
             });
             fluid.push(matches!(path, "water" | "lava"));
-            chest.push(path == "chest");
+            // The End portal's starfield is drawn by `append_block` too.
+            chest.push(matches!(path, "chest" | "end_portal"));
             waterlogged.push(block.as_ref().is_some_and(|b| b.properties.get("waterlogged").is_some_and(|value| value == "true")));
             tint_kind.push(block.as_ref().map_or(mesh::TintKind::Other, mesh::TintKind::of));
             fluid_cell.push(block.as_ref().and_then(crate::fluid::FluidCell::from_block));
@@ -993,6 +994,26 @@ fn nether_spawn(server: &mut ChunkMap) -> (f64, f64, f64) {
     (0.5, 64.0, 0.5)
 }
 
+/// A standing spot on the End's main island, clear of the exit portal at
+/// its centre and of the obsidian pillars: two air blocks over a solid one,
+/// searched from x 22 outward along the island's east side.
+fn end_spawn(server: &mut ChunkMap) -> (f64, f64, f64) {
+    let registries = server.generator().registries.clone();
+    let blocks = &registries.blocks;
+    for (x, z) in [(22, 0), (24, 0), (20, 0), (22, 4), (22, -4), (26, 0), (18, 0)] {
+        let chunk = server.load_now(minecraftoss_core::ChunkPos::new(x >> 4, z >> 4));
+        let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
+        for y in (20..120).rev() {
+            let floor = chunk.block(lx, y - 1, lz);
+            let solid = blocks.is(floor, minecraftoss_core::block::flags::SOLID_RENDER);
+            if solid && blocks.is_air(chunk.block(lx, y, lz)) && blocks.is_air(chunk.block(lx, y + 1, lz)) {
+                return (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5);
+            }
+        }
+    }
+    (100.5, 49.0, 0.5)
+}
+
 impl TerrainStream {
     pub fn new(registries: Arc<Registries>, seed: i64, view_distance: i32) -> Result<Self> {
         Self::for_dimension(registries, seed, view_distance, Dimension::Overworld, None)
@@ -1046,7 +1067,12 @@ impl TerrainStream {
                 ((x as i32, y as i32, z as i32), (x, y, z))
             }
             // ServerLevel.END_SPAWN_POINT: the obsidian platform at 100, 49, 0.
-            Dimension::End => ((100, 49, 0), (100.5, 49.0, 0.5)),
+            // Minecraft Zombies stands its house on the main island, not on
+            // `ServerLevel.END_SPAWN_POINT`'s platform out over the void.
+            Dimension::End => {
+                let (x, y, z) = end_spawn(&mut server);
+                ((x as i32, y as i32, z as i32), (x, y, z))
+            }
         };
         eprintln!("spawn found in {:.2}s ({} chunks generated)", searching.elapsed().as_secs_f64(), server.stats().generated);
         let (min_section, max_section) = states.section_range();
@@ -1174,6 +1200,25 @@ impl TerrainStream {
     /// The world generation data the chunk map runs.
     pub fn world_gen(&self) -> Arc<minecraftoss_world::chunk_map::WorldGen> {
         self.server.world_gen().clone()
+    }
+
+    /// The first `count` strongholds' locate points (the concentric rings,
+    /// nearest ring first); none outside the overworld.
+    pub fn strongholds(&self, count: usize) -> Vec<(i32, i32, i32)> {
+        let worldgen = self.world_gen();
+        let structures = &worldgen.structures;
+        let Some(index) = structures.sets().iter().position(|s| s.name.ends_with("strongholds")) else {
+            return Vec::new();
+        };
+        let placement = structures.placement(index);
+        placement
+            .ring_chunks(&worldgen.terrain, count)
+            .into_iter()
+            .map(|chunk| {
+                let p = placement.locate_pos(chunk);
+                (p.x, p.y, p.z)
+            })
+            .collect()
     }
 
     /// The storage chunks are saved to, which the level's entities share.

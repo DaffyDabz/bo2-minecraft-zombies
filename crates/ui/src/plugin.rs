@@ -37,6 +37,7 @@ impl Plugin for UiPlugin {
         register_equip_systems(app);
         register_gap_hud_systems(app);
         crate::zm_hud::register_zm_hud_systems(app);
+        crate::vulture_hud::register(app);
         crate::frame_rate::register_frame_rate_systems(app);
         crate::bo2_globe::register_globe(app);
         crate::lui_hud::register_lui_hud_systems(app);

@@ -481,6 +481,19 @@ pub fn bind_core<H>(vm: &mut Vm<H>) {
         vm.dvars.insert(n, v);
         Ok(Value::Undefined)
     });
+    f!("setdvarint", |vm, _, _, a| {
+        let n = vm.dvar_name(arg(a, 0));
+        let v = math::parse_int(&text(vm, a, 1)).to_string();
+        vm.dvars.insert(n, v);
+        Ok(Value::Undefined)
+    });
+    // setdvarfloat (Vulture Aid's tuning) stores the same way.
+    f!("setdvarfloat", |vm, _, _, a| {
+        let n = vm.dvar_name(arg(a, 0));
+        let v = text(vm, a, 1);
+        vm.dvars.insert(n, v);
+        Ok(Value::Undefined)
+    });
     f!("gettime", |vm, _, _, _| Ok(Value::Int(vm.time_ms as i32)));
     for name in [
         "assert",

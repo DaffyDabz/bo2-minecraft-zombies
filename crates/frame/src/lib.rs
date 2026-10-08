@@ -11,7 +11,7 @@ pub mod ui;
 pub use class_presets::{ClassPreset, pick_showcase, showcase_classes};
 pub use pad::{
     ActivePad, BO2_XBOX_GLYPHS, InputDevices, PromptStyle, TestControllerRumble, bo2_frontend,
-    bo2_game, bo2_pad_glyph, set_bo2_frontend, set_bo2_game,
+    bo2_cycle_glyph, bo2_game, bo2_pad_glyph, set_bo2_frontend, set_bo2_game,
 };
 pub use retire::Retiring;
 pub use schedule::{
@@ -41,4 +41,4 @@ pub use ui::{
 pub mod skate;
 pub use skate::SkateMode;
 pub mod minecraft_ui;
-pub use minecraft_ui::{InventoryPuppet, McClick, McSlot, McStack, MinecraftUi};
+pub use minecraft_ui::{InventoryPuppet, McChatLine, McClick, McSlot, McStack, MinecraftUi};

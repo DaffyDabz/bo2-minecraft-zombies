@@ -185,6 +185,10 @@ pub struct HudTessPass {
     pub script_menus: TessJob,
     /// The Minecraft map's hotbar and inventory.
     pub minecraft: TessJob,
+    /// bo2mc: Minecraft's chat.
+    pub minecraft_chat: TessJob,
+    /// bo2mc: the compass at the top right.
+    pub minecraft_compass: TessJob,
 }
 
 /// What the HUD tess flush systems' own bodies cost this frame.

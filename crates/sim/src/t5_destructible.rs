@@ -22,6 +22,13 @@ pub fn install(dobj: &mut AuthorityDObjState, definition: Arc<T5DestructibleDef>
     });
 }
 
+/// [`install`], with the parts its first stage hides hidden now (a prop the
+/// server shows itself, not one the map install posed).
+pub(crate) fn install_shown(dobj: &mut AuthorityDObjState, definition: Arc<T5DestructibleDef>) {
+    install(dobj, definition);
+    update_hide_parts(dobj);
+}
+
 #[derive(Clone)]
 struct Break {
     piece: usize,
@@ -121,6 +128,9 @@ fn update_hide_parts(dobj: &mut AuthorityDObjState) {
         .definition
         .hide_parts(&state.health, &cap.pose.bone_names);
     if hide != dobj.semantic_state.hide_part_bits {
+        if std::env::var_os("IW4L_T6_HITLOG").is_some() {
+            diag::info!(Sim, "destructible hide {}: {:08x?}", state.definition.name, hide.words());
+        }
         dobj.semantic_state.hide_part_bits = hide;
         dobj.pose_request.hide_part_bits = hide;
         dobj.pose_revision = dobj.pose_revision.wrapping_add(1);
@@ -130,16 +140,20 @@ fn update_hide_parts(dobj: &mut AuthorityDObjState) {
     }
 }
 
+/// Returns the stages' script notifies (BO2 hands them to the map's
+/// scripts: a mannequin's "headless").
 fn publish(
     world: &mut FrameWorld,
     tick: Tick,
     owner: AuthorityModelOwner,
     breaks: Vec<Break>,
     attacker: Option<crate::ClientId>,
-) {
+) -> Vec<String> {
+    let mut notifies = Vec::new();
     if breaks.is_empty() {
-        return;
+        return notifies;
     }
+    let has_script_runtime = world.ecs().get_resource::<crate::script::Runtime>().is_some();
     let base = world
         .entity_collision_capabilities()
         .iter()
@@ -157,14 +171,14 @@ fn publish(
         .find(|r| r.owner == owner)
         .and_then(|r| r.dobj.as_mut())
     else {
-        return;
+        return notifies;
     };
     if let Some(base) = base.as_ref().filter(|base| **base != dobj.current_model) {
         dobj.replace_model(base, capability);
     }
     let template = dobj.clone();
     let Some(state) = &mut dobj.t5_destructible else {
-        return;
+        return notifies;
     };
     let timers = std::mem::take(&mut state.timers);
     let definition = state.definition.clone();
@@ -172,12 +186,13 @@ fn publish(
         p.stage(0, state.health[0])
             .and_then(|stage| p.stages[stage].loop_sound.clone())
     });
-    let mut callbacks = Vec::new();
     let pose = dobj
         .capability
         .as_ref()
         .and_then(|cap| cap.pose(&dobj.pose_request, dobj.world_from_model).ok());
     let mut events = Vec::new();
+    let mut phys_debris = Vec::new();
+    // The pieces a stage throws (a mannequin's head), from the bone.
     let mut debris = Vec::new();
     for event in breaks {
         let piece = &definition.pieces[event.piece];
@@ -196,6 +211,8 @@ fn publish(
         let origin = matrix.w_axis.truncate().to_array();
         let direction = matrix.x_axis.truncate().normalize().to_array();
         if st.has_phys_preset
+            && st.spawn_models.iter().all(Option::is_none)
+            && has_script_runtime
             && piece
                 .stage(event.piece, state.health[event.piece])
                 .is_none()
@@ -242,19 +259,31 @@ fn publish(
                     .transform_vector3(glam::Vec3::from_array(forward) * power)
                     .to_array()
             });
-            debris.push((part, offset, half, velocity));
+            phys_debris.push((part, offset, half, velocity));
         }
-        if st.spawn_models.iter().any(Option::is_some) {
-            diag::warn!(
+        diag::info!(
+            Sim,
+            "T5 destructible {} piece={} leaving_stage={} fx={:?} health={}",
+            definition.name,
+            event.piece,
+            event.stage,
+            st.break_effect,
+            state.health[event.piece]
+        );
+        if st.has_phys_preset && st.spawn_models.iter().all(Option::is_none) {
+            diag::info!(
                 Sim,
-                "destructible spawn-model debris unavailable: {} piece={} stage={}",
+                "T5 destructible {} piece={} stage={}: a physics piece with no model to throw",
                 definition.name,
                 event.piece,
                 event.stage
             );
         }
+        for model in st.spawn_models.iter().flatten() {
+            debris.push((model.clone(), origin, direction));
+        }
         if let Some(notify) = &st.break_notify {
-            callbacks.push(notify.clone());
+            notifies.push(notify.clone());
         }
         if let Some(fx) = &st.break_effect {
             events.push((
@@ -274,7 +303,7 @@ fn publish(
         }
     }
     update_hide_parts(dobj);
-    for (part, offset, half, velocity) in debris {
+    for (part, offset, half, velocity) in phys_debris {
         crate::script::destructible_debris(world.ecs(), part, offset, half, velocity);
     }
     crate::script::set_destructible_model(
@@ -284,13 +313,13 @@ fn publish(
         loop_sound.as_deref(),
     );
     let attacker_value = crate::script::destructible_attacker(world.ecs(), attacker);
-    for notify in callbacks {
+    for notify in &notifies {
         crate::script::destructible_callback(
             world.ecs(),
             owner,
             "broken",
             vec![
-                crate::script::Value::string(&notify),
+                crate::script::Value::string(notify),
                 attacker_value.clone(),
             ],
         );
@@ -308,6 +337,40 @@ fn publish(
                 attacker_value.clone(),
             ],
         );
+    }
+    for (model, origin, direction) in debris {
+        // Out along the bone, or the nearest way round with room (never
+        // into the wall the prop stands against).
+        let (fx, fy) = (direction[0], direction[1]);
+        let len = (fx * fx + fy * fy).sqrt();
+        let base = if len > 0.1 { fy.atan2(fx) } else { 0.0 };
+        let mut out = [base.cos(), base.sin(), 0.0];
+        for turn in [0.0f32, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0] {
+            let a = base + turn.to_radians();
+            let d = [a.cos(), a.sin(), 0.0];
+            let t = world.trace_static_world(
+                origin,
+                [origin[0] + d[0] * 48.0, origin[1] + d[1] * 48.0, origin[2]],
+                [-4.0; 3],
+                [4.0; 3],
+                crate::bullet_collision::MASK_PLAYER_SOLID,
+            );
+            if t.fraction >= 1.0 && t.startsolid == 0 {
+                out = d;
+                break;
+            }
+        }
+        let direction = out;
+        // Where it lands: the floor under the bone.
+        let t = world.trace_static_world(
+            origin,
+            [origin[0], origin[1], origin[2] - 2000.0],
+            [0.0; 3],
+            [0.0; 3],
+            crate::bullet_collision::MASK_PLAYER_SOLID,
+        );
+        let floor = if t.fraction < 1.0 { t.endpos[2] } else { origin[2] - 64.0 };
+        crate::t6::throw_debris(world.ecs(), &model, origin, direction, floor);
     }
     for (kind, name, origin, direction) in events {
         if kind == entity_iw4::EntityEventKind::PLAY_FX {
@@ -328,6 +391,97 @@ fn publish(
             },
         );
     }
+    notifies
+}
+
+/// A blast (a grenade) damages each standing piece of every breakable prop
+/// in reach, by the distance from the piece's bone, times the piece's
+/// explosive scale. Returns each prop's script notifies.
+pub(crate) fn apply_blast(
+    world: &mut FrameWorld,
+    tick: Tick,
+    origin: [f32; 3],
+    radius: f32,
+    attacker: Option<crate::ClientId>,
+    amount_at: impl Fn(f32) -> i32,
+) -> Vec<(AuthorityModelOwner, Vec<String>)> {
+    let origin = glam::Vec3::from_array(origin);
+    let mut hits = Vec::new();
+    for row in world.entity_collision_capabilities() {
+        let Some(dobj) = row.dobj.as_ref() else {
+            continue;
+        };
+        let (Some(state), Some(cap)) = (&dobj.t5_destructible, &dobj.capability) else {
+            continue;
+        };
+        if dobj.world_from_model.w_axis.truncate().distance(origin) > radius + 128.0 {
+            continue;
+        }
+        let Ok(pose) = cap.pose(&dobj.pose_request, dobj.world_from_model) else {
+            continue;
+        };
+        for (i, piece) in state.definition.pieces.iter().enumerate() {
+            let Some(stage) = piece.stage(i, state.health[i]) else {
+                continue;
+            };
+            let at = piece.stages[stage]
+                .show_bone
+                .as_ref()
+                .and_then(|name| cap.pose.bone_names.iter().position(|n| n == name))
+                .and_then(|b| pose.get(b))
+                .map_or(dobj.world_from_model.w_axis, |m| m.w_axis)
+                .truncate();
+            let d = at.distance(origin);
+            if d > radius {
+                continue;
+            }
+            // Not through walls (a wall prop's own wall stops the line just
+            // short of it).
+            let start = (origin + glam::Vec3::Z * 4.0).to_array();
+            let t = world.trace_static_world(
+                start,
+                at.to_array(),
+                [0.0; 3],
+                [0.0; 3],
+                crate::bullet_collision::MASK_SHOT,
+            );
+            if (1.0 - t.fraction) * d > 12.0 {
+                continue;
+            }
+            let amount = (amount_at(d) as f32 * piece.explosive_damage_scale) as i32;
+            if amount > 0 {
+                hits.push((row.owner, i, amount));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (owner, index, amount) in hits {
+        let Some(dobj) = world
+            .entity_collision_capabilities_mut()
+            .iter_mut()
+            .find(|r| r.owner == owner)
+            .and_then(|r| r.dobj.as_mut())
+        else {
+            continue;
+        };
+        let Some(state) = &mut dobj.t5_destructible else {
+            continue;
+        };
+        let mut breaks = Vec::new();
+        state.damage(index, amount, None, 0, &mut breaks, true);
+        if std::env::var_os("IW4L_T6_HITLOG").is_some() {
+            diag::info!(
+                Sim,
+                "destructible blast {}: piece {index} -{amount} -> health {:?} breaks {}",
+                state.definition.name,
+                state.health,
+                breaks.len()
+            );
+        }
+        let notifies = publish(world, tick, owner, breaks, attacker);
+        out.push((owner, notifies));
+    }
+    out
 }
 
 pub(crate) fn apply_hit(
@@ -337,17 +491,17 @@ pub(crate) fn apply_hit(
     bone: u16,
     amount: u32,
     attacker: Option<crate::ClientId>,
-) -> bool {
+) -> Option<Vec<String>> {
     let Some(dobj) = world
         .entity_collision_capabilities_mut()
         .iter_mut()
         .find(|r| r.owner == owner)
         .and_then(|r| r.dobj.as_mut())
     else {
-        return false;
+        return None;
     };
     let Some(state) = &mut dobj.t5_destructible else {
-        return false;
+        return None;
     };
     let tag = dobj
         .capability
@@ -367,8 +521,17 @@ pub(crate) fn apply_hit(
     let damage = (amount as f32 * state.definition.pieces[index].bullet_damage_scale) as i32;
     let mut breaks = Vec::new();
     state.damage(index, damage, None, 0, &mut breaks, false);
-    publish(world, tick, owner, breaks, attacker);
-    true
+    if std::env::var_os("IW4L_T6_HITLOG").is_some() {
+        diag::info!(
+            Sim,
+            "destructible hit {}: bone {bone} {:?} piece {index} -{damage} -> health {:?} breaks {}",
+            state.definition.name,
+            tag,
+            state.health,
+            breaks.len()
+        );
+    }
+    Some(publish(world, tick, owner, breaks, attacker))
 }
 
 pub(crate) fn apply_piece_hit(

@@ -9,6 +9,8 @@ use bevy::prelude::*;
 /// armor (feet to head), 40 offhand.
 pub const MC_INVENTORY_SLOTS: usize = 41;
 pub const MC_HOTBAR: usize = 9;
+/// Minecraft's compass pictures (`item/compass_00` to `_31`).
+pub const COMPASS_FRAMES: u32 = 32;
 
 /// One stack as the HUD shows it.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +106,9 @@ pub struct MinecraftUi {
     pub minimap: Option<(Handle<Image>, [f32; 2], [f32; 2])>,
     /// bo2mc: a line of text centred on the screen (a warning).
     pub notice: Option<String>,
+    /// bo2mc: the compass at the top right (his 10-08): Minecraft's compass
+    /// pictures stacked top to bottom (square, RGBA), and the one showing.
+    pub compass: Option<(std::sync::Arc<Vec<u8>>, u32)>,
     /// bo2mc: a door is in reach under the crosshair, or a BO2 use prompt
     /// is up (a wall buy, the box, a machine), so the use key (E in his
     /// layout) opens or buys rather than opening the inventory.
@@ -126,6 +131,22 @@ pub struct MinecraftUi {
     /// The open furnace's fire left and its cooking done, 0 to 1.
     pub furnace_burn: f32,
     pub furnace_cook: f32,
+    /// bo2mc: Minecraft's chat (T, or / to start a command) is open and
+    /// takes the keyboard; `chat_line` is what is typed so far.
+    pub chat_open: bool,
+    pub chat_line: String,
+    /// Lines the player sent this frame (Enter), for the world to answer.
+    pub chat_submitted: Vec<String>,
+    /// What the chat shows: the newest last; each fades 10 s after `at`.
+    pub chat_log: Vec<McChatLine>,
+}
+
+/// bo2mc: one line of chat, its colour (RGB 0..1) and when it came (seconds).
+#[derive(Clone, Debug)]
+pub struct McChatLine {
+    pub text: String,
+    pub color: [f32; 3],
+    pub at: f64,
 }
 
 /// bo2mc: what the hearts, hunger, armor and air bars show.

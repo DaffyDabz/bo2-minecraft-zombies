@@ -43,8 +43,8 @@ mod step;
 // bo2zm M3: Black Ops II Zombies' own scripts.
 mod t6;
 pub use t6::{
-    T6Anim, T6Install, T6PathNode, T6Table, client_frame_heartbeat, set_t6_game_settings,
-    set_t6_profile,
+    T6Anim, T6Install, T6PathNode, T6Table, T6ZBarrierDef, client_frame_heartbeat, set_t6_game_settings,
+    set_t6_profile, zm_gametype,
 };
 pub mod t5_destructible;
 mod world;

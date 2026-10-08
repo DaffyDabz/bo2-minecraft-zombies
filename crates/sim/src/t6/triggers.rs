@@ -1,5 +1,6 @@
 //! Triggers: touch triggers (`trigger_multiple`, `trigger_radius`) notify
-//! `trigger` with the player every frame he is inside; use triggers
+//! `trigger` with the player every frame he is inside (and with zombies when
+//! the spawnflags take AI); use triggers
 //! (`trigger_use`, `trigger_use_touch`, `trigger_radius_use`) when he
 //! presses use inside the one he faces best. A trigger hidden from a player
 //! (`setinvisibletoplayer`) ignores him.
@@ -257,16 +258,255 @@ pub(super) fn dispatch(world: &mut World) {
             fire.push((obj, pobj));
         }
     }
+    actor_touches(world, &triggers, &mut fire);
     if fire.is_empty() {
         return;
     }
     with_vm(world, |vm, world| {
         for (t, p) in fire {
-            if vm.alive(t) {
+            if vm.alive(t) && !super::declassified::cabinet_used(vm, world, t, p) {
                 vm.notify_str(world, t, "trigger", &[Value::Object(p)]);
             }
         }
     });
+}
+
+/// Touch triggers whose spawnflags take AI (1 axis, 2 allies, 4 neutral)
+/// fire for each living actor of that team inside (Verrückt's electric
+/// traps: zombies walking through the live `trigger_multiple` die).
+fn actor_touches(
+    world: &mut World,
+    triggers: &[(u32, Ent, Kind)],
+    fire: &mut Vec<(ObjRef, ObjRef)>,
+) {
+    let ai: Vec<(Ent, i32)> = with_vm(world, |vm, world| {
+        let sf = vm.intern("spawnflags");
+        triggers
+            .iter()
+            .filter(|(_, _, k)| *k == Kind::Touch)
+            .filter_map(|(_, e, _)| match vm.get_field(world, e.obj?, sf) {
+                Value::Int(f) if f & 7 != 0 => Some((e.clone(), f)),
+                _ => None,
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    if ai.is_empty() {
+        return;
+    }
+    let actors: Vec<(ObjRef, i32, [f32; 3], [f32; 3])> = {
+        let zm = world.resource::<Zm>();
+        zm.actors
+            .iter()
+            .filter(|(_, a)| a.alive)
+            .filter_map(|(n, a)| {
+                let p = zm.ents.get(n)?.origin;
+                let team = match a.team.as_str() {
+                    "axis" => 1,
+                    "allies" => 2,
+                    _ => 4,
+                };
+                Some((
+                    a.obj?,
+                    team,
+                    [p[0] - a.radius, p[1] - a.radius, p[2]],
+                    [p[0] + a.radius, p[1] + a.radius, p[2] + a.height],
+                ))
+            })
+            .collect()
+    };
+    for (e, flags) in &ai {
+        for (obj, team, mins, maxs) in &actors {
+            if flags & team != 0 && touches(world, e, *mins, *maxs) {
+                fire.push((e.obj.unwrap(), *obj));
+            }
+        }
+    }
+}
+
+/// How a `trigger_damage` was hit: its spawnflags turn each kind away
+/// (1 pistol, 2 rifle, 4 projectile, 8 explosion, 16 splash, 32 melee).
+#[derive(Clone, Copy)]
+pub(crate) enum DamageKind {
+    Bullet,
+    Explosion,
+    Melee,
+}
+
+/// A shot, a knife or a blast through a `trigger_damage` brush fires it:
+/// "damage" then "trigger" (Nuketown's bunker hatch plays Marlton when
+/// knifed). `start..end` is the shot's line (to its first hit), or the
+/// blast's centre to itself with `radius`.
+pub(crate) fn damage_triggers(
+    world: &mut World,
+    start: [f32; 3],
+    end: [f32; 3],
+    radius: f32,
+    amount: i32,
+    attacker: ClientId,
+    weapon: u32,
+    how: DamageKind,
+) {
+    if !world.contains_resource::<super::T6Runtime>() {
+        return;
+    }
+    let cands: Vec<Ent> = world
+        .resource::<Zm>()
+        .ents
+        .values()
+        .filter(|e| {
+            e.obj.is_some()
+                && ((e.classname == "trigger_damage" && !e.trigger_off) || damageable_model(e))
+        })
+        .cloned()
+        .collect();
+    if cands.is_empty() {
+        return;
+    }
+    let w = super::weapon_text(world, weapon);
+    let block = match how {
+        DamageKind::Melee => 32,
+        DamageKind::Explosion => 8 | 16,
+        DamageKind::Bullet => {
+            let pistol = [
+                "m1911",
+                "python",
+                "fiveseven",
+                "judge",
+                "kard",
+                "beretta93r",
+                "c96",
+                "rnma",
+            ]
+            .iter()
+            .any(|p| w.starts_with(p));
+            if pistol { 1 } else { 2 }
+        }
+    };
+    let len = gsc_t6::math::length(gsc_t6::math::sub(end, start));
+    let steps = ((len / 4.0).ceil() as usize).clamp(1, 2048);
+    let mut hit = Vec::new();
+    for e in &cands {
+        // A model the scripts made damageable (`setcandamage`): its model's
+        // box (Mob's Afterlife shock boxes, zapped with the lightning hands).
+        if damageable_model(e) && e.brush.is_none() {
+            let Some((lo, hi)) = super::brushes::model_box(world, e) else {
+                continue;
+            };
+            let near =
+                |at: [f32; 3], r: f32| (0..3).all(|k| at[k] >= lo[k] - r && at[k] <= hi[k] + r);
+            let touched = match how {
+                DamageKind::Explosion => near(start, radius),
+                _ => (0..=steps).any(|i| {
+                    let t = i as f32 / steps as f32;
+                    near(
+                        std::array::from_fn(|k| start[k] + (end[k] - start[k]) * t),
+                        2.0,
+                    )
+                }),
+            };
+            if std::env::var_os("IW4L_T6_HITLOG").is_some() {
+                diag::info!(
+                    Sim,
+                    "bo2zm t6 damageable {} box {lo:.0?}-{hi:.0?} shot {start:.0?}->{end:.0?} touched {touched}",
+                    e.model
+                );
+            }
+            if touched {
+                hit.push(e.obj.unwrap());
+            }
+            continue;
+        }
+        let touched = match how {
+            DamageKind::Explosion => {
+                let c = center(world, e);
+                gsc_t6::math::length(gsc_t6::math::sub(c, start)) <= radius
+                    || touches(
+                        world,
+                        e,
+                        start.map(|v| v - radius * 0.5),
+                        start.map(|v| v + radius * 0.5),
+                    )
+            }
+            _ => (0..=steps).any(|i| {
+                let t = i as f32 / steps as f32;
+                let at: [f32; 3] = std::array::from_fn(|k| start[k] + (end[k] - start[k]) * t);
+                touches(world, e, at.map(|v| v - 2.0), at.map(|v| v + 2.0))
+            }),
+        };
+        if touched {
+            hit.push(e.obj.unwrap());
+        }
+    }
+    if hit.is_empty() {
+        return;
+    }
+    let pobj = world
+        .resource::<Zm>()
+        .players
+        .get(&attacker.0)
+        .map(|p| p.obj);
+    let means = match how {
+        DamageKind::Melee => "MOD_MELEE",
+        DamageKind::Explosion => "MOD_GRENADE_SPLASH",
+        DamageKind::Bullet => {
+            if block == 1 {
+                "MOD_PISTOL_BULLET"
+            } else {
+                "MOD_RIFLE_BULLET"
+            }
+        }
+    };
+    let models: Vec<ObjRef> = cands
+        .iter()
+        .filter(|e| e.classname != "trigger_damage")
+        .filter_map(|e| e.obj)
+        .collect();
+    with_vm(world, |vm, world| {
+        let sf = vm.intern("spawnflags");
+        for t in hit {
+            if !vm.alive(t) {
+                continue;
+            }
+            let model = models.contains(&t);
+            let flags = match vm.get_field(world, t, sf) {
+                Value::Int(i) if !model => i,
+                _ => 0,
+            };
+            if flags & block != 0 {
+                continue;
+            }
+            if std::env::var("IW4L_T6_TRIGLOG").is_ok() {
+                diag::info!(
+                    Sim,
+                    "bo2zm t6 damage trigger {t:?} by {attacker:?} {means} {amount}"
+                );
+            }
+            let att = pobj.map_or(Value::Undefined, Value::Object);
+            let dir = Value::Vec3(gsc_t6::math::normalize(gsc_t6::math::sub(end, start)));
+            let args = [
+                Value::Int(amount),
+                att.clone(),
+                dir,
+                Value::Vec3(end),
+                vm.string(means),
+                vm.string(""),
+                vm.string(""),
+                vm.string(""),
+                vm.string(&w),
+                Value::Int(0),
+            ];
+            vm.notify_str(world, t, "damage", &args);
+            if !model && vm.alive(t) {
+                vm.notify_str(world, t, "trigger", &[att]);
+            }
+        }
+    });
+}
+
+/// A shown model entity the scripts made damageable (`setcandamage`).
+fn damageable_model(e: &Ent) -> bool {
+    e.can_damage && !e.hidden && !e.model.is_empty() && !e.classname.starts_with("trigger")
 }
 
 #[allow(dead_code)]

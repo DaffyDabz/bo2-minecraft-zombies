@@ -163,7 +163,10 @@ fn read_zone_version(path: &Path) -> Result<u32, String> {
 }
 
 fn game_files(root: &Path) -> impl Iterator<Item = Result<PathBuf, String>> {
-    files_under(search_roots(root))
+    // bo2zm: then the extra read-only folders (`IW4L_T6_EXTRA`).
+    let mut roots = search_roots(root);
+    roots.extend(crate::t6_extra::extra_roots().iter().cloned());
+    files_under(roots)
 }
 
 fn files_under(roots: Vec<PathBuf>) -> impl Iterator<Item = Result<PathBuf, String>> {

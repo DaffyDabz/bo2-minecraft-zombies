@@ -4,6 +4,8 @@
 mod ads_allow;
 mod ads_overlay;
 mod ammo;
+// bo2mc: Black Ops II perks the engine carries out.
+pub mod bo2_perks;
 pub mod event_sound;
 mod fire_sound;
 mod fire_weapon;

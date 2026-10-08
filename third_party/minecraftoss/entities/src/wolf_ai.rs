@@ -45,6 +45,9 @@ pub const TARGET_NAMES: [&str; 8] = [
 /// A wolf's own state for its goals.
 #[derive(Clone, Debug, Default)]
 pub struct WolfState {
+    /// bo2mc's souls round: it hunts the players wherever they are, in any
+    /// difficulty.
+    pub souls: bool,
     /// `TamableAnimal.isTame` and its owner (the ID of the player it
     /// belongs to, while that player is in the level: `getOwner`).
     pub tame: bool,

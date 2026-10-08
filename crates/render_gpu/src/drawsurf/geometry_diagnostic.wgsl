@@ -518,6 +518,13 @@ struct PropOut {
     @location(3) light: vec4<f32>,
     @location(4) world_position: vec3<f32>,
     @location(5) primary: vec4<f32>,
+#ifdef DECAL
+    // A projected decal's box from the world (columns).
+    @location(6) @interpolate(flat) box0: vec4<f32>,
+    @location(7) @interpolate(flat) box1: vec4<f32>,
+    @location(8) @interpolate(flat) box2: vec4<f32>,
+    @location(9) @interpolate(flat) box3: vec4<f32>,
+#endif
 }
 
 @vertex
@@ -562,6 +569,15 @@ fn vertex_prop(in: PropVertexIn) -> PropOut {
         world = vec4(view.world_position + to_sprite * (max(d - eo, d * 0.5) / d), 1.0);
     }
 #endif
+#ifdef DECAL
+    // bo2zm M4 retest 5: a projected decal's box is already in the world;
+    // its instance columns are the box from the world, for the pixels.
+    world = vec4(in.position, 1.0);
+    out.box0 = in.world_from_local_0;
+    out.box1 = in.world_from_local_1;
+    out.box2 = in.world_from_local_2;
+    out.box3 = in.world_from_local_3;
+#endif
     out.clip_position = view.clip_from_world * world;
     out.normal = (world_from_local * vec4(in.normal, 0.0)).xyz;
     out.color = in.color;
@@ -589,6 +605,30 @@ fn fragment_prop(in: PropOut) -> @location(0) vec4<f32> {
     let pulse = 0.5 - 0.5 * sin((nz * -0.5 + t6_dyn.count.y) * 6.28318);
     return vec4(bo2_out(mix(lo, hi, pulse) * 0.5), 1.0);
 #else
+#ifdef DECAL
+    // bo2zm M4 retest 5: Black Ops II's projected decal (`mc_projecteddecal`,
+    // from the fxc disassembly; the blood a hit paints on a zombie): the
+    // scene behind the box's pixel, from the depth, into the box (-1..1);
+    // outside it nothing is drawn. Inside, the texture projected along the
+    // box's x axis (at y, z), its alpha fading to the box's x faces, its
+    // colour the texture squared times the light grid's light, no fog.
+    let scene_d = textureLoad(soft_depth, vec2<i32>(in.clip_position.xy), 0);
+    if (scene_d <= 0.0) {
+        discard;
+    }
+    let suv = (in.clip_position.xy - view.viewport.xy) / view.viewport.zw;
+    let scene_clip = vec4(suv.x * 2.0 - 1.0, 1.0 - suv.y * 2.0, scene_d, 1.0);
+    let scene_h = view.world_from_clip * scene_clip;
+    let box_from_world = mat4x4<f32>(in.box0, in.box1, in.box2, in.box3);
+    let b = (box_from_world * vec4(scene_h.xyz / scene_h.w, 1.0)).xyz;
+    if (any(abs(b) > vec3(1.0))) {
+        discard;
+    }
+    let decal = textureSampleLevel(colour_map, colour_sampler, b.yz * 0.5 + 0.5, 0.0);
+    let dtex = raw_texel(decal.rgb);
+    let decal_exposure = max(t6.sun_dir_exposure.w, 0.000001);
+    return vec4(bo2_out(dtex * dtex * in.light.rgb / decal_exposure), (1.0 - abs(b.x)) * decal.a);
+#else
     let albedo = textureSample(colour_map, colour_sampler, in.uv);
 #ifdef ALPHA_TEST
     // The game's alpha-tested shaders discard below 128/255.
@@ -608,7 +648,16 @@ fn fragment_prop(in: PropOut) -> @location(0) vec4<f32> {
         saturate(distance(in.world_position, view.world_position) * feather),
         feather > 0.0,
     );
+    // bo2zm M4 retest 5: the `_ds` (dissolve) ones, from the fxc
+    // disassembly: alpha = saturate(alphaDissolveParms.x * (texture alpha +
+    // vertex alpha - 1)) (minus instance slot 20, which is otherwise a
+    // primary light, 0 or more), so the texture's faint floor never shows
+    // and the sprite dissolves as it fades.
+    let dissolve = -min(in.primary.x, 0.0);
     var a = albedo.a * in.color.a * near;
+    if (dissolve > 0.0) {
+        a = saturate(dissolve * (albedo.a + in.color.a * near - 1.0));
+    }
     // Nothing to blend where the sprite is clear (most of a puff's corners,
     // a near-faded sprite): stop before the depth read and the blend.
     if (a < 0.002) {
@@ -748,6 +797,7 @@ fn fragment_prop(in: PropOut) -> @location(0) vec4<f32> {
     light += primary_light(u32(in.primary.x + 0.5), in.world_position, n) * in.primary.y;
     light += dyn_lights(in.world_position, n);
     return vec4(bo2_out(bo2_fog(base * light, in.world_position)), albedo.a * in.color.a);
+#endif
 #endif
 #endif
 #endif

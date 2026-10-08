@@ -533,6 +533,8 @@ pub(crate) fn cube_scaled(
     uv_dimensions: Option<[f32; 3]>,
     mirror: bool,
 ) {
+    // A ragdoll's limbs swing loose (Minecraft Zombies).
+    let part_rotation = crate::ragdoll::limb_turn(feet, rotation, scale, from, to, pivot, part_rotation) * part_rotation;
     let [x0, y0, z0] = from;
     let [x1, y1, z1] = to;
     let (x_lo, x_hi) = if mirror { (x1, x0) } else { (x0, x1) };

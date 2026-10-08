@@ -230,6 +230,10 @@ fn queue_match_clips(
         aliases += 1;
         request_named(clips, &bank.0, namespace.namespace, alias, &mut set);
     }
+    for alias in &script_sound.0.prepare {
+        aliases += 1;
+        request_named(clips, &bank.0, namespace.namespace, alias, &mut set);
+    }
     if let Some(catalog) = catalog.as_deref() {
         for alias in catalog.played_sound_aliases().into_iter().chain(MENU_CODE) {
             aliases += 1;

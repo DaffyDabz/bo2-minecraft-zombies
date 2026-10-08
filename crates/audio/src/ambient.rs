@@ -40,6 +40,30 @@ pub struct MapEmitter {
     pub pcm: Handle<PcmAudio>,
 
     pub live_pan: Option<crate::pcm::LivePan>,
+    /// bo2zm: a line emitter's other end (heard from the nearest point).
+    pub line_end_inches: Option<[f32; 3]>,
+}
+
+impl MapEmitter {
+    /// Where the listener hears it from: its place, or a line emitter's
+    /// point nearest the listener (`closest_point_on_line_to_point`).
+    pub fn heard_from(&self, ear_inches: [f32; 3]) -> [f32; 3] {
+        let Some(b) = self.line_end_inches else {
+            return self.origin_inches;
+        };
+        let a = self.origin_inches;
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        if len2 <= f32::EPSILON {
+            return a;
+        }
+        let t = (((ear_inches[0] - a[0]) * ab[0]
+            + (ear_inches[1] - a[1]) * ab[1]
+            + (ear_inches[2] - a[2]) * ab[2])
+            / len2)
+            .clamp(0.0, 1.0);
+        [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t]
+    }
 }
 
 #[derive(Resource, Clone)]
@@ -627,6 +651,7 @@ fn start_map_ambient_prepared(
                     base_gain,
                     pcm: handle,
                     live_pan: None,
+                    line_end_inches: emitter.line_end_inches,
                 },
                 Transform::from_translation(Vec3::from_array(origin_inches)),
             ))
@@ -666,7 +691,7 @@ fn start_map_ambient_prepared(
 }
 
 pub(crate) fn emitter_gain(emitter: &MapEmitter, ear_inches: [f32; 3]) -> f32 {
-    let dist = distance_inches(ear_inches, emitter.origin_inches);
+    let dist = distance_inches(ear_inches, emitter.heard_from(ear_inches));
     if emitter.knots.is_empty() {
         return 0.0;
     }
@@ -710,7 +735,7 @@ pub fn update_map_emitter_gain(
             entity,
             emitter_gain(&emitter, ear_inches),
             emitter.pcm.clone(),
-            emitter.origin_inches,
+            emitter.heard_from(ear_inches),
             has_player,
         )
     }));

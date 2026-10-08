@@ -7,6 +7,10 @@ pub struct CreateFxLoopSound {
     pub soundalias: String,
 
     pub origin_inches: [f32; 3],
+    /// bo2zm: a line emitter's other end (a Black Ops II map's wind and
+    /// power lines): the loop is heard from the line's point nearest the
+    /// listener.
+    pub line_end_inches: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +44,10 @@ pub struct ScriptedMapFx {
     pub oneshots: Vec<CreateFxOneshot>,
     pub loop_sounds: Vec<CreateFxLoopSound>,
     pub random_sounds: Vec<RandomPointSound>,
+    /// bo2zm: the map's ambient rooms and their echoes
+    /// (`setambientroomreverb(room, preset, dry, wet)`): room, preset, dry,
+    /// wet. The default room (`declareambientroom(room, true)`) is first.
+    pub rooms: Vec<(String, String, f32, f32)>,
 }
 
 pub fn parse_createfx_effect_aliases(source: &str) -> HashMap<String, String> {
@@ -177,6 +185,7 @@ fn flush_loop(
             out.push(CreateFxLoopSound {
                 soundalias,
                 origin_inches: origin,
+                line_end_inches: None,
             });
         }
     } else {

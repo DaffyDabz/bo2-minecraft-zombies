@@ -766,8 +766,13 @@ pub(crate) fn give_start_ammo(world: &mut FrameWorld, id: ClientId, weapon: u32)
         set_ammo_clip(world, id, weapon, eq.spawn_clip_count());
         return;
     }
-    let (clip, _, stock) = weapon_iw4::spawn_clip_stock(&facts, 0);
+    // A dual-wield weapon starts with both guns loaded.
+    let dual = facts.dual_wield || facts.dual_wield_weapon != 0;
+    let (clip, clip_alt, stock) = weapon_iw4::spawn_clip_stock(&facts, i32::from(dual));
     set_ammo_clip(world, id, weapon, clip);
+    if dual {
+        set_left_clip(world, id, weapon, clip_alt);
+    }
     set_ammo_stock(world, id, weapon, stock);
 }
 
@@ -783,6 +788,10 @@ fn perk_bits(name: &str) -> (u32, u32) {
         "specialty_bulletaccuracy" => weapon_iw4::PERK_BULLETACCURACY,
         "specialty_pistoldeath" => playerstate_iw4::PERK_PISTOLDEATH,
         "specialty_fastmantle" => playerstate_iw4::PERK_FASTMANTLE,
+        // bo2mc: Black Ops II's Double Tap II, Stamin-Up and Deadshot.
+        "specialty_rof" => weapon_iw4::bo2_perks::PERK_BO2_ROF,
+        "specialty_longersprint" => weapon_iw4::bo2_perks::PERK_BO2_LONGERSPRINT,
+        "specialty_deadshot" => weapon_iw4::bo2_perks::PERK_BO2_DEADSHOT | weapon_iw4::PERK_BULLETACCURACY,
         _ => 0,
     };
     let e_flags = match name {

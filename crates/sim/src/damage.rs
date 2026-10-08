@@ -108,19 +108,38 @@ pub(crate) fn apply_explosion_blast(world: &mut FrameWorld, tick: Tick, blast: &
     }
     apply_glass_blast_hits(world, tick, glass);
     apply_entity_blast(world, blast);
-    crate::t5_destructible::apply_radius(
+    crate::t6::damage_triggers(
+        world.ecs(),
+        blast.origin,
+        blast.origin,
+        blast.radius,
+        blast.inner_damage as i32,
+        blast.attacker,
+        blast.weapon,
+        crate::t6::DamageKind::Explosion,
+    );
+    // Breakable props (Nuketown's mannequins, outlets, TVs) break in blasts.
+    let broken = crate::t5_destructible::apply_blast(
         world,
         tick,
-        &crate::t5_destructible::RadiusDamage {
-            origin: blast.origin,
-            radius: blast.radius,
-            inner: blast.inner_damage,
-            outer: blast.outer_damage,
-            attacker: Some(blast.attacker),
-            exclude: None,
-            cone: blast.cone,
-        },
+        blast.origin,
+        blast.radius,
+        Some(blast.attacker),
+        |d| radius_damage_amount(blast.inner_damage, blast.outer_damage, blast.radius, d, 1.0),
     );
+    for (owner, notifies) in broken {
+        if let Some(target) = owner.script_model() {
+            for notify in notifies {
+                crate::t6::destructible_broken(
+                    world.ecs(),
+                    target,
+                    &notify,
+                    Some(blast.attacker),
+                    blast.weapon,
+                );
+            }
+        }
+    }
     let means = crate::script_player::means(world, blast.source, blast.weapon, 0, true);
     let ignore_model = world
         .ecs()
@@ -164,7 +183,8 @@ pub(crate) fn apply_block_world_damage(world: &mut FrameWorld, tick: Tick) {
         let Some(meta) = world.client_meta(target) else {
             continue;
         };
-        if meta.lifecycle != ClientLifecycle::Alive || amount <= 0 {
+        // bo2mc: creative and spectator take no damage.
+        if meta.lifecycle != ClientLifecycle::Alive || amount <= 0 || crate::bo2mc::invulnerable() {
             continue;
         }
         let life = meta.life_sequence;

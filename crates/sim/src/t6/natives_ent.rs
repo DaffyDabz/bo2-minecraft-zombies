@@ -35,7 +35,8 @@ fn typed(vm: &mut Vm<World>, key: &str, val: &str, entity: bool) -> Value {
         // Names stay text even when they look like numbers.
         "targetname" | "target" | "script_noteworthy" | "script_string" | "classname" | "model"
         | "script_flag" | "script_label" | "script_parameters" | "script_linkto"
-        | "script_linkname" | "script_sound" | "script_fxid" | "script_animation" => vm.string(val),
+        | "script_linkname" | "script_sound" | "script_fxid" | "script_animation"
+        | "script_location" => vm.string(val),
         // Numbers are numbers (BO2's scripts compare `self.zombie_cost` with
         // a score and halve it; `trigger.script_chance` with a randomfloat).
         _ => {
@@ -108,10 +109,12 @@ pub(super) fn spawn_map_entities(vm: &mut Vm<World>, world: &mut World, texts: &
                 solid: true,
                 ..Default::default()
             };
+            let mut targetname = None;
             for (k, v) in &e {
                 let key = k.to_ascii_lowercase();
                 match key.as_str() {
                     "classname" => continue,
+                    "targetname" => targetname = Some(v.clone()),
                     "origin" => {
                         if let Value::Vec3(p) = typed(vm, "origin", v, true) {
                             ent.origin = p;
@@ -135,6 +138,7 @@ pub(super) fn spawn_map_entities(vm: &mut Vm<World>, world: &mut World, texts: &
                     }
                     "radius" => ent.radius = v.trim().parse().unwrap_or(0.0),
                     "height" => ent.height = v.trim().parse().unwrap_or(0.0),
+                    "destructibledef" => ent.destructible = v.to_ascii_lowercase(),
                     _ => {}
                 }
                 let val = typed(vm, &key, v, true);
@@ -142,9 +146,15 @@ pub(super) fn spawn_map_entities(vm: &mut Vm<World>, world: &mut World, texts: &
                 vm.set_raw_field(obj, f, val);
             }
             if cls.starts_with("zbarrier") {
-                ent.zbarrier = Some(super::zbarrier::ZBarrier::from_keys(&e));
+                let mut z = super::zbarrier::ZBarrier::from_keys(&e);
+                z.def = super::zbarrier::def_for(world, &e);
+                ent.zbarrier = Some(z);
             }
-            world.resource_mut::<Zm>().ents.insert(n, ent);
+            let mut zm = world.resource_mut::<Zm>();
+            zm.ents.insert(n, ent);
+            if let Some(t) = targetname {
+                zm.nav.attach_movers(&t, n);
+            }
             ents += 1;
         }
     }
@@ -412,6 +422,36 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "unlink" => |e| e.link = None,
         "stoploopsound" => |e| e.loop_sound = None,
     );
+    // Parts of its model hidden or shown again by tag (a buildable table's
+    // parts appear as they are added); drawn by `presence`.
+    fn part(vm: &mut Vm<World>, world: &mut World, s: &Value, a: &[Value], hide: bool) {
+        let Ok(n) = me(vm, world, s) else { return };
+        let tag = text(vm, a, 0).to_ascii_lowercase();
+        if let Some(mut zm) = ent_mut(world, n) {
+            let parts = &mut zm.ents.get_mut(&n).unwrap().hidden_parts;
+            parts.retain(|p| *p != tag);
+            if hide {
+                parts.push(tag);
+            }
+        }
+    }
+    m!("hidepart", |vm, world, s, a| {
+        part(vm, world, s, a, true);
+        Ok(Value::Undefined)
+    });
+    m!("showpart", |vm, world, s, a| {
+        part(vm, world, s, a, false);
+        Ok(Value::Undefined)
+    });
+    // Origins' crafted staffs on their pedestals.
+    m!("showallparts", |vm, world, s, _| {
+        if let Ok(n) = me(vm, world, s)
+            && let Some(mut zm) = ent_mut(world, n)
+        {
+            zm.ents.get_mut(&n).unwrap().hidden_parts.clear();
+        }
+        Ok(Value::Undefined)
+    });
     // A weapon's world model on an entity (the box's floating gun).
     m!("useweaponmodel", |vm, world, s, a| {
         let Ok(n) = me(vm, world, s) else {
@@ -459,7 +499,18 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         };
         // The text as the player reads it: the language string with its
         // arguments filled in (`&&1`, `&&2`).
-        let h = super::localize(vm, world, arg(a, 0), a.get(1..).unwrap_or(&[]));
+        let mut h = super::localize(vm, world, arg(a, 0), a.get(1..).unwrap_or(&[]));
+        // bo2mc: a melee wall buy he owns (the vault's Sporks) has no ammo
+        // to sell: no prompt (BO2 offers "weapon, ammo, upgraded ammo").
+        if vm.to_text(arg(a, 0)).contains("WEAPONCOSTAMMO_UPGRADE")
+            && let Some(o) = s.as_obj()
+            && let f = vm.intern("stub")
+            && let Some(stub) = vm.raw_field(o, f).as_obj()
+            && let f = vm.intern("zombie_weapon_upgrade")
+            && super::mc_rules::is_melee(&vm.to_text(&vm.raw_field(stub, f)))
+        {
+            h.clear();
+        }
         if let Some(mut zm) = ent_mut(world, n) {
             zm.ents.get_mut(&n).unwrap().hint = (!h.is_empty()).then_some(h);
         }
@@ -480,6 +531,12 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             return Ok(Value::Undefined);
         };
         let alias = text(vm, a, 0);
+        if let Ok(want) = std::env::var("IW4L_T6_SNDLOG")
+            && (want == "1" || want.split(',').any(|w| alias.contains(w)))
+        {
+            let at = world.resource::<Zm>().ents.get(&n).map(|e| e.origin);
+            diag::info!(Sim, "bo2zm t6 loop sound {alias} at {at:?}");
+        }
         if let Some(mut zm) = ent_mut(world, n) {
             zm.ents.get_mut(&n).unwrap().loop_sound = Some(alias);
         }
@@ -530,12 +587,32 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         Ok(Value::Undefined)
     });
     m!("enablelinkto", |_, _, _, _| Ok(Value::Undefined));
+    // Players standing on it ride it (`riders`: Tranzit's bus).
+    m!("setmovingplatformenabled", |vm, world, s, a| {
+        let Ok(n) = me(vm, world, s) else {
+            return Ok(Value::Undefined);
+        };
+        let on = arg(a, 0).as_float().is_none_or(|v| v != 0.0);
+        if let Some(mut zm) = ent_mut(world, n) {
+            zm.ents.get_mut(&n).unwrap().platform = on;
+        }
+        Ok(Value::Undefined)
+    });
     m!("getorigin", |vm, world, s, _| Ok(
         origin_of(vm, world, s).map_or(Value::Undefined, Value::Vec3)
     ));
     m!("getentitynumber", |vm, _, s, _| Ok(
         entnum(vm, s).map_or(Value::Undefined, |n| Value::Int(n as i32))
     ));
+    // The engine's entity type, as the scripts' bookmarks read it: a
+    // player 1, a thrown grenade (a missile) 4, anything else 0.
+    m!("getentitytype", |vm, world, s, _| {
+        let n = entnum(vm, s);
+        let zm = world.resource::<Zm>();
+        let player = zm.players.values().any(|p| Some(p.obj) == s.as_obj());
+        let missile = n.and_then(|n| zm.ents.get(&n)).is_some_and(|e| e.classname == "grenade");
+        Ok(Value::Int(if player { 1 } else if missile { 4 } else { 0 }))
+    });
     m!("gettagorigin", |vm, world, s, _| Ok(origin_of(
         vm, world, s
     )
@@ -625,6 +702,18 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         zm.movers.rotate_to(n, from, target, now, t, acc, dec);
         Ok(Value::Undefined)
     });
+    // vibrate(dir, degrees, period, secs): rocks about its origin toward
+    // `dir`, fading out (a landed perk machine).
+    m!("vibrate", |vm, world, s, a| {
+        let n = me(vm, world, s)?;
+        let dir = vec3(a, 0)?;
+        let (amp, period, secs) = (num(a, 1)?, num(a, 2)?, num(a, 3)?);
+        let mut zm = world.resource_mut::<Zm>();
+        let now = zm.now_ms;
+        let base = zm.ents[&n].angles;
+        zm.movers.vibrate(n, base, dir, amp, period, now, secs);
+        Ok(Value::Undefined)
+    });
     m!("rotateyaw", |vm, world, s, a| rotate_axis(
         vm, world, s, a, 1
     ));
@@ -634,8 +723,8 @@ pub(super) fn bind(vm: &mut Vm<World>) {
     m!("rotateroll", |vm, world, s, a| rotate_axis(
         vm, world, s, a, 2
     ));
-    // `a istouching(b)`: whichever of the two has a volume (a brush or a
-    // trigger cylinder) against the other's box (a player's, an actor's,
+    // `a istouching(b)`: whichever of the two has a volume (a brush, a
+    // trigger cylinder or a spawned trigger box) against the other's box (a player's, an actor's,
     // else a point).
     m!("istouching", |vm, world, s, a| {
         let other = arg(a, 0).clone();
@@ -647,7 +736,11 @@ pub(super) fn bind(vm: &mut Vm<World>) {
                 .resource::<Zm>()
                 .ents
                 .get(&n)
-                .filter(|e| super::triggers::brush_index(e).is_some() || e.radius > 0.0)
+                .filter(|e| {
+                    super::triggers::brush_index(e).is_some()
+                        || e.radius > 0.0
+                        || e.box_dims.is_some()
+                })
                 .cloned()
         };
         let (vol, toucher) = match (volume_of(world, on), volume_of(world, sn)) {
@@ -768,7 +861,6 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "triggerignoreteam",
         "setvisibletoallexceptteam",
         "setexcludeteamfortrigger",
-        "setmovingplatformenabled",
         "setowner",
         "setteam",
         "setphysparams",
@@ -784,8 +876,6 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "playsoundasmaster",
         "playlocalsound",
         "useanimtree",
-        "setanim",
-        "clearanim",
         "notsolidcapsule",
         "dontinterpolate",
         "setscale",
@@ -798,9 +888,51 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "zbarrierpieceuseboxriselogic",
         "zbarrierpieceusedefaultmodel",
         "zbarrierpieceuseupgradedmodel",
+        // client draw hints (Origins' giant robots, the crystal biplane)
+        "setforcenocull",
+        "setlightintensity",
+        "setplayercollision",
     ] {
         vm.bind(name, true, |_, _, _, _| Ok(Value::Undefined));
     }
+    // A script model's animation (the Monkey Bomb's clap): actors play
+    // theirs through their state machine, not this.
+    m!("setanim", |vm, world, s, a| {
+        let Ok(n) = me(vm, world, s) else {
+            return Ok(Value::Undefined);
+        };
+        let Value::Anim(i) = arg(a, 0) else {
+            return Ok(Value::Undefined);
+        };
+        let Some(&(_, name)) = vm.program.anims.get(*i as usize) else {
+            return Ok(Value::Undefined);
+        };
+        let clip = vm.strings.get(name).to_ascii_lowercase();
+        let mut zm = world.resource_mut::<Zm>();
+        let now = zm.now_ms;
+        if let Some(e) = zm.ents.get_mut(&n)
+            && e.anim.as_ref().is_none_or(|(c, _)| *c != clip)
+        {
+            e.anim = Some((clip, now));
+        }
+        Ok(Value::Undefined)
+    });
+    m!("clearanim", |vm, world, s, _| {
+        if let Ok(n) = me(vm, world, s)
+            && let Some(e) = world.resource_mut::<Zm>().ents.get_mut(&n)
+        {
+            e.anim = None;
+        }
+        Ok(Value::Undefined)
+    });
+    m!("resetmissiledetonationtime", |vm, world, s, a| {
+        if let Ok(n) = me(vm, world, s) {
+            let secs = arg(a, 0).as_float();
+            let now = world.resource::<Zm>().now_ms;
+            super::grenades::reset_fuse(world, n, secs, now);
+        }
+        Ok(Value::Undefined)
+    });
     m!("playsoundwithnotify", |vm, world, s, a| {
         // The sound system is not wired to scripts yet: notify after a short
         // while so waiting scripts go on.

@@ -4,6 +4,7 @@ pub mod iwd;
 pub mod load_jobs;
 pub mod namespace_trees;
 pub mod progress;
+pub mod t6_extra;
 pub mod zone;
 
 pub use artifact_cache::{CacheFlight, cache_flight, cache_get, cache_put, fnv1a64, fnv1a64_more};

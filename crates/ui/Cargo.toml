@@ -13,12 +13,15 @@ asset_game.workspace = true
 asset_material.workspace = true
 asset_transport.workspace = true
 assets.workspace = true
+bcdec_rs.workspace = true # bo2zm: popup blur of menu pictures
 frame.workspace = true
 net = { path = "../net" }
 playerstate_iw4.workspace = true
 session.workspace = true
 sim.workspace = true
 hks_t6.workspace = true # bo2zm M4
+# bo2zm: the speakers' name (Settings' Sound Device row); bevy's audio already uses it.
+cpal = { version = "0.17", default-features = false }
 
 [lints]
 workspace = true

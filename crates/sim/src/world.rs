@@ -320,6 +320,7 @@ pub struct SimContentBuilder {
     weapon_setups: Arc<[Option<WeaponSetup>]>,
     weapon_world_models: Vec<(String, Vec<String>)>,
     shield_models: Vec<Option<Arc<xmodel_runtime::RetainedModelCapability>>>,
+    weapon_display_names: Vec<String>,
     weapon_projectile_models: Vec<String>,
     weapon_melee_only: Vec<bool>,
     weapon_script_sounds: Vec<WeaponScriptSounds>,
@@ -465,6 +466,10 @@ impl SimContentBuilder {
 
     pub fn set_weapon_world_models(&mut self, models: Vec<(String, Vec<String>)>) {
         self.weapon_world_models = models;
+    }
+
+    pub fn set_weapon_display_names(&mut self, names: Vec<String>) {
+        self.weapon_display_names = names;
     }
 
     pub fn set_weapon_projectile_models(&mut self, models: Vec<String>) {
@@ -1251,6 +1256,16 @@ impl SimState {
             })
     }
 
+    /// A weapon's display name key (`getweapondisplayname`).
+    pub(crate) fn weapon_display_name(&self, weapon: u32) -> Option<&str> {
+        self.content
+            .data
+            .weapon_display_names
+            .get(weapon as usize)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+    }
+
     pub(crate) fn weapon_world_model(&self, weapon: u32) -> Option<(&str, &[String])> {
         self.content
             .data
@@ -1279,6 +1294,8 @@ impl SimState {
             .position(|n| n == name)
             .and_then(|i| u32::try_from(i).ok())
             .filter(|&i| i != 0)
+            // bo2mc: Pack-a-Punch asks for `name+attachment` (barretm82_upgraded_zm+vzoom); use the base weapon.
+            .or_else(|| name.split_once('+').and_then(|(base, _)| self.weapon_index_by_script_name(base)))
     }
 
     /// bo2zm: a weapon's equipment row as stored, usable or not.

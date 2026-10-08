@@ -72,6 +72,8 @@ pub struct CapturedCombatInput {
 
     pub reload_start_add: i32,
     pub no_partial_reload: bool,
+
+    pub unlimited_ammo: bool,
     pub sprint_raise_time_ms: i32,
     pub sprint_drop_time_ms: i32,
     pub stunned_start_time_ms: i32,
@@ -222,6 +224,8 @@ pub struct WeaponCombatFacts {
 
     pub no_partial_reload: bool,
 
+    pub unlimited_ammo: bool,
+
     pub inherits_perks: bool,
 
     pub sprint_raise_time_ms: i32,
@@ -298,6 +302,8 @@ pub struct WeaponCombatFacts {
     /// bo2zm: a Black Ops II dual-wield weapon's left-hand weapon (0: not
     /// dual wield): given, it holds two clips and fires from both hands.
     pub dual_wield_weapon: u32,
+    /// bo2zm: picked back up once placed (Black Ops II `bRetrievable`).
+    pub retrievable: bool,
 }
 
 impl Default for WeaponCombatFacts {
@@ -346,6 +352,7 @@ impl WeaponCombatFacts {
             reload_start_add_time_ms: 0,
             reload_start_add: 0,
             no_partial_reload: false,
+            unlimited_ammo: false,
             sprint_raise_time_ms: 0,
             sprint_drop_time_ms: 0,
             stunned_start_time_ms: 0,
@@ -394,6 +401,7 @@ impl WeaponCombatFacts {
             dual_mag: None,
             spread_before_fire_add: false,
             dual_wield_weapon: 0,
+            retrievable: false,
         }
     }
 
@@ -461,6 +469,7 @@ impl WeaponCombatFacts {
             reload_start_add_time_ms: input.reload_start_add_time_ms,
             reload_start_add: input.reload_start_add,
             no_partial_reload: input.no_partial_reload,
+            unlimited_ammo: input.unlimited_ammo,
             inherits_perks: input.inherits_perks,
             sprint_raise_time_ms: input.sprint_raise_time_ms,
             sprint_drop_time_ms: input.sprint_drop_time_ms,
@@ -509,6 +518,7 @@ impl WeaponCombatFacts {
             dual_mag: input.dual_mag,
             spread_before_fire_add: input.spread_before_fire_add,
             dual_wield_weapon: 0,
+            retrievable: false,
         })
     }
 
@@ -960,7 +970,7 @@ fn prepare_weapon_tick(
     }
 
     if time_before != 0 && hand.weapon_time < 1 {
-        weapon_decay_hold_interrupt(hand, fire_ty, cmd, attack);
+        weapon_decay_hold_interrupt(hand, fire_ty, cmd, attack, facts.unlimited_ammo);
     }
     if hand.weapon_delay > 0 {
         hand.weapon_delay = (hand.weapon_delay - decay_ms).max(0);
@@ -1174,7 +1184,7 @@ fn finish_weapon_tick(
         };
 
         if trigger {
-            if hand.clip <= 0 {
+            if hand.clip <= 0 && !facts.unlimited_ammo {
                 hand.shot_count = 0;
                 if hand.stock > 0 && begin_weapon_reload(hand, facts) {
                     return Some(WeaponTickEvent::ReloadStarted);
@@ -1204,7 +1214,7 @@ fn finish_weapon_tick(
                 );
             }
             hand.weaponstate = WeaponState::Firing as i32;
-            hand.weapon_time = facts.fire_time_ms.max(1);
+            hand.weapon_time = crate::bo2_perks::rof_fire_time_ms(cmd.perks0, facts.fire_time_ms).max(1);
             if facts.ads_fire_only {
                 hand.weapon_delay =
                     ads_fire_only_delay_ms(cmd.f_weapon_pos_frac, facts.ads_in_rate);
@@ -1224,7 +1234,11 @@ fn finish_weapon_tick(
             if fire_weapon_kind(facts.weap_type, facts.weap_class).is_none() {
                 return Some(WeaponTickEvent::EmptyClick);
             }
-            let used = facts.ammo_per_shot().min(hand.clip);
+            let used = if facts.unlimited_ammo {
+                0
+            } else {
+                facts.ammo_per_shot().min(hand.clip)
+            };
             hand.clip -= used;
             if facts.bolt_action {
                 hand.rechamber_pending = true;
@@ -1232,7 +1246,7 @@ fn finish_weapon_tick(
             crate::weap_anim::set_fps_fire_anim(
                 &mut hand.weap_anim,
                 cmd.f_weapon_pos_frac > 0.0,
-                hand.clip <= 0,
+                hand.clip <= 0 && !facts.unlimited_ammo,
             );
             return Some(WeaponTickEvent::ShotAccepted { ammo_used: used });
         }
@@ -1316,6 +1330,7 @@ fn weapon_decay_hold_interrupt(
     fire_ty: FireType,
     cmd: &WeaponCmd,
     attack: bool,
+    unlimited_ammo: bool,
 ) {
     let ws = hand.weaponstate;
     let rechamber = ws == WeaponState::Rechambering as i32;
@@ -1337,7 +1352,7 @@ fn weapon_decay_hold_interrupt(
         return;
     }
 
-    if hand.clip <= 0 {
+    if hand.clip <= 0 && !unlimited_ammo {
         return;
     }
     hand.weapon_time = 1;

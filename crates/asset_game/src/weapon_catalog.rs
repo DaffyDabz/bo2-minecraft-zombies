@@ -215,7 +215,15 @@ pub struct WeaponBodyFacts {
 
     pub no_partial_reload: bool,
 
+    /// BO2 unlimitedAmmo: fires with an empty clip and never uses ammo
+    /// (Mob of the Dead's Afterlife lightning hands).
+    pub unlimited_ammo: bool,
+
     pub bolt_action: bool,
+
+    /// bo2zm: Black Ops II `bRetrievable` (equipment and knives the player
+    /// picks back up; the scripts' `getretrievableweapons`).
+    pub retrievable: bool,
 
     pub segmented_reload: bool,
 
@@ -1698,7 +1706,9 @@ impl WeaponCatalog {
                 reload_ammo_add: geometry.reload_ammo_add,
                 reload_start_add: geometry.reload_start_add,
                 no_partial_reload: geometry.no_partial_reload,
+                unlimited_ammo: false,
                 bolt_action: geometry.bolt_action,
+                retrievable: false,
                 segmented_reload: geometry.segmented_reload,
                 sprint_raise_time_ms: geometry.sprint_raise_time_ms,
                 sprint_loop_time_ms: geometry.sprint_loop_time_ms,
@@ -4927,6 +4937,9 @@ fn merge_body_facts(dst: &mut WeaponBodyFacts, src: WeaponBodyFacts) {
     if !dst.no_partial_reload && src.no_partial_reload {
         dst.no_partial_reload = true;
     }
+    if !dst.unlimited_ammo && src.unlimited_ammo {
+        dst.unlimited_ammo = true;
+    }
     if !dst.segmented_reload && src.segmented_reload {
         dst.segmented_reload = true;
     }
@@ -7239,6 +7252,13 @@ impl WeaponRegistry {
                 let model = self.world_model_of(i).unwrap_or_default().to_owned();
                 (model, self.hide_tags_of(i).to_vec())
             })
+            .collect()
+    }
+
+    /// Each weapon's display name key (`ZMWEAPON_...`), empty if none.
+    pub fn display_names_table(&self) -> Vec<String> {
+        (0..self.rows.len() as u32)
+            .map(|i| self.display_name_key_of(i).unwrap_or_default().to_owned())
             .collect()
     }
 

@@ -20,6 +20,9 @@ pub struct LoadingScreen {
 
     pub(crate) since_complete: Duration,
     pub(crate) preview_ready: bool,
+    /// The screen stays up at least this long after it spawned (BO2's own
+    /// loading screen fades its picture in over a few seconds).
+    min_hold: Duration,
 }
 
 impl LoadingScreen {
@@ -39,6 +42,7 @@ impl LoadingScreen {
             complete_at: None,
             since_complete: Duration::ZERO,
             preview_ready: false,
+            min_hold: Duration::ZERO,
         }
     }
 
@@ -73,6 +77,23 @@ impl LoadingScreen {
 
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Keep the screen up for `d` more from now.
+    pub fn hold_for(&mut self, d: Duration) {
+        self.min_hold = self.spawned_at.elapsed() + d;
+    }
+
+    /// [`Self::hold_for`], the first time only.
+    pub fn hold_once(&mut self, d: Duration) {
+        if self.min_hold.is_zero() {
+            self.hold_for(d);
+            diag::info!(Ui, "loading: held until {} ms", self.min_hold.as_millis());
+        }
+    }
+
+    pub fn held(&self) -> bool {
+        self.spawned_at.elapsed() < self.min_hold
     }
 
     pub fn mark_preview_ready(&mut self) {

@@ -11,7 +11,7 @@ pub mod m2;
 pub use capture::{
     AabbTreeRef, AssetKey, ClipAabbRef, ClipBrushRef, ClipCmodelRef, ClipLeafBrushNodeRef, ClipLeafRef,
     ClipMaterialRef, ClipNodeRef, ClipRef, ClipStaticModelRef, DpvsRanges, DrawState, EmbeddedImage, ImageRef, LightGridRef, MaterialRef,
-    MaterialTexture, PassRef, PathNodeRef, PrimaryLightRef, ReflectionProbeRef, ShaderArgRef, SkyGridVolumeRef, StaticModel, StringTableRef, SunRef, TechniqueRef, TechniqueSetRef,
+    MaterialTexture, PassRef, PathNodeRef, PrimaryLightRef, ReflectionProbeRef, ShaderArgRef, SkyGridVolumeRef, StaticModel, StringTableRef, SunRef, ZBarrierDefRef, TechniqueRef, TechniqueSetRef,
     WorldFogRef, WorldRef, WorldSurface, XAnimRef, XModelCollSurfRef, XModelRef, XSurfaceRef, ZoneCapture, read_image,
 };
 pub use entities::{ArtFog, MapEntity, parse_art_fog, parse_entities};
@@ -19,7 +19,7 @@ pub use gsc::{GscObject, GscRun, GscValue, MapScriptFacts, PlacedFx};
 pub use images::{ImageSource, Pack, PackSet};
 pub use m2::{
     FootstepFxTableRef, FootstepTableRef, FxEffectRef, FxElemRef, FxTrailRef, FxVisualRef, ImpactTableRef,
-    SndAliasListRef, SndAliasRef, SndBankRef, SndCurveRef, SndDriverGlobalsRef, TracerRef,
+    SndAliasListRef, SndAliasRef, SndBankRef, SndRadverbRef, SndCurveRef, SndDriverGlobalsRef, TracerRef,
     FontRef, GlyphRef, WeaponCamoMaterialRef, WeaponCamoRef, WeaponCamoSetRef, WeaponRef,
 };
 

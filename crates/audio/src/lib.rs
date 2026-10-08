@@ -13,6 +13,7 @@ mod minecraft;
 mod pcm;
 mod playback;
 mod plugin;
+mod room_echo;
 mod rumble;
 mod shellshock;
 mod space;

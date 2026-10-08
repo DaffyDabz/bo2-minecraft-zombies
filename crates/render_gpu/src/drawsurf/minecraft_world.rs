@@ -148,9 +148,14 @@ pub(super) fn register(app: &mut App) {
         .add_systems(Render, prepare_terrain.in_set(RenderSystems::PrepareResources))
         .add_systems(
             Core3d,
-            draw_terrain
-                .in_set(Core3dSystems::MainPass)
-                .before(super::draw::ExactColourDrawSet),
+            (
+                draw_terrain
+                    .in_set(Core3dSystems::MainPass)
+                    .before(super::draw::ExactColourDrawSet),
+                draw_terrain_translucent
+                    .in_set(Core3dSystems::MainPass)
+                    .after(super::draw::ExactColourDrawSet),
+            ),
         );
 }
 
@@ -500,7 +505,7 @@ fn draw_terrain(
     let (target, depth, extracted_view, msaa) = view.into_inner();
     let format = target.main_texture_format();
     let samples = msaa.map_or(1, Msaa::samples);
-    let [sky, opaque, translucent, clouds, crack, entity, entity_culled, entity_translucent, shadow, backdrop, hand] = gpu
+    let [sky, opaque, _, clouds, _, entity, entity_culled, _, shadow, backdrop, hand] = gpu
         .pipelines
         .entry((format, samples))
         .or_insert_with(|| pipelines(&device, &registry, format, samples))
@@ -565,6 +570,59 @@ fn draw_terrain(
     pass.set_render_pipeline(&sky);
     pass.draw(0..3, 0..1);
     pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, depth_min, depth_max);
+    // The hand in front of everything, as the view model is.
+    if let Some((vertices, indices, count)) = gpu.hand.as_ref() {
+        let (band_min, band_max) = reverse_z_viewport_depth(super::depth_range::GFX_DEPTH_RANGE_VIEWMODEL);
+        pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, band_min, band_max);
+        pass.set_render_pipeline(&hand);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..*count, 0, 0..1);
+        pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, depth_min, depth_max);
+    }
+    if let Some((_, vertices, indices, count)) = gpu.clouds.as_ref() {
+        pass.set_render_pipeline(&clouds);
+        pass.set_vertex_buffer(0, vertices.slice(..));
+        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
+        pass.draw_indexed(0..*count, 0, 0..1);
+    }
+}
+
+/// Glass, water and see-through mob parts, and the cracks: after Black Ops
+/// II's models, since they leave the depth alone (his 10-08: a perk machine
+/// behind the house's glass showed on top of it).
+fn draw_terrain_translucent(
+    view: ViewQuery<(&ViewTarget, &SceneDepthTexture, &ExtractedView, Option<&Msaa>)>,
+    registry: Res<ExactPipelineRegistry>,
+    device: Res<RenderDevice>,
+    mut gpu: ResMut<TerrainGpu>,
+    mut context: RenderContext,
+) {
+    let Some(bind) = gpu.bind.clone() else {
+        return;
+    };
+    let (target, depth, extracted_view, msaa) = view.into_inner();
+    let format = target.main_texture_format();
+    let samples = msaa.map_or(1, Msaa::samples);
+    let [_, _, translucent, _, crack, _, _, entity_translucent, _, _, _] = gpu
+        .pipelines
+        .entry((format, samples))
+        .or_insert_with(|| pipelines(&device, &registry, format, samples))
+        .clone();
+    let attachments = [Some(target.get_color_attachment())];
+    let mut pass =
+        context.begin_tracked_render_pass(bevy::render::render_resource::RenderPassDescriptor {
+            label: Some("iw4l_minecraft_terrain_translucent"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    let vp = extracted_view.viewport;
+    let (depth_min, depth_max) = reverse_z_viewport_depth(GFX_DEPTH_RANGE_SCENE);
+    pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, depth_min, depth_max);
+    pass.set_bind_group(0, &bind, &[]);
     pass.set_render_pipeline(&translucent);
     for pos in gpu.visible.iter().rev() {
         let Some(section) = gpu.sections.get(pos) else {
@@ -585,22 +643,6 @@ fn draw_terrain(
     }
     if let Some((vertices, indices, count)) = gpu.cracks.as_ref() {
         pass.set_render_pipeline(&crack);
-        pass.set_vertex_buffer(0, vertices.slice(..));
-        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..*count, 0, 0..1);
-    }
-    // The hand in front of everything, as the view model is.
-    if let Some((vertices, indices, count)) = gpu.hand.as_ref() {
-        let (band_min, band_max) = reverse_z_viewport_depth(super::depth_range::GFX_DEPTH_RANGE_VIEWMODEL);
-        pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, band_min, band_max);
-        pass.set_render_pipeline(&hand);
-        pass.set_vertex_buffer(0, vertices.slice(..));
-        pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
-        pass.draw_indexed(0..*count, 0, 0..1);
-        pass.set_viewport(vp.x as f32, vp.y as f32, vp.z as f32, vp.w as f32, depth_min, depth_max);
-    }
-    if let Some((_, vertices, indices, count)) = gpu.clouds.as_ref() {
-        pass.set_render_pipeline(&clouds);
         pass.set_vertex_buffer(0, vertices.slice(..));
         pass.set_index_buffer(indices.slice(..), IndexFormat::Uint32);
         pass.draw_indexed(0..*count, 0, 0..1);

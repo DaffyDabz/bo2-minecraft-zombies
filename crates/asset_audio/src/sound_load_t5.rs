@@ -380,6 +380,7 @@ impl T5SoundCapture {
             envelop_min,
             envelop_max,
             envelop_percentage,
+            reverb_send: 0.0,
             speaker_map: None,
             limit_count: s.u8_at(row, sz::SND_ALIAS_LIMIT_COUNT_OFF).ok(),
             entity_limit_count: s.u8_at(row, sz::SND_ALIAS_ENTITY_LIMIT_COUNT_OFF).ok(),

@@ -66,9 +66,19 @@ pub(crate) struct Entities {
     /// volume, pitch.
     pub(crate) sounds: Vec<(String, DVec3, f32, f32)>,
     random: minecraftoss_player::rng::LegacyRandom,
+    /// bo2mc: Minecraft lightning (the souls round's hellhounds and storm).
+    bolts: crate::minecraft_lightning::Bolts,
     /// Vanilla's difficulty: 0 (peaceful) spawns no monsters and removes
     /// the ones there are; 2 is normal.
     pub(crate) difficulty: i32,
+    /// The `doMobSpawning` rule: off in Minecraft Zombies' Nether and End,
+    /// where only the waves come.
+    pub(crate) spawn_mobs: bool,
+    /// Hunting monsters standing still: where each stood and for how many
+    /// ticks (bo2mc: a stuck one claws its way to the player).
+    stuck: HashMap<u64, (DVec3, u32)>,
+    /// The stuck hunters as of the last tick: each one's feet.
+    pub(crate) diggers: Vec<DVec3>,
 }
 
 /// What bullets and blasts count as for block loot: vanilla drops nothing
@@ -100,8 +110,8 @@ pub(crate) struct PlayerView {
 }
 
 impl Entities {
-    pub(crate) fn new(stream: &TerrainStream, seed: i64) -> Self {
-        let sim = ServerSim::new(stream.world_gen(), stream.states.clone(), "minecraft:overworld");
+    pub(crate) fn new(stream: &TerrainStream, seed: i64, dimension: &str) -> Self {
+        let sim = ServerSim::new(stream.world_gen(), stream.states.clone(), dimension);
         let mut server = ServerHandle::spawn(sim);
         // Mob and block loot and the recipes (stack sizes), from the game's
         // data JAR when MinecraftOSS has one.
@@ -159,7 +169,11 @@ impl Entities {
             seed,
             sounds: Vec::new(),
             random: minecraftoss_player::rng::LegacyRandom::new((seed ^ 0x1735) as u64),
+            bolts: Default::default(),
             difficulty: 2,
+            spawn_mobs: true,
+            stuck: HashMap::new(),
+            diggers: Vec::new(),
         }
     }
 
@@ -320,6 +334,12 @@ impl Entities {
         }
     }
 
+    /// bo2mc: an item hung still at block point `at` for show (the bread
+    /// on the house wall): never picked up, never despawns.
+    pub(crate) fn show_item(&mut self, item: &str, at: [f64; 3]) {
+        self.server.spawn_item(item, 1, None, at, [0.0; 3], 32767, -32768);
+    }
+
     /// A held item's model under a view-space pose, lit at `light_at`.
     pub(crate) fn held_item_mesh(
         &mut self,
@@ -335,9 +355,20 @@ impl Entities {
         mesh
     }
 
-    /// A fist on the mob the player looks at within reach (one damage, as
-    /// an empty hand deals).
-    pub(crate) fn punch(&mut self, eye: DVec3, look: DVec3, yaw: f32) -> bool {
+    /// bo2mc (survival): the held item used on the mob the player looks
+    /// at within reach (food to breed or grow, shears, a bucket to milk).
+    /// False when no mob is there.
+    pub(crate) fn use_on_mob(&mut self, eye: DVec3, look: DVec3) -> bool {
+        let Some((hit, _)) = self.world.mob_on_ray(eye, look, 3.0) else {
+            return false;
+        };
+        self.server.mob_action(hit, None, &self.inventory.clone(), self.selected, false);
+        true
+    }
+
+    /// The held item's attack on the mob the player looks at within reach
+    /// (an empty hand deals one damage), at this attack strength.
+    pub(crate) fn punch(&mut self, eye: DVec3, look: DVec3, yaw: f32, attack_damage: f32, strength: f32, critical: bool) -> bool {
         let Some((hit, _)) = self.world.mob_on_ray(eye, look, 3.0) else {
             return false;
         };
@@ -345,10 +376,10 @@ impl Entities {
             player_id: PLAYER,
             position: eye - DVec3::Y * f64::from(EYE_HEIGHT),
             yaw,
-            attack_damage: 1.0,
-            strength: 1.0,
+            attack_damage: f64::from(attack_damage),
+            strength,
             sprinting: false,
-            can_critical: false,
+            can_critical: critical,
             can_sweep: false,
         };
         self.server.mob_action(hit, Some(attack), &self.inventory.clone(), self.selected, false);
@@ -358,6 +389,11 @@ impl Entities {
     /// A block the player placed, for the level the mobs walk in.
     pub(crate) fn placed(&mut self, scene: &HandcraftedScene, pos: (i32, i32, i32)) {
         self.server.player_edit(scene, pos, PlayerEdit::Place);
+    }
+
+    /// bo2mc (survival): bone meal on a clicked face, grown by the level.
+    pub(crate) fn bone_meal(&mut self, pos: (i32, i32, i32), face: &'static str) {
+        self.server.bone_meal(pos, face);
     }
 
     /// Client ticks run so far.
@@ -394,6 +430,69 @@ impl Entities {
 
     /// Sends a server tick when one is due and takes what came back: block
     /// changes to show, and mob hits on the player in MW2 damage.
+    /// bo2mc's souls round: angry wolves at these block points.
+    pub(crate) fn summon_souls_wolves(&mut self, positions: Vec<[f64; 3]>) {
+        self.server.summon_souls_wolves(positions);
+    }
+
+    /// A souls wolf that cannot reach him snaps to a block point.
+    pub(crate) fn move_souls_wolf(&mut self, id: u64, to: [f64; 3]) {
+        self.server.move_souls_wolf(id, to);
+    }
+
+    pub(crate) fn end_souls_wolves(&mut self) {
+        self.server.end_souls_wolves();
+    }
+
+    /// bo2mc: Electric Cherry's shock: every living mob within `radius`
+    /// blocks of `center` (a block point) takes `damage` Minecraft points.
+    /// How many it reached.
+    pub(crate) fn shock(&mut self, center: [f64; 3], radius: f64, damage: f32) -> usize {
+        let c = DVec3::from_array(center);
+        let mut n = 0;
+        for (key, b) in self.boxes() {
+            let mid = DVec3::new((b[0] + b[3]) * 0.5, (b[1] + b[4]) * 0.5, (b[2] + b[5]) * 0.5);
+            if mid.distance(c) > radius + 0.5 {
+                continue;
+            }
+            let Some(hit) = decode(key) else { continue };
+            let attack = minecraftoss_entities::world::PlayerAttack {
+                player_id: PLAYER,
+                position: c,
+                yaw: 0.0,
+                attack_damage: f64::from(damage),
+                strength: 1.0,
+                sprinting: false,
+                can_critical: false,
+                can_sweep: false,
+            };
+            self.server.mob_action(hit, Some(attack), &minecraftoss_player::inventory::Inventory::default(), 0, false);
+            n += 1;
+        }
+        n
+    }
+
+    /// The chat's `/summon`: a mob of `kind` (`minecraft:cow`) at a block
+    /// point.
+    pub(crate) fn summon(&mut self, kind: &str, at: [f64; 3]) {
+        self.server.summon(kind.to_owned(), at, None);
+    }
+
+    /// A Minecraft lightning bolt at a block point in `delay` seconds.
+    pub(crate) fn strike(&mut self, pos: [f64; 3], delay: f64) {
+        self.bolts.strike(pos, delay, &mut self.random);
+    }
+
+    /// The souls wolves alive as the player tracks them, and where.
+    pub(crate) fn souls_wolves(&self) -> Vec<(u64, [f64; 3])> {
+        self.world
+            .wolves()
+            .iter()
+            .filter(|w| w.ai.state.wolf.souls && w.wolf.health > 0.0)
+            .map(|w| (w.id, w.wolf.body.position.to_array()))
+            .collect()
+    }
+
     pub(crate) fn tick(
         &mut self,
         dt: f64,
@@ -402,6 +501,7 @@ impl Entities {
         player: &PlayerView,
     ) -> (Vec<((i32, i32, i32), Option<Block>)>, Vec<(i32, Option<[f64; 3]>)>) {
         self.clock += dt;
+        self.bolts.frame(dt);
         let ticked = self.clock >= TICK_SECONDS;
         if ticked {
             self.clock = (self.clock - TICK_SECONDS).min(TICK_SECONDS);
@@ -414,8 +514,43 @@ impl Entities {
                 }
             }
             self.portal.tick();
-            if self.ticks % 600 == 0 {
-                diag::info!(World, "Minecraft mobs: {} tracked", self.boxes().len());
+            self.bolts.tick(&mut self.random, &mut self.sounds);
+            if self.ticks % 200 == 0 {
+                // Monsters and how close the nearest is (do they hunt him?).
+                let w = &self.world;
+                let [fx, fy, fz] = player.feet;
+                let mut monsters = 0;
+                let mut hunting = 0;
+                let mut near = f64::MAX;
+                let mut near_goals = String::new();
+                let mut note = |p: &minecraftoss_entities::movement::Body, ai: Option<&minecraftoss_entities::monster_ai::MonsterAi>| {
+                    monsters += 1;
+                    if ai.is_some_and(|ai| matches!(ai.state.target, Some(minecraftoss_entities::monster_ai::Target::Player(_)))) {
+                        hunting += 1;
+                    }
+                    let (dx, dy, dz) = (p.position.x - fx, p.position.y - fy, p.position.z - fz);
+                    let d = (dx * dx + dy * dy + dz * dz).sqrt();
+                    if d < near {
+                        near = d;
+                        near_goals = ai.map_or("no ai".to_owned(), |ai| format!("{:?}, {dy:.0} up", ai.running_goals()));
+                    }
+                };
+                w.zombies().iter().filter(|e| e.zombie.health > 0.0).for_each(|e| note(&e.zombie.body, e.ai.as_deref()));
+                w.skeletons().iter().filter(|e| e.skeleton.health > 0.0).for_each(|e| note(&e.skeleton.body, e.ai.as_deref()));
+                w.creepers().iter().filter(|e| e.creeper.health > 0.0 && !e.creeper.exploded).for_each(|e| note(&e.creeper.body, Some(&e.ai)));
+                w.spiders().iter().filter(|e| e.spider.health > 0.0).for_each(|e| note(&e.spider.body, Some(&e.ai)));
+                w.witches().iter().filter(|e| e.witch.health > 0.0).for_each(|e| note(&e.witch.body, Some(&e.ai)));
+                let nearest = if monsters > 0 { format!("nearest {near:.0} blocks away ({near_goals})") } else { "none".to_owned() };
+                let animals = w.cows().iter().filter(|e| e.cow.health > 0.0).count()
+                    + w.sheep().iter().filter(|e| e.health > 0.0).count()
+                    + w.pigs().iter().filter(|e| e.pig.health > 0.0).count()
+                    + w.chickens().iter().filter(|e| e.chicken.health > 0.0).count();
+                diag::info!(
+                    World,
+                    "Minecraft mobs: {} tracked, {animals} animals, {monsters} monsters, {hunting} hunting him, {} digging, {nearest}",
+                    self.boxes().len(),
+                    self.diggers.len()
+                );
             }
             let feet = DVec3::from_array(player.feet);
             let center = ((feet.x.floor() as i32) >> 4, (feet.z.floor() as i32) >> 4);
@@ -439,6 +574,7 @@ impl Entities {
                 spectator: !player.alive,
                 attackable: player.alive,
             };
+            let souls = sim::bo2mc::enabled() && sim::bo2mc::souls_fog();
             self.server.tick(TickInput {
                 day_ticks,
                 players: if player.alive { vec![player.feet] } else { Vec::new() },
@@ -467,7 +603,11 @@ impl Entities {
                 bright_outside,
                 tracking: (player.feet, 160.0),
                 player_hurts: Vec::new(),
-                spawn_mobs: true,
+                spawn_mobs: self.spawn_mobs && !souls,
+                // A souls round is dogs only: no night monsters join it.
+                clear_monsters: souls,
+                // Vulture Aid: Looting III on what he kills.
+                looting: if sim::bo2mc::enabled() && sim::bo2mc::player_has_perk("specialty_nomotionsensor") { 3 } else { 0 },
             });
         }
         let mut changes = Vec::new();
@@ -485,6 +625,12 @@ impl Entities {
             for sound in output.mob_results.iter().flat_map(|result| result.sounds.iter()) {
                 self.sounds.push((sound.event.clone(), sound.position, sound.volume, sound.pitch));
             }
+            // What the mob took or gave (food eaten, milk, worn shears).
+            for (slot, now) in output.mob_results.iter().flat_map(|result| result.slots.iter()) {
+                if let Some(held) = self.inventory.slots.get_mut(*slot) {
+                    *held = now.clone();
+                }
+            }
             // `ServerExplosion`'s sound: loud, pitched down.
             for blast in &output.explosions {
                 let pitch = (1.0 + (self.random.next_float() - self.random.next_float()) * 0.2) * 0.7;
@@ -497,6 +643,14 @@ impl Entities {
                 }
             }
             for hit in output.player_hits.into_iter().filter(|h| h.player_id == PLAYER) {
+                // PhD Flopper: a creeper's blast does not hurt him.
+                if matches!(hit.kind, PlayerHitKind::Explosion { .. })
+                    && sim::bo2mc::enabled()
+                    && sim::bo2mc::player_has_perk("specialty_flakjacket")
+                {
+                    diag::info!(World, "bo2mc: PhD Flopper took a creeper blast");
+                    continue;
+                }
                 let from = match hit.kind {
                     PlayerHitKind::Melee { attacker, .. } => Some(attacker.to_array()),
                     _ => None,
@@ -505,6 +659,7 @@ impl Entities {
             }
         }
         if ticked {
+            self.find_diggers(DVec3::from_array(player.feet));
             self.server_items_tick(DVec3::from_array(player.feet));
             // `ItemEntity.playerTouch`'s pickup pop.
             for _ in 0..self.world_items.take_pickup_sounds() {
@@ -513,6 +668,41 @@ impl Entities {
             }
         }
         (changes, hits)
+    }
+
+    /// Hunting monsters (not spiders, which climb) that have stood still
+    /// for a second and a half, or half a second against a wall, while the
+    /// player is out of reach: they are walled off and claw through.
+    fn find_diggers(&mut self, feet: DVec3) {
+        use minecraftoss_entities::monster_ai::{MonsterAi, Target};
+        use minecraftoss_entities::movement::Body;
+        let w = &self.world;
+        let mut hunters: Vec<(u64, DVec3, bool)> = Vec::new();
+        let mut add = |id: u64, body: &Body, ai: Option<&MonsterAi>| {
+            if ai.is_some_and(|ai| matches!(ai.state.target, Some(Target::Player(_)))) {
+                hunters.push((id, body.position, body.horizontal_collision));
+            }
+        };
+        w.zombies().iter().filter(|e| e.zombie.health > 0.0).for_each(|e| add(e.id, &e.zombie.body, e.ai.as_deref()));
+        w.skeletons().iter().filter(|e| e.skeleton.health > 0.0).for_each(|e| add(e.id, &e.skeleton.body, e.ai.as_deref()));
+        w.creepers().iter().filter(|e| e.creeper.health > 0.0 && !e.creeper.exploded).for_each(|e| add(e.id, &e.creeper.body, Some(&e.ai)));
+        w.witches().iter().filter(|e| e.witch.health > 0.0).for_each(|e| add(e.id, &e.witch.body, Some(&e.ai)));
+        let mut stuck = HashMap::with_capacity(hunters.len());
+        self.diggers.clear();
+        for (id, p, against_wall) in hunters {
+            let (dx, dy, dz) = (feet.x - p.x, feet.y - p.y, feet.z - p.z);
+            let flat = (dx * dx + dz * dz).sqrt();
+            let out_of_reach = flat > 2.0 || dy.abs() >= 2.0;
+            let (anchor, still) = match self.stuck.get(&id) {
+                Some(&(anchor, still)) if (p - anchor).with_y(0.0).length() < 0.4 => (anchor, still + 1),
+                _ => (p, 0),
+            };
+            stuck.insert(id, (anchor, still));
+            if out_of_reach && flat < 32.0 && (still >= 30 || (against_wall && still >= 10)) {
+                self.diggers.push(p);
+            }
+        }
+        self.stuck = stuck;
     }
 
     /// Every living mob's key and box in blocks, for bullets.
@@ -660,6 +850,7 @@ impl Entities {
         }
         self.poof.append_mesh(&mut out.items, atlas, forward, partial, light);
         self.portal.append_mesh(&mut out.items, atlas, forward, partial, light);
+        self.bolts.append_mesh(&mut out.items, atlas);
         let held: Vec<_> =
             skeleton_items.into_iter().chain(zombie_items).chain(villager_items).chain(witch_items).collect();
         let _ = self.items.append_held_items(&mut out.items, &held, packs, atlas, light);

@@ -39,6 +39,11 @@ const FONT_FILES: [(&str, &str); 7] = [
     ("smallItalicFont", "SmallItalic"),
 ];
 
+/// Black Ops II's build number as its menus show it, and where (root
+/// units, right-aligned).
+const VERSION_TEXT: &str = "43.1701.1";
+const VERSION_RECT: [f32; 4] = [1000.0, 70.0, 1125.0, 84.0];
+
 fn font_name(file: &str) -> &'static str {
     let stem = file.rsplit('/').next().unwrap_or(file);
     FONT_FILES
@@ -165,6 +170,36 @@ const RESOLUTIONS: [&str; 6] = [
     "2560x1440",
     "3840x2160",
 ];
+
+/// The speakers this PC can play on, as Windows names them (Settings' Sound
+/// Device row, "Speakers (Realtek USB Audio)"), the one it plays on first;
+/// asked once.
+fn sound_devices() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            // Windows' full name ("Speakers (Realtek USB Audio)"), not
+            // just "Speakers".
+            let named = |d: &cpal::Device| {
+                let desc = d.description().ok()?;
+                Some(desc.extended().first().map_or(desc.name(), |f| f.as_str()).to_owned())
+            };
+            let host = cpal::default_host();
+            let mut names: Vec<String> = host.default_output_device().as_ref().and_then(named).into_iter().collect();
+            if let Ok(all) = host.output_devices() {
+                for d in all {
+                    if let Some(n) = named(&d)
+                        && !names.contains(&n)
+                    {
+                        names.push(n);
+                    }
+                }
+            }
+            names
+        })
+        .clone()
+}
 
 /// His settings as BO2's profile and hardware-profile names.
 fn profile_of(s: &frame::GameSettings) -> Vec<(String, String)> {
@@ -312,7 +347,9 @@ fn settings_bridge(hud: &mut LuiHud, settings: &mut frame::GameSettings) {
         });
         let pairs = profile_of(settings);
         let mut v = hud.host.values.borrow_mut();
-        v.player_name = settings.player_name.clone();
+        // The name on his lobby row: a name his settings give (the family
+        // launcher's profile), else the Steam account this PC signs into.
+        v.player_name = settings.shown_name();
         for (k, x) in &pairs {
             v.profile.insert(k.clone(), x.clone());
             v.dvars.insert(k.clone(), x.clone());
@@ -352,7 +389,8 @@ fn settings_bridge(hud: &mut LuiHud, settings: &mut frame::GameSettings) {
 }
 
 /// His keys as BO2's pad buttons (what its menus listen for).
-const MENU_KEYS: [(KeyCode, &str); 7] = [
+/// (BO2 on PC turns menu tabs with D, the Settings and Controls pages; A goes back.)
+const MENU_KEYS: [(KeyCode, &str); 9] = [
     (KeyCode::Escape, "secondary"),
     (KeyCode::Enter, "primary"),
     (KeyCode::NumpadEnter, "primary"),
@@ -360,6 +398,8 @@ const MENU_KEYS: [(KeyCode, &str); 7] = [
     (KeyCode::ArrowDown, "down"),
     (KeyCode::ArrowLeft, "left"),
     (KeyCode::ArrowRight, "right"),
+    (KeyCode::KeyA, "shoulderl"),
+    (KeyCode::KeyD, "shoulderr"),
 ];
 
 /// Keys and mouse into BO2's menus: Esc opens its pause menu (the HUD's
@@ -540,6 +580,12 @@ fn engine_calls(hud: &mut LuiHud, io: &mut LuiIo<'_, '_>, local: Option<&LocalPr
                     v.dvars.insert(key, value);
                     continue;
                 }
+                // Custom Games' options back to the game's defaults.
+                if word.eq_ignore_ascii_case("resetCustomGametype") {
+                    let mut v = hud.host.values.borrow_mut();
+                    v.settings = v.default_settings.clone();
+                    continue;
+                }
                 let ours = match word {
                     "fast_restart" | "map_restart" => Some("map_restart".to_owned()),
                     // bo2mc (his ask 10-05): Exit Game inside a match goes back
@@ -614,6 +660,13 @@ fn engine_calls(hud: &mut LuiHud, io: &mut LuiIo<'_, '_>, local: Option<&LocalPr
                 io.bind.write(frame::UiBindRequest { command });
                 hud.binding = true;
             }
+            hks_t6::host::EngineCall::Event(name, fields) => {
+                let fields: Vec<(&str, Value)> = fields
+                    .iter()
+                    .map(|(k, n)| (k.as_str(), Value::Num(*n)))
+                    .collect();
+                hud.host.root_event(&name, &fields);
+            }
         }
     }
 }
@@ -683,28 +736,31 @@ fn build(ui: &assets::T6Ui, frontend: bool) -> LuiHud {
         }
     }
     zombies_values(&mut host);
-    host.values.borrow_mut().front_end = frontend;
-    // bo2mc: MINECRAFT beside NUKETOWN in the map pick (when the front end
-    // has its rows), picked when the menu first opens.
-    if frontend {
+    {
         let mut v = host.values.borrow_mut();
-        let has = v.tables.get("zm/mapstable.csv").is_some_and(|rows| {
-            rows.iter()
-                .any(|r| r.first().is_some_and(|m| m == assets::bo2mc_frontend::MAP))
-        });
-        if has {
-            v.maps = vec![
-                assets::bo2mc_frontend::MAP.to_owned(),
-                "zm_nuked".to_owned(),
-            ];
-            for (k, x) in [
-                ("ui_mapname", assets::bo2mc_frontend::MAP),
-                ("ui_zm_mapstartlocation", assets::bo2mc_frontend::LOCATION),
-            ] {
-                v.dvars.insert(k.to_owned(), x.to_owned());
+        v.front_end = frontend;
+        v.default_settings = v.settings.clone();
+        // bo2mc: MINECRAFT beside NUKETOWN in the map pick (when the front end
+        // has its rows), picked when the menu first opens.
+        if frontend {
+            let has = v.tables.get("zm/mapstable.csv").is_some_and(|rows| {
+                rows.iter()
+                    .any(|r| r.first().is_some_and(|m| m == assets::bo2mc_frontend::MAP))
+            });
+            if has {
+                v.maps = vec![
+                    assets::bo2mc_frontend::MAP.to_owned(),
+                    "zm_nuked".to_owned(),
+                ];
+                for (k, x) in [
+                    ("ui_mapname", assets::bo2mc_frontend::MAP),
+                    ("ui_zm_mapstartlocation", assets::bo2mc_frontend::LOCATION),
+                ] {
+                    v.dvars.insert(k.to_owned(), x.to_owned());
+                }
+                v.profile
+                    .insert("map_zm".to_owned(), assets::bo2mc_frontend::MAP.to_owned());
             }
-            v.profile
-                .insert("map_zm".to_owned(), assets::bo2mc_frontend::MAP.to_owned());
         }
     }
     // BO2's front end (its own script state, as BO2 keeps it apart from
@@ -775,9 +831,9 @@ fn zombies_values(host: &mut Host) {
         ("sv_running", "1"),
         // The engine's own (the front end reads them).
         ("developer", "0"),
-        // His party: up to four players (BO2's zombies party), one at this
-        // PC.
-        ("party_maxplayers", "4"),
+        // His party: eight in the public lobby, four in a game (BO2's
+        // zombies party; `party_size` switches it), one at this PC.
+        ("party_maxplayers", "8"),
         ("party_maxlocalplayers", "1"),
         // Each lobby kind's local players (one: this PC) and party size.
         ("party_maxlocalplayers_mainlobby", "1"),
@@ -790,12 +846,33 @@ fn zombies_values(host: &mut Host) {
         ("party_maxplayers_theater", "4"),
         ("party_maxplayers_systemlink", "4"),
         ("party_maxplayers_local_splitscreen", "1"),
-        ("party_maxplayers_partylobby", "4"),
+        // The public Zombies lobby: "1 Player (8 Max)" in the real game.
+        ("party_maxplayers_partylobby", "8"),
         ("party_playerCount", "1"),
         // Everyone in the party must be ready (he is: Start Match).
         ("party_readyPercentRequired", "1"),
+        // Settings' Voice Chat page as the real game first opens it.
+        ("cl_voice", "1"),
+        // Settings' Sound Device row: the speakers this PC can play on.
+        ("sd_can_switch_device", "1"),
     ] {
         v.dvars.insert(k.to_owned(), x.to_owned());
+    }
+    let speakers = sound_devices();
+    if let Some(name) = speakers.first() {
+        v.dvars.insert("sd_xa2_device_name".to_owned(), name.clone());
+        v.dvars.insert("sd_xa2_num_devices".to_owned(), speakers.len().to_string());
+        v.enums.insert("sd_xa2_device_name".to_owned(), speakers.clone());
+    }
+    // The volume sliders the profile keeps, as the real game first has
+    // them (Codcaster's run 0 to 2).
+    for (k, x) in [
+        ("snd_shoutcast_game", "0.25"),
+        ("snd_shoutcast_voip", "1"),
+        ("snd_voicechat_volume", "1"),
+        ("snd_voicechat_record_level", "1"),
+    ] {
+        v.profile.entry(k.to_owned()).or_insert_with(|| x.to_owned());
     }
     v.settings.insert("startRound".to_owned(), 1.0);
     // The one map this rebuild plays.
@@ -1130,12 +1207,6 @@ fn send_changes(host: &mut Host, old: Option<&Values>, new: &Values) {
     }
 }
 
-/// Text without Black Ops II's colour codes (`^1`..`^9`) and button
-/// pictures (`^BBUTTON_CYCLE_LEFT^`).
-fn plain(text: &str) -> String {
-    plain_with(text, None)
-}
-
 /// BO2's button token (`BUTTON_LUI_PRIMARY`, the `CoD.buttonStrings`) as
 /// the pad button `frame::bo2_pad_glyph` names.
 fn lui_button(token: &str) -> Option<&'static str> {
@@ -1184,6 +1255,7 @@ fn plain_with(text: &str, pad: Option<frame::PromptStyle>) -> String {
             }
             if let Some(glyph) = pad
                 .and_then(|style| lui_button(&token).and_then(|b| frame::bo2_pad_glyph(b, style)))
+                .or_else(|| frame::bo2_cycle_glyph(&token))
             {
                 out.push_str(glyph);
             }
@@ -1198,10 +1270,11 @@ fn plain_with(text: &str, pad: Option<frame::PromptStyle>) -> String {
 fn lui_hud(
     mut commands: Commands,
     mut slot: NonSendMut<LuiHudSlot>,
-    (ui, front_ui, screen): (
+    (ui, front_ui, screen, mut loading): (
         Option<Res<assets::T6Ui>>,
         Option<Res<assets::T6Frontend>>,
         Res<frame::AppScreen>,
+        Option<ResMut<assets::LoadingScreen>>,
     ),
     fonts: Option<Res<Bo2Fonts>>,
     icons: Option<Res<assets::T6HudIcons>>,
@@ -1437,19 +1510,27 @@ fn lui_hud(
     // The map loads after Start Match: BO2's loading screen over the menus.
     if hud.frontend && *screen == frame::AppScreen::Loading && !hud.loading_open {
         hud.loading_open = true;
+        hks_t6::host::set_loading_dvars(&mut hud.host.values.borrow_mut());
         hud.host.open_menu("Loading");
-        // bo2mc: its picture, name, place and mode fade in at once (BO2
-        // waits 2 s, then a second each: a map here loads in about 3, so
-        // the picture never showed).
-        for event in [
-            "start_loading",
-            "fade_in_map_image",
-            "fade_in_map_location",
-            "fade_in_gametype",
-        ] {
-            hud.host
-                .root_event(event, &[("controller", Value::Num(0.0))]);
+        // The engine starts it once its screen is up: the map name, place,
+        // game mode and picture fade in one after another
+        // (ui_mp_t6_hud_loading.lua). BO2 loads on another thread so its
+        // screen keeps drawing; ours stops drawing once the map installs
+        // (about 2.5 s in, measured load146), which froze the screen before
+        // the picture's turn. So all four fades start together and the
+        // whole screen is up within a second.
+        hud.host.root_event("start_loading", &[]);
+        for event in ["fade_in_map_location", "fade_in_gametype", "fade_in_map_image"] {
+            hud.host.root_event(event, &[]);
         }
+    }
+    // (The loading screen can arrive a frame after the menu opens.)
+    if hud.frontend
+        && hud.loading_open
+        && *screen == frame::AppScreen::Loading
+        && let Some(loading) = loading.as_deref_mut()
+    {
+        loading.hold_once(std::time::Duration::from_millis(4500));
     }
     if !hud.frontend {
         // bo2mc: on the Minecraft world the scoreboard's place is the
@@ -1702,7 +1783,7 @@ fn lui_hud(
     } else {
         None
     };
-    let drawn: Vec<Drawn> = hud
+    let mut drawn: Vec<Drawn> = hud
         .host
         .drawn()
         .into_iter()
@@ -1713,9 +1794,31 @@ fn lui_hud(
                     || d.material.is_some()
                     || d.kind == "image"
                     || d.text.as_deref().is_some_and(|t| !t.trim().is_empty())
-                    || (d.kind == "dashes" && d.dashes.0 > 0))
+                    || ((d.kind == "dashes" || d.kind == "meter") && d.dashes.0 > 0))
         })
         .collect();
+    // The engine's build number, small at the top right of every menu
+    // screen (no script draws it; the loading screen has none).
+    if hud.frontend && !hud.loading_open {
+        drawn.push(Drawn {
+            id: usize::MAX,
+            kind: "text",
+            rect: VERSION_RECT,
+            alpha: 1.0,
+            rgb: [1.0, 1.0, 1.0],
+            material: None,
+            text: Some(VERSION_TEXT.to_owned()),
+            font: None,
+            alignment: 3,
+            anchors: (false, true),
+            z_rot: 0.0,
+            dashes: (0, 0),
+            dash_pitch: 0.0,
+            shader: [[0.0; 4]; 4],
+            blur: false,
+            clip: None,
+        });
+    }
 
     let root = match roots.iter().next() {
         Some(r) => r,
@@ -1750,7 +1853,14 @@ fn lui_hud(
         existing.insert(n.id, e);
     }
     let mut keep: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // BO2's popup blur smears the menu under it until its words are gone
+    // (Theater under Select Film); the veil below only darkens, so words
+    // behind the top blur are not drawn.
+    let last_blur = drawn.iter().rposition(|d| d.blur && d.material.is_none());
     for (order, d) in drawn.iter().enumerate() {
+        if last_blur.is_some_and(|b| order < b) && d.text.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            continue;
+        }
         let [x0, y0, x1, y1] = d.rect;
         // Clipped by a stencil ancestor (setUseStencil): wholly outside its
         // box is not drawn; a picture across its edge is cropped below.
@@ -1770,18 +1880,19 @@ fn lui_hud(
         let color = Color::linear_rgba(d.rgb[0], d.rgb[1], d.rgb[2], d.alpha.clamp(0.0, 1.0));
         let z = ZIndex(order as i32 + 1);
         if d.blur && d.material.is_none() {
-            // A popup's blur of what is behind it: a dark veil (the menu
-            // under it fades out as BO2's blur hides it).
+            // A popup's blur of what is behind it: a dark veil over the
+            // whole screen (BO2 blurs and darkens everything under the
+            // popup, not just the popup's own box).
             keep.insert(d.id);
             let node = Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(x0 * scale),
-                top: Val::Px(y0 * scale),
-                width: Val::Px((x1 - x0).abs() * scale),
-                height: Val::Px((y1 - y0).abs() * scale),
+                left: Val::Px(0.0),
+                top: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
                 ..default()
             };
-            let veil = Color::linear_rgba(0.0, 0.0, 0.0, 0.8 * d.alpha.clamp(0.0, 1.0));
+            let veil = Color::linear_rgba(0.0, 0.0, 0.0, BLUR_VEIL * d.alpha.clamp(0.0, 1.0));
             let shows = "blur".to_owned();
             if let Some(&e) = existing.get(&d.id)
                 && let Ok((_, n, mut nn, mut zi)) = nodes.get_mut(e)
@@ -1808,17 +1919,25 @@ fn lui_hud(
                 ))
                 .id();
             commands.entity(root).add_child(e);
-        } else if d.kind == "dashes" {
+        } else if d.kind == "dashes" || d.kind == "meter" {
             // A slider's bar: `count` dashes across its rectangle, the lit
-            // ones bright (BO2's engine draws them; flat bars here).
+            // ones filled (BO2's engine draws them). The voice level meter
+            // (Settings' Level Indicator) is the same with square dashes.
             keep.insert(d.id);
             let (count, lit) = d.dashes;
-            // Each dash is half its pitch wide, two thirds of the height.
+            // Dashes one pitch apart, as the real ones sit (measured): a
+            // slider's 5 units in from its bar's left and 5 above its
+            // middle; the meter's centred across its box, also 5 up.
             let pitch = d.dash_pitch * scale;
+            let inset = if d.kind == "meter" {
+                (((x1 - x0).abs() * scale - pitch * count as f32) / 2.0).max(0.0)
+            } else {
+                5.0 * scale
+            };
             let node = Node {
                 position_type: PositionType::Absolute,
-                left: Val::Px(x0 * scale),
-                top: Val::Px(y0 * scale),
+                left: Val::Px(x0 * scale + inset),
+                top: Val::Px((y0 - 5.0) * scale),
                 width: Val::Px(pitch * count as f32),
                 height: Val::Px((y1 - y0).abs() * scale),
                 align_items: AlignItems::Center,
@@ -1850,21 +1969,47 @@ fn lui_hud(
                     z,
                 ))
                 .with_children(|c| {
+                    // As BO2 draws them (measured, 720 high): 11 tall, 5
+                    // wide, 8 apart. Lit: grey, its top 3 rows lighter and
+                    // its bottom 3 a little; unlit: a faint outline. Not
+                    // tinted by the bar's colour (the real ones look the
+                    // same focused or not). The colours are the real
+                    // screen's (94, 66, 76 of 255) through our output's
+                    // curve (about a 1.2 power), so they come out the same.
+                    // The level meter's are 11 square, 14 apart.
+                    let a = color.alpha();
+                    let unit = scale;
+                    let wide = if d.kind == "meter" { 11.0 } else { 5.0 } * unit;
+                    let grey = |v: f32| BackgroundColor(Color::linear_rgba(v, v, v, a));
                     for i in 0..count {
-                        let a = if i < lit {
-                            color.alpha()
-                        } else {
-                            color.alpha() * 0.25
+                        let dash = Node {
+                            width: Val::Px(wide),
+                            height: Val::Px(11.0 * unit),
+                            margin: UiRect::right(Val::Px(pitch - wide)),
+                            flex_direction: FlexDirection::Column,
+                            justify_content: JustifyContent::SpaceBetween,
+                            flex_shrink: 0.0,
+                            ..default()
                         };
-                        c.spawn((
-                            Node {
-                                width: Val::Px(pitch * 0.5),
-                                margin: UiRect::right(Val::Px(pitch * 0.5)),
-                                height: Val::Percent(66.0),
-                                ..default()
-                            },
-                            BackgroundColor(color.with_alpha(a)),
-                        ));
+                        if i < lit {
+                            c.spawn((dash, grey(0.33))).with_children(|d| {
+                                let band = || Node {
+                                    width: Val::Percent(100.0),
+                                    height: Val::Px(3.0 * unit),
+                                    ..default()
+                                };
+                                d.spawn((band(), grey(0.44)));
+                                d.spawn((band(), grey(0.37)));
+                            });
+                        } else {
+                            c.spawn((
+                                Node {
+                                    border: UiRect::all(Val::Px(unit.max(1.0))),
+                                    ..dash
+                                },
+                                BorderColor::all(Color::linear_rgba(1.0, 1.0, 1.0, 0.05 * a)),
+                            ));
+                        }
                     }
                 })
                 .id();
@@ -1894,6 +2039,16 @@ fn lui_hud(
                 v0: Vec4::from_array(d.shader[0]),
                 v2: Vec4::from_array(d.shader[2]),
                 color: Vec4::new(d.rgb[0], d.rgb[1], d.rgb[2], d.alpha.clamp(0.0, 1.0)),
+                blur: Vec4::new(
+                    if last_blur.is_some_and(|b| order < b) {
+                        BLUR_UNITS * 2.0 / (x1 - x0).abs().max(1.0)
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             };
             let shows = "globe".to_owned();
             if let Some(&e) = existing.get(&d.id)
@@ -1980,9 +2135,21 @@ fn lui_hud(
                 .filter(|(i, _)| *i == Some(d.id))
                 .map(|(_, m)| m);
             let mat = forced.as_ref().unwrap_or(mat);
-            let Some(handle) = picture(&mut pictures, icons, &mut image_assets, mat) else {
+            // Under the top popup's blur: the picture smeared (BO2 blurs the
+            // whole menu behind a popup; the Options menu's logo and sky).
+            let behind = last_blur.is_some_and(|b| order < b);
+            let size = ((x1 - x0).abs(), (y1 - y0).abs());
+            let found = if behind {
+                blurred_picture(&mut pictures, icons, &mut image_assets, mat, size)
+            } else {
+                picture(&mut pictures, icons, &mut image_assets, mat).map(|h| (h, mat.clone(), Vec2::ZERO))
+            };
+            let Some((handle, key, pad)) = found else {
                 continue;
             };
+            // A smeared picture's box takes in the border it smears into.
+            let (px, py) = ((x1 - x0) * pad.x, (y1 - y0) * pad.y);
+            let [x0, y0, x1, y1] = [x0 - px, y0 - py, x1 + px, y1 + py];
             keep.insert(d.id);
             // Cropped to its clip: the visible part of the box, and the
             // same part of the picture (unturned pictures only).
@@ -2017,7 +2184,7 @@ fn lui_hud(
                 rotation: Rot2::degrees(-d.z_rot),
                 ..default()
             };
-            let shows = format!("image {mat}");
+            let shows = format!("image {key}");
             if std::env::var("BO2ZM_LUI_CHAIN")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -2101,12 +2268,13 @@ fn lui_hud(
             let font = font_name(d.font.as_deref().unwrap_or("normalFont"));
             let px = (y1 - y0).abs() * scale;
             let width = bo2.line_width(font, &text, px);
-            // LUI.Alignment: 1 left, 2 centre, 3 right; none draws from the
-            // left edge, except in a box placed from its parent's centre,
-            // which it is centred on (MFTabManager's 2-wide tab titles).
+            // LUI.Alignment: 1 left, 2 centre, 3 right; none is centred in
+            // its box (BO2's Options menu words, in a box wider than the
+            // word, and MFTabManager's tab titles), except a box held to one
+            // side only, drawn from that side's edge.
             let align = match (d.alignment, d.anchors) {
                 (1..=3, _) => d.alignment,
-                (_, (false, false)) => 2,
+                (_, (false, false) | (true, true)) => 2,
                 _ => 1,
             };
             // A line longer than its box goes onto more lines, broken at
@@ -2236,6 +2404,176 @@ fn wrap_lines(bo2: &Bo2Fonts, font: &str, text: &str, px: f32, width: f32) -> Ve
     lines
 }
 
+/// How dark a popup's blur leaves the menu behind it (0 clear, 1 black).
+const BLUR_VEIL: f32 = 0.6;
+/// How far a popup's blur smears the menu behind it, in the menus'
+/// 1280-wide units.
+const BLUR_UNITS: f32 = 14.0;
+
+/// A material's picture smeared as BO2's popup blur smears it, for a box
+/// `size` units across: shrunk until one pixel is about a blur's width,
+/// softened, and drawn stretched (made once per picture and strength).
+/// Returns the image, the name it is kept under and how far its border
+/// reaches past the box, as a share of the box.
+fn blurred_picture(
+    cache: &mut HashMap<String, Handle<Image>>,
+    icons: Option<&assets::T6HudIcons>,
+    images: &mut Assets<Image>,
+    name: &str,
+    size: (f32, f32),
+) -> Option<(Handle<Image>, String, Vec2)> {
+    let img = icons?.0.iter().find(|(k, _)| k == name)?.1.clone();
+    let (w, h) = (img.texture_descriptor.size.width as usize, img.texture_descriptor.size.height as usize);
+    let f = (blur_step(w, size.0) / 2).max(1);
+    let pad = Vec2::new(4.0 / w.div_ceil(f).max(1) as f32, 4.0 / h.div_ceil(f).max(1) as f32);
+    let step = blur_step(w, size.0);
+    let key = format!("{name}#blur{step}");
+    if let Some(h) = cache.get(&key) {
+        return Some((h.clone(), key, pad));
+    }
+    let rgba = picture_rgba(&img)?;
+    // Shrink by half the blur's width (alpha-weighted, so see-through
+    // pixels do not darken the edges), then three soft passes.
+    let (sw, sh) = (w.div_ceil(f).max(1), h.div_ceil(f).max(1));
+    let mut small = vec![[0f32; 4]; sw * sh];
+    for y in 0..h {
+        for x in 0..w {
+            let p = &rgba[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            let a = f32::from(p[3]) / 255.0;
+            let c = &mut small[(y / f) * sw + x / f];
+            for i in 0..3 {
+                c[i] += f32::from(p[i]) / 255.0 * a;
+            }
+            c[3] += a;
+        }
+    }
+    for (i, c) in small.iter_mut().enumerate() {
+        let (sx, sy) = (i % sw, i / sw);
+        let n = ((w - sx * f).min(f) * (h - sy * f).min(f)) as f32;
+        for v in c.iter_mut() {
+            *v /= n;
+        }
+    }
+    // A border the smear spreads into, so a picture's box edge is soft too:
+    // see-through, or the edge carried on for a picture solid to its edge
+    // (a backdrop does not fade at the screen's edge).
+    const PAD: usize = 4;
+    let border: Vec<f32> = (0..sw)
+        .flat_map(|x| [small[x][3], small[(sh - 1) * sw + x][3]])
+        .chain((0..sh).flat_map(|y| [small[y * sw][3], small[y * sw + sw - 1][3]]))
+        .collect();
+    let solid = border.iter().sum::<f32>() / border.len().max(1) as f32 > 0.95;
+    let (iw, ih) = (sw, sh);
+    let (sw, sh) = (iw + PAD * 2, ih + PAD * 2);
+    let mut small = {
+        let inner = small;
+        let mut out = vec![[0f32; 4]; sw * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                let (ix, iy) = (x as i32 - PAD as i32, y as i32 - PAD as i32);
+                let inside = (0..iw as i32).contains(&ix) && (0..ih as i32).contains(&iy);
+                if inside || solid {
+                    let (cx, cy) = (ix.clamp(0, iw as i32 - 1) as usize, iy.clamp(0, ih as i32 - 1) as usize);
+                    out[y * sw + x] = inner[cy * iw + cx];
+                }
+            }
+        }
+        out
+    };
+    let soften = |px: &mut Vec<[f32; 4]>, horizontal: bool| {
+        let src = px.clone();
+        for y in 0..sh {
+            for x in 0..sw {
+                let mut acc = [0f32; 4];
+                for (d, wt) in [(-1i32, 0.25f32), (0, 0.5), (1, 0.25)] {
+                    let (nx, ny) = if horizontal {
+                        ((x as i32 + d).clamp(0, sw as i32 - 1) as usize, y)
+                    } else {
+                        (x, (y as i32 + d).clamp(0, sh as i32 - 1) as usize)
+                    };
+                    let s = src[ny * sw + nx];
+                    for i in 0..4 {
+                        acc[i] += s[i] * wt;
+                    }
+                }
+                px[y * sw + x] = acc;
+            }
+        }
+    };
+    for _ in 0..3 {
+        soften(&mut small, true);
+        soften(&mut small, false);
+    }
+    let mut out = vec![0u8; sw * sh * 4];
+    for (i, c) in small.iter().enumerate() {
+        let a = c[3].max(1e-6);
+        for k in 0..3 {
+            out[i * 4 + k] = ((c[k] / a).clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        out[i * 4 + 3] = (c[3].clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    use bevy::asset::RenderAssetUsages;
+    use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+    // Stored values shown as they are, as `picture` does.
+    let small = Image::new(
+        Extent3d { width: sw as u32, height: sh as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        out,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    );
+    let h = images.add(small);
+    cache.insert(key.clone(), h.clone());
+    Some((h, key, pad))
+}
+
+/// The popup blur's width in a picture's own pixels (`w` wide, drawn
+/// `drawn` units across), in steps so a picture that grows or shrinks is
+/// not remade every frame.
+fn blur_step(w: usize, drawn: f32) -> usize {
+    let r = BLUR_UNITS * w as f32 / drawn.max(1.0);
+    [1usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]
+        .into_iter()
+        .min_by(|a, b| (*a as f32 - r).abs().total_cmp(&(*b as f32 - r).abs()))
+        .unwrap_or(1)
+}
+
+/// A picture's top level as plain RGBA bytes (its stored values).
+fn picture_rgba(image: &Image) -> Option<Vec<u8>> {
+    use bevy::render::render_resource::TextureFormat as F;
+    let w = image.texture_descriptor.size.width as usize;
+    let h = image.texture_descriptor.size.height as usize;
+    let data = image.data.as_ref()?;
+    let (block, decode): (usize, fn(&[u8], &mut [u8], usize)) = match image.texture_descriptor.format {
+        F::Bc1RgbaUnormSrgb | F::Bc1RgbaUnorm => (8, bcdec_rs::bc1),
+        F::Bc2RgbaUnormSrgb | F::Bc2RgbaUnorm => (16, bcdec_rs::bc2),
+        F::Bc3RgbaUnormSrgb | F::Bc3RgbaUnorm => (16, bcdec_rs::bc3),
+        F::Bc7RgbaUnormSrgb | F::Bc7RgbaUnorm => (16, bcdec_rs::bc7),
+        F::Rgba8UnormSrgb | F::Rgba8Unorm => return data.get(..w * h * 4).map(<[u8]>::to_vec),
+        _ => return None,
+    };
+    let mut rgba = vec![0u8; w * h * 4];
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    let mut tile = [0u8; 64];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let at = (by * bw + bx) * block;
+            decode(data.get(at..at + block)?, &mut tile, 16);
+            for y in 0..4 {
+                for x in 0..4 {
+                    let (px, py) = (bx * 4 + x, by * 4 + y);
+                    if px < w && py < h {
+                        let d = (py * w + px) * 4;
+                        let s = (y * 4 + x) * 4;
+                        rgba[d..d + 4].copy_from_slice(&tile[s..s + 4]);
+                    }
+                }
+            }
+        }
+    }
+    Some(rgba)
+}
+
 /// A material's picture as an image handle (made once).
 fn picture(
     cache: &mut HashMap<String, Handle<Image>>,
@@ -2281,7 +2619,26 @@ fn picture(
             img.texture_descriptor.format
         );
     }
-    let h = images.add((*img).clone());
+    // The 2D layer's target shows what is written as it is, so a picture
+    // is read as stored (BO2's menus draw it so); read as sRGB it showed
+    // about three times too dark (the Zombies menus' sky, globe and maps).
+    let mut img = (*img).clone();
+    use bevy::render::render_resource::TextureFormat as F;
+    let raw = match img.texture_descriptor.format {
+        F::Rgba8UnormSrgb => Some(F::Rgba8Unorm),
+        F::Bc1RgbaUnormSrgb => Some(F::Bc1RgbaUnorm),
+        F::Bc2RgbaUnormSrgb => Some(F::Bc2RgbaUnorm),
+        F::Bc3RgbaUnormSrgb => Some(F::Bc3RgbaUnorm),
+        F::Bc7RgbaUnormSrgb => Some(F::Bc7RgbaUnorm),
+        _ => None,
+    };
+    if let Some(f) = raw {
+        img.texture_descriptor.format = f;
+    }
+    // Menu pictures stop at their edges: wrapped, the loading screen's top
+    // and bottom shades drew a dark line across the map picture.
+    img.sampler = bevy::image::ImageSampler::linear();
+    let h = images.add(img);
     cache.insert(name.to_owned(), h.clone());
     Some(h)
 }

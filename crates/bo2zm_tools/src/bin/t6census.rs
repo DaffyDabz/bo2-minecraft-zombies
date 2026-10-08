@@ -73,6 +73,16 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        // T6CENSUS_XMODELS=<substring>: the zone's models whose name has it.
+        if let Ok(want) = std::env::var("T6CENSUS_XMODELS") {
+            let hits: Vec<&str> = cap
+                .xmodels
+                .iter()
+                .map(|m| m.name.as_str())
+                .filter(|n| n.contains(want.as_str()))
+                .collect();
+            println!("XMODELS {z}: {} of {} {hits:?}", hits.len(), cap.xmodels.len());
+        }
         if std::env::var("T6CENSUS_PATHS").is_ok() && !cap.path_nodes.is_empty() {
             let nodes = &cap.path_nodes;
             let mut types: BTreeMap<u32, usize> = BTreeMap::new();

@@ -77,7 +77,12 @@ pub(crate) fn advance(world: &mut World, now: i64) {
         return;
     }
     world.resource_mut::<Zm>().wallbuys.chalk_done = true;
-    let effects: Vec<(i32, [f32; 3], [f32; 3], [f32; 3])> = with_vm(world, |vm, _| {
+    // (effect id or its file, where, facing, up, what it sells)
+    type Chalk = (Result<i32, String>, [f32; 3], [f32; 3], [f32; 3], String);
+    // Wall buys with no chalk drawing hang their gun on the wall instead
+    // (by clientfield name).
+    let mut on_wall = Vec::new();
+    let effects: Vec<Chalk> = with_vm(world, |vm, _| {
         let fx_table = field(vm, vm.level, "_effect");
         let fx_of = |vm: &mut Vm<World>, key: &str| -> Option<i32> {
             let Value::Array(a) = &fx_table else {
@@ -98,21 +103,54 @@ pub(crate) fn advance(world: &mut World, now: i64) {
                 continue;
             };
             let angles = field(vm, s, "angles").as_vec3().unwrap_or([0.0; 3]);
-            let Some(fx) = fx_of(vm, &format!("{w}_fx")).or_else(|| fx_of(vm, "m14_zm_fx")) else {
+            if NO_CHALK.contains(&w.as_str()) {
+                let o = field(vm, s, "origin");
+                on_wall.push(format!("{w}_{}", vm.to_text(&o)));
                 continue;
+            }
+            // The map's own chalk for it; else its chalk file by name
+            // (Nuketown's scripts give the Claymore none); else the M14's.
+            let fx = match fx_of(vm, &format!("{w}_fx")) {
+                Some(fx) => Ok(fx),
+                // (BO2 has no frag chalk: the Semtex grenade's.)
+                None if w == "frag_grenade_zm" => Err("maps/zombie/fx_zmb_wall_buy_semtex".to_owned()),
+                None if !w.is_empty() => Err(format!("maps/zombie/fx_zmb_wall_buy_{}", w.trim_end_matches("_zm"))),
+                None => match fx_of(vm, "m14_zm_fx") {
+                    Some(fx) => Ok(fx),
+                    None => continue,
+                },
             };
             let (f, _, u) = gsc_t6::math::angle_vectors(angles);
-            out.push((fx, origin, f, u));
+            out.push((fx, origin, f, u, w));
         }
         out
     })
     .unwrap_or_default();
-    for (fx, origin, forward, up) in effects {
-        if let Some(name) = super::natives_fx::fx_name(world, fx) {
+    for (fx, origin, forward, up, what) in effects {
+        let name = match fx {
+            Ok(fx) => super::natives_fx::fx_name(world, fx),
+            Err(file) => Some(file),
+        };
+        if let Some(name) = name {
+            diag::info!(
+                Sim,
+                "wall buy chalk: {what} at {:.0},{:.0},{:.0}: {name}",
+                origin[0],
+                origin[1],
+                origin[2]
+            );
             super::natives_fx::effect_axis(world, &name, origin, forward, up);
         }
     }
+    for name in on_wall {
+        diag::info!(Sim, "wall buy on the wall: {name}");
+        with_vm(world, |vm, world| show_gun(vm, world, &name, false));
+    }
 }
+
+/// Weapons BO2 has no chalk drawing for (Mob of the Dead's, never wall
+/// buys there): his 10-07 "just put it on the wall" until he has outlines.
+const NO_CHALK: [&str; 3] = ["blundergat_zm", "spoon_zm_alcatraz", "spork_zm_alcatraz"];
 
 /// A world clientfield changed: a wall buy bought shows its gun.
 pub(super) fn world_field(vm: &mut Vm<World>, world: &mut World, name: &str, value: i32) {
@@ -125,6 +163,12 @@ pub(super) fn world_field(vm: &mut Vm<World>, world: &mut World, name: &str, val
     {
         return;
     }
+    show_gun(vm, world, name, true);
+}
+
+/// A wall buy's gun out on the wall (clientfield `name`), sliding out of
+/// it or (no chalk) already there.
+fn show_gun(vm: &mut Vm<World>, world: &mut World, name: &str, slide: bool) {
     // The wall buy this field belongs to: `<weapon>_<origin>`.
     let mut found = None;
     for s in structs(vm) {
@@ -136,11 +180,11 @@ pub(super) fn world_field(vm: &mut Vm<World>, world: &mut World, name: &str, val
         let o = field(vm, s, "origin");
         if format!("{}_{}", vm.to_text(&w), vm.to_text(&o)) == name {
             let target = field(vm, s, "target");
-            found = Some(vm.to_text(&target));
+            found = Some((vm.to_text(&target), vm.to_text(&w)));
             break;
         }
     }
-    let Some(target) = found else { return };
+    let Some((target, weapon)) = found else { return };
     let mut model_at = None;
     for s in structs(vm) {
         let tn = field(vm, s, "targetname");
@@ -157,12 +201,25 @@ pub(super) fn world_field(vm: &mut Vm<World>, world: &mut World, name: &str, val
         model_at = Some((vm.to_text(&m), origin, angles));
         break;
     }
-    let Some((model, origin, angles)) = model_at else {
+    let Some((mut model, origin, angles)) = model_at else {
         return;
     };
+    // bo2mc's copied wall buys (frag grenades, the vault's guns) keep the
+    // copied gun's model for their use box: the one that comes out is
+    // the weapon's own.
+    if target.contains("_bo2mc_")
+        && let Ok(w) = super::weapon(world, &weapon)
+        && let Some((m, _)) = super::frame(world).weapon_world_model(w)
+    {
+        model = m.to_owned();
+    }
     // Out of the wall: from 8 units along its right to its place.
     let (_, right, _) = gsc_t6::math::angle_vectors(angles);
-    let from = std::array::from_fn(|i| origin[i] + right[i] * 8.0);
+    let from = if slide {
+        std::array::from_fn(|i| origin[i] + right[i] * 8.0)
+    } else {
+        origin
+    };
     let now = world.resource::<Zm>().now_ms;
     let n = world.resource_mut::<Zm>().alloc_entnum();
     let obj = vm.alloc_object(ObjKind::Entity(n));

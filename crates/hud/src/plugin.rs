@@ -121,6 +121,8 @@ impl Plugin for HudPlugin {
                             update_targetmap,
                             crate::menus::update_script_menus,
                             crate::minecraft_inventory::update_minecraft_hud,
+                            crate::minecraft_chat::update,
+                            crate::minecraft_compass::update,
                             hud_stage_close::<7>,
                         )
                             .chain(),
@@ -147,6 +149,8 @@ impl Plugin for HudPlugin {
                     flush_hud_elems_tess,
                     flush_targetmap_tess,
                     flush_minecraft_tess,
+                    flush_minecraft_chat_tess,
+                    flush_minecraft_compass_tess,
                     flush_blood_tess,
                     flush_script_menus_tess,
                 )
@@ -343,6 +347,8 @@ fn ensure_hud_root(mut commands: Commands, existing: Query<Entity, With<HudRoot>
             spawn_targetmap(root);
             crate::menus::spawn_script_menus(root);
             crate::font_overlay::spawn_overlay(root, crate::minecraft_inventory::MinecraftRaster);
+            crate::font_overlay::spawn_overlay(root, crate::minecraft_chat::MinecraftChatRaster);
+            crate::font_overlay::spawn_overlay(root, crate::minecraft_compass::MinecraftCompassRaster);
         });
 }
 
@@ -858,6 +864,66 @@ pub(crate) fn flush_overhead_names_tess(
     }
     let job = std::mem::take(&mut pass.overhead_names);
     if let Ok((_, mut host, mut latch)) = hint.single_mut() {
+        gpu_list::apply_tess_job(
+            job,
+            &mut host,
+            &mut latch,
+            &mut hud_images,
+            &mut images,
+            &mut frame,
+            surface.width(),
+            surface.height(),
+        );
+    }
+}
+
+fn flush_minecraft_chat_tess(
+    surface: Res<crate::surface::Hud2dSurface>,
+    mut pass: ResMut<HudTessPass>,
+    mut hud_images: ResMut<HudImages>,
+    mut images: ResMut<Assets<Image>>,
+    mut frame: ResMut<crate::gpu_list::HudTessGpuFrame>,
+    mut chat: Query<
+        (Entity, &mut Node, &mut crate::gpu_list::GpuListLatch),
+        With<crate::minecraft_chat::MinecraftChatRaster>,
+    >,
+) {
+    let _body = gpu_list::TessBody::open();
+    if !surface.is_ready() {
+        return;
+    }
+    let job = std::mem::take(&mut pass.minecraft_chat);
+    if let Ok((_, mut host, mut latch)) = chat.single_mut() {
+        gpu_list::apply_tess_job(
+            job,
+            &mut host,
+            &mut latch,
+            &mut hud_images,
+            &mut images,
+            &mut frame,
+            surface.width(),
+            surface.height(),
+        );
+    }
+}
+
+fn flush_minecraft_compass_tess(
+    surface: Res<crate::surface::Hud2dSurface>,
+    mut pass: ResMut<HudTessPass>,
+    mut hud_images: ResMut<HudImages>,
+    mut images: ResMut<Assets<Image>>,
+    mut frame: ResMut<crate::gpu_list::HudTessGpuFrame>,
+    mut compass: Query<
+        (Entity, &mut Node, &mut crate::gpu_list::GpuListLatch),
+        With<crate::minecraft_compass::MinecraftCompassRaster>,
+    >,
+) {
+    let _body = gpu_list::TessBody::open();
+    if !surface.is_ready() {
+        return;
+    }
+    let job = std::mem::take(&mut pass.minecraft_compass);
+    if let Ok((_, mut host, mut latch)) = compass.single_mut() {
         gpu_list::apply_tess_job(
             job,
             &mut host,

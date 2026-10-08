@@ -260,6 +260,18 @@ pub(super) fn weapon_events(world: &mut World) {
         }
         if reloading(st) && !reloading(last_s) {
             events.push("reload_start");
+            // bo2mc: Electric Cherry's shock (`electric_cherry_reload_attack`:
+            // 32 to 128 units, more the emptier the magazine) on the
+            // Minecraft mobs too, in Minecraft points (a zombie has 20).
+            if crate::bo2mc::enabled()
+                && world.resource::<Zm>().players.get(&c).is_some_and(|p| p.perks.contains("specialty_grenadepulldeath"))
+            {
+                let max = frame(world).combat_facts_for(w).map_or(0, |f| f.clip_size).max(1);
+                let empty = 1.0 - (clip.max(0) as f32 / max as f32).clamp(0.0, 1.0);
+                let (radius, damage) = (32.0 + 96.0 * empty, 2.0 + 18.0 * empty);
+                crate::bo2mc::push(crate::bo2mc::Request::Shock { at: ps.origin, radius, damage });
+                diag::info!(Sim, "bo2mc perks: Electric Cherry shock {radius:.0} units, {damage:.0} Minecraft damage");
+            }
         }
         if reloading(last_s) && !reloading(st) && clip > last_clip {
             events.push("reload");

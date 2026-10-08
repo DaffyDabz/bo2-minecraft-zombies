@@ -66,6 +66,8 @@ pub struct PcmAudio {
     live_pan: Option<LivePan>,
     live_gain: Option<LiveGain>,
     channel_gain: Option<LiveGain>,
+    /// bo2zm: the room echo this play sends into, and how much.
+    echo: Option<(Arc<crate::room_echo::EchoParams>, f32)>,
 }
 
 #[derive(Asset, TypePath, Clone)]
@@ -102,6 +104,7 @@ impl PcmAudio {
             live_pan: None,
             live_gain: None,
             channel_gain: None,
+            echo: None,
         })
     }
 
@@ -125,7 +128,18 @@ impl PcmAudio {
             live_pan: Some(LivePan::unity()),
             live_gain: self.live_gain.clone(),
             channel_gain: self.channel_gain.clone(),
+            echo: None,
         }
+    }
+
+    /// bo2zm: this play also sends `send` (0..1) into the room's echo (it
+    /// plays as stereo, then rings on for the echo's tail).
+    pub fn with_echo(mut self, params: Arc<crate::room_echo::EchoParams>, send: f32) -> Self {
+        if self.live_pan.is_none() {
+            self.live_pan = Some(LivePan::unity());
+        }
+        self.echo = Some((params, send));
+        self
     }
 
     pub fn live_pan(&self) -> Option<&LivePan> {
@@ -171,7 +185,10 @@ impl PcmAudio {
             channel_gain: self.channel_gain.clone(),
             pending_right: None,
             looping,
+            echo: None,
+            tail_left: 0,
         }
+        .with_echo(self.echo.as_ref().filter(|_| !looping))
     }
 }
 
@@ -205,6 +222,9 @@ pub struct PcmDecoder {
     channel_gain: Option<LiveGain>,
     pending_right: Option<f32>,
     looping: bool,
+    echo: Option<crate::room_echo::Echo>,
+    /// Echo frames still to ring after the clip.
+    tail_left: usize,
 }
 
 impl PcmDecoder {
@@ -213,7 +233,19 @@ impl PcmDecoder {
             return Some(right);
         }
         if !self.rewind_for_loop() {
-            return None;
+            // The clip is over; its echo rings on.
+            let (Some(echo), Some(live)) = (&mut self.echo, &self.live) else {
+                return None;
+            };
+            if self.tail_left == 0 {
+                return None;
+            }
+            self.tail_left -= 1;
+            let (gain_l, gain_r) = live.get();
+            let g = (gain_l + gain_r) * 0.5;
+            let (wl, wr) = echo.tick(0.0);
+            self.pending_right = Some(wr * g);
+            return Some(wl * g);
         }
         let Some(live) = &self.live else {
             let sample = self.samples[self.pos];
@@ -225,8 +257,26 @@ impl PcmDecoder {
         let left = *self.samples.get(self.pos)?;
         let right = self.samples.get(self.pos + 1).copied().unwrap_or(left);
         self.pos += ch;
+        if let Some(echo) = &mut self.echo {
+            let g = (gain_l + gain_r) * 0.5;
+            let (wl, wr) = echo.tick((left + right) * 0.5);
+            self.pending_right = Some(right * gain_r + wr * g);
+            return Some(left * gain_l + wl * g);
+        }
         self.pending_right = Some(right * gain_r);
         Some(left * gain_l)
+    }
+
+    fn with_echo(mut self, echo: Option<&(Arc<crate::room_echo::EchoParams>, f32)>) -> Self {
+        if let Some((params, send)) = echo
+            && *send > 0.0
+            && self.live.is_some()
+        {
+            let e = crate::room_echo::Echo::new(params, self.sample_rate, *send);
+            self.tail_left = e.tail_frames();
+            self.echo = Some(e);
+        }
+        self
     }
 
     fn remaining_out(&self) -> usize {
@@ -234,7 +284,7 @@ impl PcmDecoder {
             let extra = usize::from(self.pending_right.is_some());
             let ch = self.src_channels.max(1) as usize;
             let frames_left = self.samples.len().saturating_sub(self.pos) / ch;
-            extra + frames_left * 2
+            extra + (frames_left + self.tail_left) * 2
         } else {
             self.samples.len().saturating_sub(self.pos)
         }
@@ -294,7 +344,8 @@ impl Source for PcmDecoder {
         if self.looping {
             return None;
         }
-        let frames = self.samples.len() as u64 / self.src_channels.max(1) as u64;
+        let frames = self.samples.len() as u64 / self.src_channels.max(1) as u64
+            + self.echo.as_ref().map_or(0, |e| e.tail_frames() as u64);
         Some(Duration::from_secs_f64(
             frames as f64 / self.sample_rate.max(1) as f64,
         ))
@@ -376,5 +427,6 @@ pub fn decode_audio_bytes(bytes: &[u8]) -> Option<PcmAudio> {
         live_pan: None,
         live_gain: None,
         channel_gain: None,
+        echo: None,
     })
 }

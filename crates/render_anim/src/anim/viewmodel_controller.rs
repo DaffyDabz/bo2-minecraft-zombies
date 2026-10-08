@@ -250,7 +250,13 @@ impl ViewmodelController {
             | WeaponAnimSlot::LastShot
             | WeaponAnimSlot::AdsLastShot
             | WeaponAnimSlot::HoldFire => {
-                let timer = self.weapon.fire_time_ms;
+                // bo2zm: the wind-up plays over the wind-up time, not the
+                // throw's (the Monkey Bomb's pull-back ran at double speed).
+                let timer = if slot == WeaponAnimSlot::HoldFire {
+                    self.weapon.hold_fire_time_ms
+                } else {
+                    self.weapon.fire_time_ms
+                };
                 (
                     WeaponState::Firing,
                     if timer > 0 { Some(timer) } else { None },

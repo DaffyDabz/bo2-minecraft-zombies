@@ -200,6 +200,9 @@ pub struct CapturedAlias {
     pub envelop_max: f32,
     pub envelop_percentage: f32,
 
+    /// bo2zm: how much of the sound goes to the room's echo (0..1).
+    pub reverb_send: f32,
+
     pub speaker_map: Option<String>,
 
     pub limit_count: Option<u8>,
@@ -372,6 +375,10 @@ pub struct SoundCatalog {
     /// compiled scripts; replaces the createfx source parse.
     pub scripted_map_fx: Option<crate::createfx::ScriptedMapFx>,
 
+    /// bo2zm: the banks' room echoes by name (16 values in `SndRadverb`'s
+    /// order, from smoothing to returnHighpass).
+    pub radverbs: HashMap<String, [f32; 16]>,
+
     pub ent_channels: Vec<EntChannel>,
     by_alias: HashMap<(AssetNamespace, String), usize>,
 
@@ -416,6 +423,9 @@ impl SoundCatalog {
         }
         if self.scripted_map_fx.is_none() {
             self.scripted_map_fx = other.scripted_map_fx;
+        }
+        for (name, values) in other.radverbs {
+            self.radverbs.entry(name).or_insert(values);
         }
         if self.ent_channels.is_empty() && !other.ent_channels.is_empty() {
             self.ent_channels = other.ent_channels;
@@ -477,6 +487,9 @@ impl SoundCatalog {
         }
         if self.scripted_map_fx.is_none() {
             self.scripted_map_fx = other.scripted_map_fx;
+        }
+        for (name, values) in other.radverbs {
+            self.radverbs.entry(name).or_insert(values);
         }
         if self.ent_channels.is_empty() && !other.ent_channels.is_empty() {
             self.ent_channels = other.ent_channels;
@@ -1683,6 +1696,7 @@ impl AssetLinkSink for SoundCatalog {
                 envelop_percentage: s
                     .f32_at(row, s.layout(SND_ALIAS_ENVELOP_PERCENTAGE, 120))
                     .unwrap_or(0.0),
+                reverb_send: 0.0,
                 speaker_map: speaker_map_name(s, row),
                 limit_count: None,
                 entity_limit_count: None,

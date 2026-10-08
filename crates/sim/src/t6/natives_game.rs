@@ -262,11 +262,15 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         zm.fx.push(name);
         Ok(Value::Int(zm.fx.len() as i32))
     });
+    // Only players in the game: one still connecting (before `begin`) is not
+    // listed, as in the engine (_visionset_mgr::monitor reads every listed
+    // player's _player_entnum, set on "connected", which follows `begin`).
     f!("getplayers", |_, world, _, _| {
         let ps: Vec<Value> = world
             .resource::<Zm>()
             .players
             .values()
+            .filter(|p| p.begun)
             .map(|p| Value::Object(p.obj))
             .collect();
         Ok(list(ps))
@@ -290,8 +294,46 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         }
         Ok(Value::bool(entnum(vm, v).is_some()))
     });
+    // An animation's length in seconds, and the times (0..1 of its length)
+    // a notetrack of it fires (Buried's head chopper slices by them).
+    f!("getanimlength", |vm, world, _, a| {
+        let len = anim_of(vm, world, arg(a, 0)).map_or(0.0, |x| {
+            if x.framerate > 0.0 {
+                f32::from(x.numframes) / x.framerate
+            } else {
+                0.0
+            }
+        });
+        Ok(Value::Float(len))
+    });
+    f!("getnotetracktimes", |vm, world, _, a| {
+        let note = text(vm, a, 1);
+        let times = anim_of(vm, world, arg(a, 0))
+            .map(|x| {
+                x.notifies
+                    .iter()
+                    .filter(|(n, _)| n.eq_ignore_ascii_case(&note))
+                    .map(|(_, t)| Value::Float(*t))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(list(times))
+    });
     f!("getwatcherweapons", |_, _, _, _| Ok(list(Vec::new())));
-    f!("getretrievableweapons", |_, _, _, _| Ok(list(Vec::new())));
+    // The weapons BO2 marks retrievable (placed equipment, knives): their
+    // names, so _weaponobjects makes each a watcher ("equip_turbine").
+    f!("getretrievableweapons", |vm, world, _, _| {
+        let f = frame(world);
+        let ws: Vec<u32> = (1..f.weapon_combat_len() as u32)
+            .filter(|&w| f.weapon_combat_row(w).is_some_and(|r| r.retrievable))
+            .collect();
+        drop(f);
+        let names = ws
+            .into_iter()
+            .map(|w| vm.string(&super::weapon_text(world, w)))
+            .collect();
+        Ok(list(names))
+    });
     f!("getplayerspawnid", |vm, _, _, a| Ok(
         entnum(vm, arg(a, 0)).map_or(Value::Int(0), |n| Value::Int(n as i32))
     ));
@@ -396,6 +438,29 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let v = nodes_matching(vm, world, a);
         Ok(list(v))
     });
+    // Path node links the scripts change (Die Rise's escape pod, ffotd fixes).
+    f!("linknodes", |_, world, _, a| {
+        if let Some((x, y)) = node_pair(world, a) {
+            world.resource_mut::<Zm>().nav.link(x, y);
+        }
+        Ok(Value::Undefined)
+    });
+    f!("unlinknodes", |_, world, _, a| {
+        if let Some((x, y)) = node_pair(world, a) {
+            world.resource_mut::<Zm>().nav.unlink(x, y);
+        }
+        Ok(Value::Undefined)
+    });
+    f!("nodesarelinked", |_, world, _, a| {
+        let linked = node_pair(world, a).is_some_and(|(x, y)| world.resource::<Zm>().nav.linked(x, y));
+        Ok(Value::Int(linked as i32))
+    });
+    f!("deletepathnode", |_, world, _, a| {
+        if let Some(n) = node_index(world, arg(a, 0)) {
+            world.resource_mut::<Zm>().nav.delete(n);
+        }
+        Ok(Value::Undefined)
+    });
     f!("getallnodes", |_, world, _, _| {
         let v = world
             .resource::<Zm>()
@@ -404,6 +469,16 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             .map(|o| Value::Object(*o))
             .collect();
         Ok(list(v))
+    });
+    // The node nearest a point (Buried's ghosts and Leroy path from it).
+    f!("getnearestnode", |_, world, _, a| {
+        let p = arg(a, 0).as_vec3().unwrap_or([0.0; 3]);
+        let zm = world.resource::<Zm>();
+        Ok(zm
+            .nav
+            .nearest(p)
+            .and_then(|i| zm.node_objs.get(i as usize).copied())
+            .map_or(Value::Undefined, Value::Object))
     });
     for name in ["getnodesinradius", "getnodesinradiussorted"] {
         vm.bind(name, false, |_, world, _, a| {
@@ -430,6 +505,22 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             ))
         });
     }
+    // Every path node within a sphere (zm_prison::title_update_main_end
+    // marks the ones by the docks `no_teleport`).
+    f!("getanynodearray", |_, world, _, a| {
+        let center = arg(a, 0).as_vec3().unwrap_or([0.0; 3]);
+        let radius = arg(a, 1).as_float().unwrap_or(0.0);
+        let zm = world.resource::<Zm>();
+        let v = zm
+            .nav
+            .nodes
+            .iter()
+            .zip(&zm.node_objs)
+            .filter(|(n, _)| gsc_t6::math::length(gsc_t6::math::sub(n.origin, center)) <= radius)
+            .map(|(_, o)| Value::Object(*o))
+            .collect();
+        Ok(list(v))
+    });
     // bo2zm M3: weapon facts the scripts ask (class, fire type).
     f!("weaponclass", |vm, world, _, a| {
         let w = super::weapon(world, &text(vm, a, 0)).unwrap_or(0);
@@ -460,6 +551,19 @@ pub(super) fn bind(vm: &mut Vm<World>) {
             .map(|(m, _)| m.to_owned())
             .unwrap_or_default();
         Ok(vm.string(&model))
+    });
+    // A weapon's localized name (a dug-up gun's pickup hint).
+    f!("getweapondisplayname", |vm, world, _, a| {
+        let w = super::weapon(world, &text(vm, a, 0)).ok();
+        let key = w.and_then(|w| {
+            super::frame(world)
+                .weapon_display_name(w)
+                .map(str::to_owned)
+        });
+        Ok(match key {
+            Some(k) => Value::IStr(vm.intern(&k)),
+            None => vm.string(""),
+        })
     });
     // Weapon facts the scripts ask about a gun by name.
     fn facts(
@@ -695,9 +799,23 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         let (s, e) = (vec3(a, 0)?, vec3(a, 1)?);
         Ok(Value::bool(world_trace(world, s, e, SHOT).0 >= 1.0))
     });
-    f!("physicstrace", |_, world, _, a| {
+    // physicstrace(start, end[, mins, maxs, ignore]): a trace array like
+    // bullettrace's (BO2's scripts read trace["position"]), swept with the
+    // box when one is given.
+    f!("physicstrace", |vm, world, _, a| {
         let (s, e) = (vec3(a, 0)?, vec3(a, 1)?);
-        Ok(Value::Vec3(world_trace(world, s, e, SOLID).1))
+        let (mins, maxs) = (
+            vec3(a, 2).unwrap_or([0.0; 3]),
+            vec3(a, 3).unwrap_or([0.0; 3]),
+        );
+        let t = frame(world).trace_static_world(s, e, mins, maxs, SOLID);
+        let f = if t.startsolid != 0 {
+            0.0
+        } else {
+            t.fraction.clamp(0.0, 1.0)
+        };
+        let pos = std::array::from_fn(|i| s[i] + (e[i] - s[i]) * f);
+        Ok(trace_array(vm, (f, pos, t.normal)))
     });
     f!("playerphysicstrace", |_, world, _, a| {
         let (s, e) = (vec3(a, 0)?, vec3(a, 1)?);
@@ -781,7 +899,6 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "playsound",
         "physicsexplosionsphere",
         "physicsexplosioncylinder",
-        "earthquake",
         "playrumbleonposition",
         "setclientnamemode",
         "setvoipattachment",
@@ -792,7 +909,30 @@ pub(super) fn bind(vm: &mut Vm<World>) {
         "disablezombies",
         "setdvarbool",
         "sethideonclientwhendead",
+        // a client draw distance (map mains, e.g. Tranzit)
+        "setculldist",
     ] {
         vm.bind(name, false, |_, _, _, _| Ok(Value::Undefined));
     }
+}
+
+/// The animation a script `%name` value names (its xanim's timing).
+fn anim_of(vm: &Vm<World>, world: &World, v: &Value) -> Option<super::T6Anim> {
+    let Value::Anim(i) = v else {
+        return None;
+    };
+    let (_, name) = *vm.program.anims.get(*i as usize)?;
+    world.resource::<Zm>().anims.get(vm.str(name)).cloned()
+}
+
+/// The path node index a script node object stands for.
+fn node_index(world: &World, v: &Value) -> Option<u32> {
+    let o = v.as_obj()?;
+    let zm = world.resource::<Zm>();
+    zm.node_objs.iter().position(|n| *n == o).map(|i| i as u32)
+}
+
+/// The two path nodes a link builtin names.
+fn node_pair(world: &World, a: &[Value]) -> Option<(u32, u32)> {
+    Some((node_index(world, arg(a, 0))?, node_index(world, arg(a, 1))?))
 }

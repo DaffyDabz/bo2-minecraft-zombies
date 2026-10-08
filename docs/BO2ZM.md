@@ -49,7 +49,7 @@ python crates/fastfile_t6/gen/t6gen.py <OpenAssetTools checkout> crates/fastfile
 ```
 
 The generator reads two kinds of facts from an OpenAssetTools checkout on the
-developer's machine (`D:\scratch\rebuild-recon\oat`): the T6 structure
+developer's machine (`<scratch>\rebuild-recon\oat`): the T6 structure
 declarations (`src/Common/Game/T6/T6_Assets.h`, enums from `T6.h`) and the
 zone-load rules (`src/ZoneCode/Game/T6/T6_Commands.txt` and `XAssets/*.txt`:
 counts, conditions, blocks, reuse, reorder, alignment overrides). It computes

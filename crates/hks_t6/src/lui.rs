@@ -166,11 +166,13 @@ impl State {
         if let Some(v) = num("blue") {
             self.blue = v;
         }
-        if let Some(v) = num("alpha") {
-            self.alpha = v;
-        }
-        if let Some(v) = num("alphaMultiplier") {
-            self.alpha_multiplier = v;
+        // The real engine keeps one fade value: a state carrying only
+        // `alphaMultiplier` (fade_in = {alphaMultiplier = 1}) brings back an
+        // element made at alpha 0, so both keys set the same alpha here.
+        match (num("alpha"), num("alphaMultiplier")) {
+            (Some(a), Some(m)) => self.alpha = a * m,
+            (Some(v), None) | (None, Some(v)) => self.alpha = v,
+            (None, None) => {}
         }
         if let Some(v) = num("zRot") {
             self.z_rot = v;
@@ -399,12 +401,18 @@ fn ease(t: f64, ease_in: bool, ease_out: bool) -> f64 {
     }
 }
 
-/// The state the setters change now: the open animation's end, or the
-/// shown state.
-fn edit(e: &mut Element, f: impl FnOnce(&mut State)) {
-    match e.pending.as_mut() {
-        Some(p) => f(p),
-        None => f(&mut e.state),
+/// The state the setters change now: the open animation's end, the
+/// running animation's end as well as the shown state (LUI writes the
+/// latest animation's target: Nuketown's map fades in when its picture is
+/// ready, during its zoom), or the shown state.
+fn edit(e: &mut Element, f: impl Fn(&mut State)) {
+    match (e.pending.as_mut(), e.anim.as_mut()) {
+        (Some(p), _) => f(p),
+        (None, Some(a)) => {
+            f(&mut a.to);
+            f(&mut e.state);
+        }
+        (None, None) => f(&mut e.state),
     }
 }
 
@@ -515,10 +523,14 @@ pub fn tick(now_ms: f64) -> Vec<(Rc<UserData>, String, bool, f64)> {
     l.borrow_mut().now_ms = now_ms;
     let roots = l.borrow().roots.clone();
     let mut done = Vec::new();
-    let mut stack = roots;
+    // Tree order (parents first, children first to last): two animations
+    // ending in the same frame report in the order the game's UI does
+    // (leaving Custom Games, the map's ends before the globe's, which
+    // resets the map's "to the corner" mark the map's handler reads).
+    let mut stack: Vec<_> = roots.into_iter().rev().collect();
     while let Some(u) = stack.pop() {
         let ended = with(&u, |e| {
-            stack.extend(e.children.iter().cloned());
+            stack.extend(e.children.iter().rev().cloned());
             let a = e.anim.as_ref()?;
             let t = if a.duration_ms <= 0.0 {
                 1.0
@@ -637,7 +649,11 @@ pub fn layout_clipped(
                 })
             })
             .collect();
-        let total = sizes.iter().sum::<f32>() + spacing * sizes.len().saturating_sub(1) as f32;
+        // A child with no size along the axis takes no room and no spacing
+        // (ButtonList's two key-repeat helpers: BO2's Options menu starts
+        // Settings at the list's top, not two spacings down).
+        let placed = sizes.iter().filter(|s| **s > 0.0).count();
+        let total = sizes.iter().sum::<f32>() + spacing * placed.saturating_sub(1) as f32;
         let (lo, hi) = if vertical { (r[1], r[3]) } else { (r[0], r[2]) };
         let mut at = match align {
             2 | 5 => (lo + hi) * 0.5 - total * 0.5,
@@ -646,7 +662,9 @@ pub fn layout_clipped(
         };
         for (k, size) in kids.iter().zip(sizes) {
             walk(k, r, a, Some((vertical, at, at + size)), clip, measure, out);
-            at += size + spacing;
+            if size > 0.0 {
+                at += size + spacing;
+            }
         }
     }
     walk(root, rect, 1.0, None, None, measure, &mut out);
@@ -772,7 +790,7 @@ pub fn install(vm: &mut Vm) {
             _ => None,
         };
         let streamed = with(&u, |e| {
-            edit(e, |s| s.material = m);
+            edit(e, |s| s.material = m.clone());
             e.streamed
         });
         // Our pictures are resident: a streamed one is ready at once.
@@ -788,7 +806,7 @@ pub fn install(vm: &mut Vm) {
                 Value::Nil => None,
                 v => Some(vm.tostring(&v)?),
             };
-            with(&u, |e| edit(e, |s| s.text = t));
+            with(&u, |e| edit(e, |s| s.text = t.clone()));
             Ok(vec![])
         });
     }
@@ -799,7 +817,7 @@ pub fn install(vm: &mut Vm) {
             Value::User(f) => f.data.borrow().downcast_ref::<String>().cloned(),
             _ => None,
         };
-        with(&u, |e| edit(e, |s| s.font = f));
+        with(&u, |e| edit(e, |s| s.font = f.clone()));
         Ok(vec![])
     });
     reg(vm, n, "setAlignment", |_, a| {
@@ -869,6 +887,19 @@ pub fn install(vm: &mut Vm) {
             e.kind = "dashes";
             e.dashes = (count.max(0), filled.clamp(0, count.max(0)));
             e.dash_pitch = pitch.max(1.0);
+        });
+        Ok(vec![])
+    });
+    // setupVoiceMeter(count): Settings' Level Indicator, `count` square
+    // dashes 14 apart lit by how loud the microphone is (none here: no
+    // voice chat, so all unlit, as the real one sits with no one talking).
+    reg(vm, n, "setupVoiceMeter", |_, a| {
+        let u = this(&a, "setupVoiceMeter")?;
+        let count = arg(&a, 1).as_num().unwrap_or(20.0) as i32;
+        with(&u, |e| {
+            e.kind = "meter";
+            e.dashes = (count.max(0), 0);
+            e.dash_pitch = 14.0;
         });
         Ok(vec![])
     });
@@ -961,7 +992,10 @@ pub fn install(vm: &mut Vm) {
     // completeAnimation: the running animation jumps to its end (the
     // values written since beginAnimation included), and, as LUI does it,
     // its `transition_complete_<name>` runs now, before the script's next
-    // line (the globe's spin restarts there, then its move replaces it).
+    // line, marked `interrupted`: a looping handler stops there (the menu
+    // button's pulse_high/pulse_low loop ends when it loses focus; without
+    // the mark every button once passed over kept pulsing grey), and the
+    // globe's handlers skip it before its next move starts.
     reg(vm, n, "completeAnimation", |vm, a| {
         let u = this(&a, "completeAnimation")?;
         let name = with(&u, |e| {
@@ -977,6 +1011,7 @@ pub fn install(vm: &mut Vm) {
                 .set_str("name", Value::str(&format!("transition_complete_{name}")));
             t.borrow_mut().set_str("controller", Value::Num(0.0));
             t.borrow_mut().set_str("lateness", Value::Num(0.0));
+            t.borrow_mut().set_str("interrupted", Value::Bool(true));
             let pe = vm.index(&target, &Value::str("processEvent"))?;
             if !matches!(pe, Value::Nil) {
                 vm.call(pe, vec![target, Value::Table(t)])?;
@@ -1118,8 +1153,6 @@ pub fn install(vm: &mut Vm) {
         ("setupGameMessages", "messages"),
         ("setupObjectiveProgress", "progress"),
         ("setupHUDShaker", "element"),
-        ("setupVoipImage", "voip"),
-        ("setupVoiceMeter", "voip"),
         ("setupCinematicSubtitles", "subtitles"),
         ("setupTiles", "image"),
         ("setupEdgePointer", "pointer"),
@@ -1137,6 +1170,16 @@ pub fn install(vm: &mut Vm) {
             Ok(vec![])
         });
     }
+    // setupVoipImage(clientNum): the engine's speaker beside a player's
+    // name: the plain grey speaker (`voice_quiet`), as nobody talks here.
+    reg(vm, n, "setupVoipImage", |_, a| {
+        let u = this(&a, "setupVoipImage")?;
+        with(&u, |e| {
+            e.kind = "image";
+            edit(e, |s| s.material = Some("voice_quiet".to_owned()));
+        });
+        Ok(vec![])
+    });
     reg(vm, n, "setupUIStreamedImage", |_, a| {
         let u = this(&a, "setupUIStreamedImage")?;
         let has_picture = with(&u, |e| {

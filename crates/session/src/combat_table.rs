@@ -65,6 +65,7 @@ pub(crate) fn validated_facts(
         reload_start_add_time_ms: f.reload_start_add_time_ms,
         reload_start_add: f.reload_start_add,
         no_partial_reload: f.no_partial_reload,
+        unlimited_ammo: f.unlimited_ammo,
         dual_mag: f.dual_mag,
         spread_before_fire_add: f.spread_before_fire_add,
         inherits_perks: f.inherits_perks,
@@ -170,6 +171,7 @@ pub fn from_registry(
                 });
             facts.alternate_weapon = weapons.alternate_of(i as u32);
             facts.dual_wield_weapon = weapons.dual_wield_weapon_of(i as u32);
+            facts.retrievable = f.retrievable;
             facts.aim_assist = weapon_iw4::AimAssistRanges {
                 auto_aim: f.auto_aim_range,
                 hip: f.aim_assist_range,

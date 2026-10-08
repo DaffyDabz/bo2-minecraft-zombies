@@ -21,7 +21,7 @@ pub(crate) fn register(app: &mut App) {
     app.add_systems(Update, apply_t6_fog_bank.in_set(frame::RenderSet::Anim));
 }
 
-fn apply_t6_fog_bank(
+pub(crate) fn apply_t6_fog_bank(
     presented: Option<Res<PresentedSnapshot>>,
     local: Option<Res<LocalPresentClient>>,
     scene: Option<ResMut<WorldScene>>,

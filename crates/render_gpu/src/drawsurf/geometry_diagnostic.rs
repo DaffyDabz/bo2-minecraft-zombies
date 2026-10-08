@@ -420,6 +420,12 @@ const T6_OBJECTIVE: u32 = 0x1000_0000;
 /// Prop style bit: an objective surface (bit 2 is free in prop styles: the
 /// blend keeps bits 0..1).
 const STYLE_OBJECTIVE: u16 = 0x04;
+/// Draw-code bit: BO2's projected decal technique (the blood a hit paints
+/// on a zombie): its box paints what lies inside it, from the scene depth.
+const T6_DECAL: u32 = 0x2000_0000;
+/// Prop style bit: a projected decal (lit, so the unlit scale's bit 12 is
+/// free); it draws only with the scene depth (`STYLE_SOFT`, group 3).
+const STYLE_DECAL: u16 = 0x1000;
 
 /// The pipeline style of a prop surface (never lightmapped or layered).
 fn prop_style(code: u32) -> u16 {
@@ -435,6 +441,9 @@ fn prop_style(code: u32) -> u16 {
     }
     if code & T6_OBJECTIVE != 0 {
         style |= STYLE_OBJECTIVE;
+    }
+    if code & T6_DECAL != 0 && code & T6_UNLIT == 0 {
+        style |= STYLE_DECAL;
     }
     style
 }
@@ -482,7 +491,12 @@ fn draw_dynamic_list<'w>(
             .then(|| world_textures.probes.as_ref())
             .flatten()
             .and_then(|_| world_textures.shine.get(&(slot, normal, specular)));
-        let soft_here = soft.filter(|_| soft_code(code));
+        let soft_here = soft.filter(|_| soft_code(code) || decal_code(code));
+        // A projected decal without the scene depth has nothing to paint
+        // (its box itself is never drawn).
+        if decal_code(code) && soft_here.is_none() {
+            continue;
+        }
         let style = prop_style(code)
             | if shine_group.is_some() { STYLE_SHINE } else { 0 }
             | if soft_here.is_some() { STYLE_SOFT } else { 0 };
@@ -535,10 +549,19 @@ fn soft_code(code: u32) -> bool {
     code != T6_NONE && code & T6_EFFECT != 0 && code & T6_CLOUD == 0 && t6_blended(code)
 }
 
+/// bo2zm M4 retest 5: a projected decal code (lit, not an effect).
+fn decal_code(code: u32) -> bool {
+    code != T6_NONE && code & T6_DECAL != 0 && code & T6_UNLIT == 0 && code & T6_EFFECT == 0
+}
+
 /// bo2zm: a prop or dynamic code that can draw with shine: lit, opaque or
-/// blended (glass), not an effect.
+/// blended (glass), not an effect or a projected decal.
 fn prop_shine_code(code: u32) -> bool {
-    code != T6_NONE && code & T6_UNLIT == 0 && code & 3 <= 1 && code & T6_EFFECT == 0
+    code != T6_NONE
+        && code & T6_UNLIT == 0
+        && code & 3 <= 1
+        && code & T6_EFFECT == 0
+        && code & T6_DECAL == 0
 }
 
 /// Style bits of a lit lightmapped style's extra layers (12..15).
@@ -702,6 +725,13 @@ impl SpecializedRenderPipeline for DiagnosticPipeline {
                                 defs.push("SOFT".into());
                             }
                         }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & STYLE_DECAL != 0
+                            && style & STYLE_SOFT != 0
+                        {
+                            defs.push("DECAL".into());
+                            defs.push("SOFT".into());
+                        }
                         if style_layers(style) {
                             defs.push("LAYERS".into());
                             for (k, shift) in [(1, 12), (2, 14)] {
@@ -737,7 +767,8 @@ impl SpecializedRenderPipeline for DiagnosticPipeline {
                     self.lightmap_layout.clone(),
                 ],
                 DiagnosticTess::PropTextured(style)
-                    if style & STYLE_SOFT != 0 && style & T6_EFFECT as u16 != 0 =>
+                    if style & STYLE_SOFT != 0
+                        && (style & T6_EFFECT as u16 != 0 || style & STYLE_DECAL != 0) =>
                 {
                     vec![
                         self.view_layout.clone(),
@@ -1840,7 +1871,7 @@ fn prepare_views(
                 if prop_shine_code(code) {
                     styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SHINE));
                 }
-                if soft_code(code) {
+                if soft_code(code) || decal_code(code) {
                     styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SOFT));
                 }
             }

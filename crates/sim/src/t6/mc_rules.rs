@@ -14,7 +14,7 @@
 //!   closer, the clock waits at midnight for the round, sunset warns a player
 //!   underground, and falls hurt through BO2's own player damage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bevy_ecs::prelude::{Resource, World};
 use gsc_t6::{Array, HookAction, Key, ObjKind, ObjRef, Value, Vm};
@@ -62,6 +62,9 @@ pub(crate) struct McRules {
     puppet: Option<u32>,
     puppet_anim: Option<String>,
     use_was: bool,
+    /// The bread buy's trigger (entity number), and use held last tick.
+    bread: Option<u32>,
+    bread_use_was: bool,
     perks_on: Option<i64>,
     /// The rules side's own clock while the world side runs none: ticks
     /// and paused.
@@ -75,6 +78,52 @@ pub(crate) struct McRules {
     /// His most health last tick: Juggernog's rise comes as full golden
     /// hearts (BO2's regen, which would fill them, is off).
     max_seen: i32,
+    /// TranZit's bus at the start, and it has come and gone.
+    bus: Option<Bus>,
+    bus_done: bool,
+    /// Round 1 waits for the bus to leave (BO2's `round_start` held), and
+    /// since when.
+    round_held: Option<i64>,
+    /// The chat's /round ended this round: the next comes at once, no day.
+    jump_night: bool,
+    /// The dimension the zombies were last put in (a portal trip raises
+    /// them all again near the players).
+    dimension_seen: u8,
+    /// Zombies already seen dead (each drops at most once).
+    seen_dead: HashSet<u32>,
+    /// The souls round under way, and where the last enemy fell (its Max
+    /// Ammo drops there).
+    souls: Option<Souls>,
+    last_kill: Option<[f32; 3]>,
+    /// The house's door buys (trigger entities), and use held last tick.
+    house_doors: Option<[u32; 2]>,
+    door_use_was: bool,
+    /// The vault door's buy trigger, and use held last tick.
+    vault_door: Option<u32>,
+    vault_use_was: bool,
+    /// The windows' rebuild triggers, and when the next board goes up while
+    /// he holds use.
+    window_trigs: Option<Vec<u32>>,
+    board_at: Option<i64>,
+    /// Animations the glue plays on its own models: entity -> (anim,
+    /// start ms, looping); a finished one holds its last frame.
+    anims: HashMap<u32, (String, i64, bool)>,
+    last_ms: i64,
+    /// Monkey bombs he had when the box gave him more (they add up).
+    monkeys_before: Option<i32>,
+}
+
+/// The bus's run: its model and the driver's, the stage and when it began,
+/// its x (map) and speed once it drives off.
+struct Bus {
+    model: u32,
+    driver: u32,
+    stage: u8,
+    at: i64,
+    x: f32,
+    speed: f32,
+    /// When a player was last seen aboard (the doors shut 2 s after).
+    aboard_at: i64,
 }
 
 /// Guns he may own at once (playtest 1b: every gun is an item in its own
@@ -114,7 +163,7 @@ fn clock_live() -> bool {
 
 /// A request for the world side, dropped when none runs (they would pile
 /// up).
-fn push(r: Request) {
+pub(super) fn push(r: Request) {
     if world_side() || fake_day() {
         bo2mc::push(r);
     }
@@ -215,30 +264,6 @@ impl Shift {
     }
 }
 
-/// Where the wall buys go: (map point on the wall, the yaw the wall faces
-/// into the room). The long walls first (round the box, the doors and
-/// Pack-a-Punch), then the short walls between the perk machines.
-fn wall_spots() -> Vec<([f32; 3], f32)> {
-    const B: f32 = 36.0;
-    // At his eye (60): the wall buy is used by looking at its chalk from
-    // right in front of it.
-    const Z: f32 = 60.0;
-    let hz = bo2mc::ROOM_HALF_Z as f32 + 0.5;
-    let hx = bo2mc::ROOM_HALF_X as f32 + 0.5;
-    let mut out = Vec::new();
-    for dx in [-7, 2, 4, 6] {
-        out.push(([dx as f32 * B, hz * B - 1.0, Z], -90.0));
-    }
-    for dx in [-2, -4, -6, 7] {
-        out.push(([dx as f32 * B, -hz * B + 1.0, Z], 90.0));
-    }
-    for dz in [-1, 1] {
-        out.push(([-hx * B + 1.0, -(dz as f32) * B, Z], 0.0));
-        out.push(([hx * B - 1.0, -(dz as f32) * B, Z], 180.0));
-    }
-    out
-}
-
 /// The player starts: round the middle of the room, facing the north door.
 fn start_spots() -> Vec<[f32; 3]> {
     [[0, 0], [1, 0], [-1, 0], [0, 1], [1, 1], [-1, 1], [2, 0], [-2, 0]]
@@ -247,15 +272,69 @@ fn start_spots() -> Vec<[f32; 3]> {
         .collect()
 }
 
+/// A copy of the wall buy selling `from` (its structs, renamed) selling
+/// `to` instead: the frag grenades (10-07, his ask: grenades are bought,
+/// and Nuketown has no frag chalk; BO2 has none, it uses the Semtex
+/// grenade's) and the vault's rare weapons (no chalk: their sign says it).
+fn clone_wallbuy(ents: &mut Vec<Vec<(String, String)>>, from: &str, to: &str) {
+    let is_from = |e: &Vec<(String, String)>| {
+        get(e, "classname") == Some("script_struct")
+            && matches!(get(e, "targetname"), Some("weapon_upgrade" | "claymore_purchase"))
+            && get(e, "zombie_weapon_upgrade") == Some(from)
+    };
+    let Some(source) = ents.iter().find(|e| is_from(e)).cloned() else {
+        diag::warn!(Sim, "bo2mc map: no {from} wall buy to copy for {to}");
+        return;
+    };
+    let suffix = format!("_bo2mc_{to}");
+    let rename = |e: &mut Vec<(String, String)>, top: bool| {
+        for k in ["targetname", "target"] {
+            if let Some(v) = get(e, k).filter(|_| k == "target" || !top).map(|v| format!("{v}{suffix}")) {
+                set(e, k, v);
+            }
+        }
+    };
+    let mut top = source;
+    rename(&mut top, true);
+    set(&mut top, "zombie_weapon_upgrade", to.to_owned());
+    let mut out = vec![top];
+    // Its chalk and model structs (two levels of `target`).
+    let mut want: Vec<String> = get(&out[0], "target").map(|t| t.trim_end_matches(suffix.as_str()).to_owned()).into_iter().collect();
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for e in ents.iter() {
+            if get(e, "classname") != Some("script_struct") || !want.iter().any(|w| get(e, "targetname") == Some(w)) {
+                continue;
+            }
+            let mut c = e.clone();
+            if let Some(t) = get(&c, "target") {
+                next.push(t.to_owned());
+            }
+            // Its model stays the copied one's: BO2 sizes the use box
+            // from it (a model the map has not loaded gives no box, and
+            // no buy). The gun that slides out is the weapon's own
+            // (`wallbuys::world_field`).
+            rename(&mut c, false);
+            out.push(c);
+        }
+        want = next;
+    }
+    diag::info!(Sim, "bo2mc map: {to} wall buy added ({} structs, a copy of {from})", out.len());
+    ents.extend(out);
+}
+
 /// Nuketown's map entities on the block world: what makes no sense there
 /// goes, the starts, the box and the wall buys move into the spawn room.
 pub(super) fn filter_map_entities(ents: &mut Vec<Vec<(String, String)>>) {
     let before = ents.len();
     ents.retain(|e| keep(e));
     let dropped = before - ents.len();
+    clone_wallbuy(ents, "sticky_grenade_zm", "frag_grenade_zm");
+    for c in bo2mc::CHALKS.iter().filter(|c| matches!(c.wall, bo2mc::ChalkWall::VaultWest | bo2mc::ChalkWall::VaultEast) && !c.weapon.is_empty()) {
+        clone_wallbuy(ents, "ak74u_zm", c.weapon);
+    }
     let (start_pos, start_yaw) = bo2mc::player_start();
     let starts = start_spots();
-    let walls = wall_spots();
     let (box_pos, box_face) = bo2mc::box_spot();
     // Rigid moves for groups: by the targetname of the structs they reach.
     let mut by_target: BTreeMap<String, Shift> = BTreeMap::new();
@@ -267,10 +346,16 @@ pub(super) fn filter_map_entities(ents: &mut Vec<Vec<(String, String)>>) {
         let origin = vec3(get(e, "origin"));
         let yaw = vec3(get(e, "angles"))[1];
         if cls == "script_struct" && noteworthy == "initial_spawn" {
-            let p = starts[n_start % starts.len()];
+            // In the bus (TranZit's arrival), else in the room.
+            let (p, yaw) = if bo2mc::bus_on() {
+                let s = bo2mc::bus_starts();
+                s[n_start % s.len()]
+            } else {
+                (starts[n_start % starts.len()], start_yaw)
+            };
             n_start += 1;
             set(e, "origin", text3([p[0], p[1], p[2] + 1.0]));
-            set(e, "angles", text3([0.0, start_yaw, 0.0]));
+            set(e, "angles", text3([0.0, yaw, 0.0]));
         } else if cls == "script_struct" && targetname == "player_respawn_point" {
             set(e, "origin", text3([start_pos[0], start_pos[1], start_pos[2] + 1.0]));
             set(e, "angles", text3([0.0, start_yaw, 0.0]));
@@ -286,7 +371,9 @@ pub(super) fn filter_map_entities(ents: &mut Vec<Vec<(String, String)>>) {
                 "weapon_upgrade" | "tazer_upgrade" | "bowie_upgrade" | "claymore_purchase"
             )
         {
-            let Some(&(p, face)) = walls.get(n_wall) else {
+            let weapon = get(e, "zombie_weapon_upgrade").unwrap_or("").to_owned();
+            let Some((p, face)) = bo2mc::chalk_of(&weapon).map(|c| c.spot()) else {
+                diag::warn!(Sim, "bo2mc map: wall buy {weapon:?} has no chalk spot, left where it was");
                 continue;
             };
             n_wall += 1;
@@ -357,8 +444,10 @@ pub(super) fn install(vm: &mut Vm<World>) {
         ("maps/mp/zm_nuked_perks", "perks_from_the_sky", perks_in_the_room),
         ("maps/mp/zombies/_zm", "init", before_zm_init),
         ("maps/mp/zombies/_zm", "round_over", round_over),
+        ("maps/mp/zombies/_zm", "round_start", round_start),
         ("maps/mp/zombies/_zm_zonemgr", "create_spawner_list", spawner_list),
         ("maps/mp/zm_nuked", "include_powerups", include_powerups),
+        ("maps/mp/zm_nuked", "custom_add_weapons", prison_weapons),
         ("maps/mp/zombies/_zm_powerups", "func_should_drop_carpenter", yes),
         ("maps/mp/zombies/_zm_powerups", "start_carpenter", carpenter),
         ("maps/mp/zombies/_zm_powerups", "start_carpenter_new", carpenter),
@@ -368,6 +457,12 @@ pub(super) fn install(vm: &mut Vm<World>) {
         // Playtest 1b: every gun is an item in its own slot; a wall buy or
         // a box gun never replaces the one in his hands.
         ("maps/mp/zombies/_zm_utility", "get_player_weapon_limit", gun_limit),
+        // 10-07: grenades, claymores and monkey bombs are items: none come
+        // free each round, they come from the chalk and the box.
+        ("maps/mp/zombies/_zm", "award_grenades_for_survivors", nothing),
+        ("maps/mp/zombies/_zm_weap_claymore", "give_claymores_after_rounds", nothing),
+        ("maps/mp/zombies/_zm_magicbox", "treasure_chest_canplayerreceiveweapon", monkeys_in_box),
+        ("maps/mp/zombies/_zm_weap_cymbal_monkey", "player_give_cymbal_monkey", monkeys_given),
     ];
     for (script, name, hook) in hooks {
         if !vm.hook_function(script, name, *hook) {
@@ -396,6 +491,44 @@ fn yes(_: &mut Vm<World>, _: &mut World, _: &Value, _: &[Value]) -> HookAction {
 
 fn gun_limit(_: &mut Vm<World>, _: &mut World, _: &Value, _: &[Value]) -> HookAction {
     HookAction::Return(Value::Int(GUN_LIMIT))
+}
+
+/// Monkey bombs a box hit gives (BO2's own three), on top of his.
+const MONKEYS_PER_BOX: i32 = 3;
+
+/// His monkey bombs and how many he can carry (0, 0 without any).
+fn monkey_count(world: &mut World) -> (Option<u32>, i32, i32) {
+    let Ok(w) = super::weapon(world, "cymbal_monkey_zm") else {
+        return (None, 0, 0);
+    };
+    let f = frame(world);
+    let cap = f.combat_facts_for(w).map_or(0, |c| c.clip_size);
+    let held = f.player(ClientId(0)).is_some_and(|ps| ps.weapons.contains(&(w as i32)));
+    let n = if held { crate::script_player::ammo_clip(&f, ClientId(0), w) } else { 0 };
+    (Some(w), n, cap)
+}
+
+/// The box offers monkey bombs to him while he has room for more (BO2
+/// never offers a weapon he holds).
+fn monkeys_in_box(vm: &mut Vm<World>, world: &mut World, _: &Value, args: &[Value]) -> HookAction {
+    if !bo2mc::enabled() || args.get(1).is_none_or(|w| vm.to_text(w) != "cymbal_monkey_zm") {
+        return HookAction::Continue;
+    }
+    let (_, n, cap) = monkey_count(world);
+    if n > 0 && n < cap {
+        return HookAction::Return(Value::Int(1));
+    }
+    HookAction::Continue
+}
+
+/// The box gives him monkey bombs: they add to the ones he has (set in
+/// `publish_player` once BO2 has given them).
+fn monkeys_given(_: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value]) -> HookAction {
+    if bo2mc::enabled() {
+        let (_, n, _) = monkey_count(world);
+        world.resource_mut::<McRules>().monkeys_before = Some(n);
+    }
+    HookAction::Continue
 }
 
 /// Nuketown lifts its machines into the sky and drops them over the
@@ -486,15 +619,31 @@ fn round_over(vm: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value]) -> 
         let f = vm.intern("round_number");
         vm.raw_field(vm.level, f).as_int().unwrap_or(0)
     };
+    let mut souls = false;
+    let mut jump = false;
     if let Some(mut r) = world.get_resource_mut::<McRules>() {
+        jump = std::mem::take(&mut r.jump_night);
         r.holding = true;
-        r.holding_since = now;
-        r.morning_seen = false;
+        // The chat's /round: night again at once (no clock: no ten seconds).
+        r.holding_since = if jump { now - 10_000 } else { now };
+        r.morning_seen = jump;
         r.paused = false;
+        if let Some(s) = r.souls.as_mut() {
+            s.zombies_done = true;
+            souls = true;
+        }
+    }
+    if souls {
+        diag::info!(Sim, "bo2mc round {} zombies done at {}s: the souls round waits for its hounds and wolves", round - 1, now / 1000);
+        return HookAction::Redirect(wait, vec![name]);
+    }
+    if bo2mc::endless() {
+        diag::info!(Sim, "bo2mc round {} over at {}s in {}: round {round} comes in ten seconds", round - 1, now / 1000, bo2mc::dimension_name(bo2mc::dimension()));
+        return HookAction::Redirect(wait, vec![name]);
     }
     if clock_live() {
         push_clock(world, Request::PauseDay(false));
-        push_clock(world, Request::SetDay(DAWN));
+        push_clock(world, Request::SetDay(if jump { NIGHTFALL } else { DAWN }));
     }
     diag::info!(
         Sim,
@@ -504,6 +653,36 @@ fn round_over(vm: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value]) -> 
         bo2mc::day_ticks()
     );
     HookAction::Redirect(wait, vec![name])
+}
+
+/// Round 1 (BO2's `round_start`) waits while the bus is still at the stop:
+/// it starts when the bus has gone.
+fn round_start(_: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value]) -> HookAction {
+    if !bo2mc::enabled() || !bo2mc::bus_on() {
+        return HookAction::Continue;
+    }
+    let now = world.resource::<Zm>().now_ms;
+    let Some(mut r) = world.get_resource_mut::<McRules>() else {
+        return HookAction::Continue;
+    };
+    if r.bus_done || r.round_held.is_some() {
+        return HookAction::Continue;
+    }
+    r.round_held = Some(now);
+    diag::info!(Sim, "bo2mc bus: round 1 waits for the bus at {}s", now / 1000);
+    HookAction::Return(Value::Undefined)
+}
+
+/// The bus has gone (or never came): round 1 starts.
+fn release_round(world: &mut World, now: i64, why: &str) {
+    if world.resource_mut::<McRules>().round_held.take().is_none() {
+        return;
+    }
+    with_vm(world, |vm, world| {
+        let level = Value::Object(vm.level);
+        vm.spawn_named(world, "maps/mp/zombies/_zm", "round_start", level, vec![]);
+    });
+    diag::info!(Sim, "bo2mc bus: round 1 starts at {}s ({why})", now / 1000);
 }
 
 /// BO2 lists where zombies may spawn each second (`create_spawner_list`):
@@ -535,6 +714,68 @@ fn include_powerups(vm: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value
     let level = Value::Object(vm.level);
     let name = vm.string("carpenter");
     vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "include_powerup", level, vec![name]);
+    HookAction::Continue
+}
+
+/// Mob of the Dead's weapons in the weapon table (the asset lane loads
+/// them when zm_prison's zones are on disk; without them, nothing): name,
+/// its Pack-a-Punch weapon, hint, wall-buy cost, announcer line. Out of the
+/// box (BO2's `include_weapon(name, 0)`); a wall buy at a spot sells one at
+/// its cost and `weapon_give` hands one out. Costs are placeholders.
+const PRISON_WEAPONS: &[(&str, &str, &str, i32, &str)] = &[
+    ("spoon_zm_alcatraz", "", "Spork", 5000, ""),
+    ("spork_zm_alcatraz", "", "Golden Spork", 15000, ""),
+    ("blundergat_zm", "blundergat_upgraded_zm", "Blundergat", 10000, "wpck_shotgun"),
+];
+
+/// Nuketown's weapon table, then Mob of the Dead's ones on top (above).
+fn prison_weapons(vm: &mut Vm<World>, world: &mut World, _: &Value, _: &[Value]) -> HookAction {
+    let level = Value::Object(vm.level);
+    let mut added = Vec::new();
+    for &(name, upgrade, hint, cost, vo) in PRISON_WEAPONS {
+        if super::weapon(world, name).is_err() {
+            continue;
+        }
+        let w = vm.string(name);
+        let args = vec![w.clone(), Value::Int(0)];
+        if vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "include_weapon", level.clone(), args).is_none() {
+            diag::warn!(Sim, "bo2mc weapons: no include_weapon");
+            break;
+        }
+        let up = if upgrade.is_empty() || super::weapon(world, upgrade).is_err() {
+            Value::Undefined
+        } else {
+            let u = vm.string(upgrade);
+            vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "include_weapon", level.clone(), vec![u.clone(), Value::Int(0)]);
+            u
+        };
+        if name.starts_with("spork") || name.starts_with("spoon") {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "register_melee_weapon_for_level", level.clone(), vec![w.clone()]);
+        }
+        // Its prompt is the M14's with its name ("Hold [E] for M14
+        // [Cost: 500]"): Nuketown has no strings for them.
+        let key = format!("BO2MC_WEAPON_{}", name.to_ascii_uppercase());
+        let m14 = world.resource::<Zm>().strings.get("ZOMBIE_WEAPON_M14").filter(|t| t.contains("M14")).cloned();
+        let key = match m14 {
+            Some(t) => {
+                world.resource_mut::<Zm>().strings.insert(key.clone(), t.replace("M14", hint));
+                key
+            }
+            None => hint.to_owned(),
+        };
+        let hint = Value::IStr(vm.intern(&key));
+        let vo = vm.string(vo);
+        let empty = vm.string("");
+        let args = vec![w, up, hint, Value::Int(cost), vo, empty, Value::Undefined];
+        if vm.spawn_named(world, "maps/mp/zombies/_zm_weapons", "add_zombie_weapon", level.clone(), args).is_none() {
+            diag::warn!(Sim, "bo2mc weapons: no add_zombie_weapon");
+            break;
+        }
+        added.push(name);
+    }
+    if !added.is_empty() {
+        diag::info!(Sim, "bo2mc weapons: {} in the weapon table", added.join(" "));
+    }
     HookAction::Continue
 }
 
@@ -583,9 +824,9 @@ fn enable_zones(world: &mut World) {
     }
 }
 
-/// A melee weapon's name (the knife and its upgrades).
-fn is_melee(name: &str) -> bool {
-    ["knife", "bowie", "tazer", "sickle"].iter().any(|k| name.contains(k))
+/// A melee weapon's name (the knife and its upgrades, the vault's Spork).
+pub(super) fn is_melee(name: &str) -> bool {
+    ["knife", "bowie", "tazer", "sickle", "spork", "spoon"].iter().any(|k| name.contains(k))
 }
 
 /// What the world side asks: heal from food, the armor he wears, the item
@@ -607,6 +848,7 @@ fn asks(world: &mut World) {
                 world.resource_mut::<McRules>().armor = (points.max(0.0), toughness.max(0.0));
             }
             Ask::SelectBlock => world.resource_mut::<McRules>().knife = false,
+            Ask::Swing { damage, reach } => swing(world, damage, reach),
             Ask::Select(name) => {
                 let knife = is_melee(&name);
                 world.resource_mut::<McRules>().knife = knife;
@@ -626,6 +868,69 @@ fn asks(world: &mut World) {
             }
         }
     }
+}
+
+/// BO2 damage per point of a Minecraft weapon's attack damage: an iron
+/// sword's 6 is the knife's 150 (a round-one zombie in one swing).
+const SWING_DAMAGE_PER_POINT: f32 = 25.0;
+
+/// His Minecraft weapon or tool's swing. His 10-08: "make the Minecraft
+/// swords do damage to the Nazi zombies, according to what they are ...
+/// that same thing to the other tools". The nearest zombie on his line of
+/// sight within reach takes it, as the knife's melee.
+fn swing(world: &mut World, damage: f32, reach: f32) {
+    let Some(obj) = world.resource::<Zm>().players.get(&0).filter(|p| !p.laststand).map(|p| p.obj) else {
+        return;
+    };
+    let Some((eye, fwd)) = frame(world).player(ClientId(0)).filter(|ps| ps.health > 0).map(|ps| {
+        (
+            [ps.origin[0], ps.origin[1], ps.origin[2] + ps.view_height_current],
+            crate::bullet::angles_to_forward(ps.viewangles),
+        )
+    }) else {
+        return;
+    };
+    let target = {
+        let zm = world.resource::<Zm>();
+        let mut best: Option<(f32, u32, [f32; 3])> = None;
+        for (n, a) in &zm.actors {
+            let Some(e) = zm.ents.get(n).filter(|e| a.alive && !e.hidden) else {
+                continue;
+            };
+            // Its body: a standing cylinder at its feet, the ray's nearest
+            // point to its middle on it.
+            let mid = [e.origin[0], e.origin[1], e.origin[2] + 36.0];
+            let t = (0..3).map(|k| (mid[k] - eye[k]) * fwd[k]).sum::<f32>().clamp(0.0, reach);
+            let p: [f32; 3] = std::array::from_fn(|k| eye[k] + fwd[k] * t);
+            let (dx, dy) = (p[0] - e.origin[0], p[1] - e.origin[1]);
+            if dx * dx + dy * dy <= 20.0 * 20.0
+                && (e.origin[2] - 4.0..=e.origin[2] + 76.0).contains(&p[2])
+                && best.is_none_or(|(b, _, _)| t < b)
+            {
+                best = Some((t, *n, p));
+            }
+        }
+        best
+    };
+    let Some((_, n, point)) = target else { return };
+    let amount = ((damage * SWING_DAMAGE_PER_POINT).round() as i32).max(1);
+    diag::info!(Sim, "bo2mc swing: zombie {n} takes {amount} ({damage:.1} Minecraft damage)");
+    with_vm(world, |vm, world| {
+        super::actors::damage(
+            vm,
+            world,
+            n,
+            Value::Object(obj),
+            Value::Object(obj),
+            amount,
+            0,
+            "MOD_MELEE",
+            "knife_zm",
+            point,
+            fwd,
+            "torso_upper",
+        );
+    });
 }
 
 /// No knife on V (playtest 1): the knife is an item, and with it picked his
@@ -685,6 +990,13 @@ fn publish_player(world: &mut World) {
         if not_an_item(&name) {
             continue;
         }
+        // 10-07: no free frag grenades (BO2 hands them out at the start);
+        // grenades come from the chalk.
+        if name.trim_end_matches("_mp") == "frag_grenade_zm" {
+            crate::script_player::take_weapon(&mut frame(world), client, w);
+            diag::info!(Sim, "bo2mc items: free frag grenades taken");
+            continue;
+        }
         let f = frame(world);
         let class = f.equipment_facts_for(w).map_or(0, |eq| eq.offhand_class);
         let kind = if is_melee(&name) {
@@ -732,7 +1044,43 @@ fn publish_player(world: &mut World) {
             ..WeaponItem::default()
         });
     }
-    let shown: Vec<String> = items.iter().map(|i| format!("{}#{}:{}", i.name, i.index, i.kind)).collect();
+    // The box's monkey bombs add to the ones he had.
+    if let Some(before) = world.resource_mut::<McRules>().monkeys_before.take() {
+        let (w, n, cap) = monkey_count(world);
+        if let Some(w) = w {
+            let want = (before + MONKEYS_PER_BOX).min(cap.max(1));
+            crate::script_player::set_ammo_clip(&mut frame(world), client, w, want);
+            if let Some(i) = items.iter_mut().find(|i| i.index == w) {
+                i.clip = want;
+            }
+            diag::info!(Sim, "bo2mc items: box monkey bombs {before} + {MONKEYS_PER_BOX} -> {want} (had {n} after the give, carry {cap})");
+        }
+    }
+    // His claymores all down: the chalk sells him more (BO2 sells them
+    // once and gives two each round, which is off).
+    if items.iter().any(|i| i.kind == "mine" && i.clip == 0)
+        && let Some(p) = world.resource::<Zm>().players.get(&0).map(|p| p.obj)
+    {
+        let cleared = with_vm(world, |vm, _| {
+            let me = Value::Object(p);
+            let had = !matches!(field(vm, &me, "current_placeable_mine"), Value::Undefined);
+            if had {
+                set_field(vm, p, "current_placeable_mine", Value::Undefined);
+            }
+            had
+        })
+        .unwrap_or(false);
+        if cleared {
+            diag::info!(Sim, "bo2mc items: claymores used up, the chalk sells more");
+        }
+    }
+    let shown: Vec<String> = items
+        .iter()
+        .map(|i| match i.kind {
+            "gun" | "melee" => format!("{}#{}:{}", i.name, i.index, i.kind),
+            _ => format!("{}#{}:{}x{}", i.name, i.index, i.kind, i.clip),
+        })
+        .collect();
     let shown = shown.join(" ");
     if world.resource::<McRules>().items_logged != shown {
         diag::info!(Sim, "bo2mc items: {shown}");
@@ -749,7 +1097,8 @@ fn publish_player(world: &mut World) {
         diag::info!(Sim, "bo2mc: most health {before} -> {}: {gain} golden", ps.max_health);
     }
     world.resource_mut::<McRules>().max_seen = ps.max_health;
-    bo2mc::set_player(ps.health, ps.max_health, items);
+    let perks = world.resource::<Zm>().players.get(&client.0).map_or(Vec::new(), |p| p.perks.iter().cloned().collect());
+    bo2mc::set_player(ps.health, ps.max_health, items, perks);
 }
 
 /// The ammo station (playtest 1): against the east wall between the perk
@@ -833,9 +1182,25 @@ fn puppet_idle(world: &World) -> Option<String> {
     names.iter().find(|k| k.contains("stand") && !k.contains("2")).or(names.first()).map(|s| (*s).clone())
 }
 
-/// The inventory body's idle (looping), for its model row.
+/// An animation's length in ms (None: not loaded).
+fn anim_ms(world: &World, name: &str) -> Option<i64> {
+    let a = world.resource::<Zm>().anims.get(name)?;
+    Some(((f32::from(a.numframes.max(1)) / a.framerate.max(1.0)) * 1000.0).max(1.0) as i64)
+}
+
+/// The glue's models' animations for their model rows: the bus's and its
+/// driver's (`McRules::anims`), the inventory body's idle (looping).
 pub(super) fn puppet_anim(world: &World, n: u32, now: i64) -> Option<(String, f32, f32)> {
     let r = world.get_resource::<McRules>()?;
+    if let Some((name, start, looping)) = r.anims.get(&n) {
+        let length_ms = anim_ms(world, name)?;
+        let t = (now - start).max(0);
+        if *looping {
+            return Some((name.clone(), (t % length_ms) as f32 / length_ms as f32, 1000.0 / length_ms as f32));
+        }
+        let done = t >= length_ms;
+        return Some((name.clone(), (t as f32 / length_ms as f32).min(1.0), if done { 0.0 } else { 1000.0 / length_ms as f32 }));
+    }
     if r.puppet != Some(n) {
         return None;
     }
@@ -952,6 +1317,66 @@ fn ammo_station(world: &mut World, now: i64) {
     diag::info!(Sim, "bo2mc ammo station at {}s: {name} {what} ({score} points, cost {cost})", now / 1000);
 }
 
+fn bread_hint() -> String {
+    format!("Hold ^3[{{+activate}}]^7 to buy Bread x{} [Cost: {}]", bo2mc::BREAD_COUNT, bo2mc::BREAD_COST)
+}
+
+/// The bread on the house's north wall (his 10-08): twelve loaves into his
+/// Minecraft inventory for 100 points. The loaf itself hangs on the wall
+/// from the world side.
+fn bread_buy(world: &mut World, now: i64) {
+    let client = ClientId(0);
+    let hint = bread_hint();
+    if world.resource::<McRules>().bread.is_none() {
+        let spot = bo2mc::cell_floor(bo2mc::BREAD_CELL.0, bo2mc::BREAD_CELL.1);
+        let n = with_vm(world, |vm, world| {
+            let t = world.resource_mut::<Zm>().alloc_entnum();
+            let tobj = vm.alloc_object(ObjKind::Entity(t));
+            world.resource_mut::<Zm>().ents.insert(
+                t,
+                super::Ent {
+                    obj: Some(tobj),
+                    classname: "trigger_radius_use".into(),
+                    origin: spot,
+                    radius: 40.0,
+                    height: 72.0,
+                    hint: Some(hint.clone()),
+                    ..Default::default()
+                },
+            );
+            t
+        });
+        let Some(n) = n else { return };
+        world.resource_mut::<McRules>().bread = Some(n);
+        diag::info!(Sim, "bo2mc bread: ent {n} on the north wall");
+    }
+    // A fresh press of use while it is the trigger he faces.
+    let held = crate::script_player::buttons(&mut frame(world), client)
+        & (playerstate_iw4::buttons::USE | playerstate_iw4::buttons::USE_RELOAD)
+        != 0;
+    let was = std::mem::replace(&mut world.resource_mut::<McRules>().bread_use_was, held);
+    let facing = world.resource::<Zm>().hints.get(&0).is_some_and(|h| *h == hint);
+    if !held || was || !facing {
+        return;
+    }
+    let score = frame(world).client_meta(client).map_or(0, |m| m.score);
+    let ok = score >= bo2mc::BREAD_COST;
+    let pobj = world.resource::<Zm>().players.get(&0).map(|p| p.obj);
+    with_vm(world, |vm, world| {
+        let Some(p) = pobj else { return };
+        let me = Value::Object(p);
+        if ok {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_score", "minus_to_player_score", me.clone(), vec![Value::Int(bo2mc::BREAD_COST)]);
+        }
+        let sound = vm.string(if ok { "purchase" } else { "no_purchase" });
+        vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "play_sound_on_ent", me, vec![sound]);
+    });
+    if ok {
+        bo2mc::push(Request::Give { item: "minecraft:bread".into(), count: bo2mc::BREAD_COUNT });
+    }
+    diag::info!(Sim, "bo2mc bread at {}s: {} ({score} points)", now / 1000, if ok { "bought" } else { "refused: points" });
+}
+
 /// The level started (map entities, the game type's and the map's main):
 /// the night flag stands set (the game starts at nightfall).
 pub(super) fn level_started(vm: &mut Vm<World>, world: &mut World) {
@@ -981,13 +1406,696 @@ pub(super) fn tick(world: &mut World, now: i64) {
     asks(world);
     buttons(world);
     ammo_station(world, now);
+    bread_buy(world, now);
+    bus_arrival(world, now);
+    house_doors(world, now);
+    vault_door(world, now);
+    windows(world, now);
+    world.resource_mut::<McRules>().last_ms = now;
     inventory_puppet(world);
     publish_player(world);
     spawn_spots(world, now);
     turn_perks_on(world, now);
     night(world, now);
     world_damage(world, now);
+    spectator_unseen(world);
     rise_again_closer(world, now);
+    nether_drops(world, now);
+    souls_round(world, now);
+}
+
+/// The Nether has no blazes: its zombies sometimes drop a blaze rod (one in
+/// `BLAZE_ROD_CHANCE`), for the Eyes of Ender that open the End.
+const BLAZE_ROD_CHANCE: u64 = 6;
+
+fn nether_drops(world: &mut World, now: i64) {
+    let mut seen = std::mem::take(&mut world.resource_mut::<McRules>().seen_dead);
+    let mut dead = Vec::new();
+    {
+        let zm = world.resource::<Zm>();
+        seen.retain(|n| zm.actors.get(n).is_some_and(|a| !a.alive));
+        for (n, a) in &zm.actors {
+            if a.alive || a.scripted.is_some() {
+                continue;
+            }
+            // Hidden: one that rose again elsewhere, not a kill.
+            let Some(e) = zm.ents.get(n) else { continue };
+            if e.hidden || !seen.insert(*n) {
+                continue;
+            }
+            dead.push((*n, e.origin, a.aitype.contains("dog")));
+        }
+    }
+    world.resource_mut::<McRules>().seen_dead = seen;
+    if let Some(&(_, at, _)) = dead.last() {
+        world.resource_mut::<McRules>().last_kill = Some(at);
+    }
+    for (n, at, dog) in dead {
+        let Some(block) = bo2mc::map_to_block([at[0], at[1], at[2] + 8.0]) else {
+            continue;
+        };
+        // A cheap mix of the zombie and the time, a few bits per roll.
+        let mut roll = (u64::from(n).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (now as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)) >> 13;
+        let mut next = |m: u64| {
+            let r = roll % m;
+            roll /= m;
+            r
+        };
+        // His 10-08: "have drops like those mobs? like rotten flesh and
+        // bones": a Minecraft zombie's and skeleton's (0-2 of each), and
+        // rarely a zombie's iron ingot, carrot or potato. Hellhounds drop
+        // nothing.
+        if !dog {
+            let flesh = next(3) as u32;
+            let bones = next(3) as u32;
+            if flesh > 0 {
+                push(Request::Drop { item: "minecraft:rotten_flesh".into(), count: flesh, at: block });
+            }
+            if bones > 0 {
+                push(Request::Drop { item: "minecraft:bone".into(), count: bones, at: block });
+            }
+            if next(RARE_DROP_CHANCE) == 0 {
+                let item = ["minecraft:iron_ingot", "minecraft:carrot", "minecraft:potato"][next(3) as usize];
+                push(Request::Drop { item: item.into(), count: 1, at: block });
+            }
+        }
+        if bo2mc::dimension() == bo2mc::NETHER && next(BLAZE_ROD_CHANCE) == 0 {
+            push(Request::Drop { item: "minecraft:blaze_rod".into(), count: 1, at: block });
+            diag::info!(Sim, "bo2mc nether: zombie {n} dropped a blaze rod at {block:?}");
+        }
+    }
+}
+
+/// One zombie in this many drops an iron ingot, a carrot or a potato
+/// (Minecraft's zombie: 2.5%).
+const RARE_DROP_CHANCE: u64 = 40;
+
+// ------------------------------------------------------------ souls rounds
+
+/// Every fifth round is a souls round, Nacht der Untoten's hellhound round:
+/// thick fog, "Fetch me their souls!", hellhounds and a pack of angry
+/// Minecraft wolves, and no zombies. It is over when every hound and wolf
+/// is dead: the last one drops a Max Ammo and the fog lifts.
+const SOULS_EVERY: i32 = 5;
+
+/// IW4L_BO2MC_SOULS_EVERY=1 makes every round a souls round (hidden tests).
+fn souls_every() -> i32 {
+    std::env::var("IW4L_BO2MC_SOULS_EVERY").ok().and_then(|v| v.parse().ok()).filter(|&n| n > 0).unwrap_or(SOULS_EVERY)
+}
+/// The longest the next round waits on a hound or wolf nobody can reach.
+const SOULS_GIVE_UP_MS: i64 = 120_000;
+
+#[derive(Default)]
+struct Souls {
+    round: i32,
+    started: i64,
+    zombies_done: bool,
+    /// The hellhounds (actor numbers).
+    dogs: Vec<u32>,
+    /// Hellhounds still owed: none came when the round began (no spawn
+    /// spots yet), so they are tried again each second.
+    owed: usize,
+    retry_at: i64,
+}
+
+fn start_souls(world: &mut World, now: i64, round: i32) {
+    let wolves = (3 + round / 10).min(6) as u32;
+    // Nacht der Untoten's solo dog round: six hounds, more each time.
+    let want = ((5 + round / 5) as usize).min(12);
+    let dogs = super::mc_dogs::spawn(world, round, want);
+    let hounds = dogs.len();
+    let owed = if dogs.is_empty() { want } else { 0 };
+    world.resource_mut::<McRules>().souls =
+        Some(Souls { round, started: now, zombies_done: false, dogs, owed, retry_at: now + 1000 });
+    world.resource_mut::<McRules>().last_kill = None;
+    bo2mc::set_souls_fog(true);
+    souls_music(world, "dog_start");
+    push(Request::Notice { text: "Fetch me their souls!".into(), seconds: 5.0 });
+    push(Request::SoulsWolves { count: wolves });
+    diag::info!(Sim, "bo2mc souls round {round} at {}s: {hounds} hellhounds, {wolves} wolves, fog in", now / 1000);
+}
+
+/// BO2's own dog-round audio: the music state (`dog_start` / `dog_end`) and,
+/// at the start, the round sting and the announcer (`play_dog_round`).
+fn souls_music(world: &mut World, state: &str) {
+    let player = world.resource::<Zm>().players.get(&0).map(|p| p.obj);
+    with_vm(world, |vm, world| {
+        let level = Value::Object(vm.level);
+        let s = vm.string(state);
+        vm.spawn_named(world, "maps/mp/zombies/_zm_audio", "change_zombie_music", level, vec![s]);
+        if state == "dog_start"
+            && let Some(p) = player
+        {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_ai_dogs", "play_dog_round", Value::Object(p), vec![]);
+        }
+    });
+}
+
+fn souls_round(world: &mut World, now: i64) {
+    let Some((round, started, done, dogs)) =
+        world.resource::<McRules>().souls.as_ref().map(|s| (s.round, s.started, s.zombies_done, s.dogs.clone()))
+    else {
+        return;
+    };
+    if let Some(at) = bo2mc::take_souls_wolf_death() {
+        world.resource_mut::<McRules>().last_kill = Some(at);
+    }
+    // Nacht's dog round has no zombies: BO2's round queue stays empty, so
+    // the round's zombies are "done" at once and only hounds and wolves come.
+    if !done {
+        with_vm(world, |vm, _| {
+            for name in ["zombie_total", "zombie_total_subtract"] {
+                let f = vm.intern(name);
+                vm.set_raw_field(vm.level, f, Value::Int(0));
+            }
+        });
+    }
+    let (owed, retry_at) = world.resource::<McRules>().souls.as_ref().map_or((0, 0), |s| (s.owed, s.retry_at));
+    if owed > 0 {
+        if now >= retry_at {
+            let more = super::mc_dogs::spawn(world, round, owed);
+            if let Some(s) = world.resource_mut::<McRules>().souls.as_mut() {
+                s.retry_at = now + 1000;
+                if !more.is_empty() {
+                    diag::info!(Sim, "bo2mc souls round {round}: {} owed hellhounds came", more.len());
+                    s.owed = 0;
+                    s.dogs.extend(more);
+                }
+            }
+        }
+        return;
+    }
+    let dogs_alive = {
+        let zm = world.resource::<Zm>();
+        dogs.iter().filter(|n| zm.actors.get(n).is_some_and(|a| a.alive)).count()
+    };
+    let wolves = bo2mc::souls_wolves();
+    // The wolves join a server tick or two after they are asked for.
+    let settled = now - started >= 5000;
+    let since = world.resource::<McRules>().holding_since;
+    let give_up = done && now - since >= SOULS_GIVE_UP_MS;
+    if !(done && settled && dogs_alive == 0 && wolves == 0) && !give_up {
+        return;
+    }
+    let at = world.resource::<McRules>().last_kill.or_else(|| player_spots(world).first().copied());
+    if let Some(at) = at {
+        with_vm(world, |vm, world| {
+            let name = vm.string("full_ammo");
+            vm.spawn_named(
+                world,
+                "maps/mp/zombies/_zm_powerups",
+                "specific_powerup_drop",
+                Value::Object(vm.level),
+                vec![name, Value::Vec3(at)],
+            );
+        });
+    }
+    bo2mc::set_souls_fog(false);
+    souls_music(world, "dog_end");
+    if clock_live() && !bo2mc::endless() {
+        push_clock(world, Request::PauseDay(false));
+        push_clock(world, Request::SetDay(DAWN));
+    }
+    {
+        let mut r = world.resource_mut::<McRules>();
+        r.souls = None;
+        r.holding_since = now;
+        r.morning_seen = false;
+    }
+    diag::info!(
+        Sim,
+        "bo2mc souls round {round} cleared at {}s{}: Max Ammo at {at:?}, fog lifts",
+        now / 1000,
+        if give_up { format!(" (gave up on {dogs_alive} hounds, {wolves} wolves)") } else { String::new() }
+    );
+}
+
+// ------------------------------------------------------------ TranZit's bus
+
+/// The driver's spot on the bus (from the bus's origin, its frame): his
+/// seat behind the windscreen, on the left, and the way he faces (his
+/// model looks down its -y: 90 faces the road ahead). His 10-08: "the
+/// driver is in front of it" (he sat past the windscreen, at x 385).
+const DRIVER_AT: [f32; 4] = [330.0, 45.0, 40.0, 90.0];
+
+/// `IW4L_BO2MC_DRIVER="x y z yaw"` places him elsewhere (hidden tests).
+fn driver_at() -> [f32; 4] {
+    std::env::var("IW4L_BO2MC_DRIVER")
+        .ok()
+        .and_then(|v| {
+            let n: Vec<f32> = v.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+            (n.len() == 4).then(|| [n[0], n[1], n[2], n[3]])
+        })
+        .unwrap_or(DRIVER_AT)
+}
+/// The bus's top speed and how fast it gets there (map units, seconds).
+const BUS_TOP_SPEED: f32 = 500.0;
+const BUS_ACCEL: f32 = 120.0;
+/// It is gone (hidden) once its origin passes this x: near the road's end.
+const BUS_GONE_X: f32 = 50.0 * 36.0;
+/// The longest the doors stay open with someone still aboard.
+/// The longest round 1 waits for the bus (from when BO2 would start it).
+const ROUND_HOLD_MAX_MS: i64 = 180_000;
+const BUS_WAIT_MS: i64 = 45_000;
+
+/// A script model of the glue's own, standing at `origin`.
+fn new_model(world: &mut World, model: &str, origin: [f32; 3], yaw: f32) -> Option<u32> {
+    with_vm(world, |vm, world| {
+        let n = world.resource_mut::<Zm>().alloc_entnum();
+        let obj = vm.alloc_object(ObjKind::Entity(n));
+        world.resource_mut::<Zm>().ents.insert(
+            n,
+            super::Ent {
+                obj: Some(obj),
+                classname: "script_model".into(),
+                model: model.into(),
+                origin,
+                angles: [0.0, yaw, 0.0],
+                ..Default::default()
+            },
+        );
+        n
+    })
+}
+
+fn play_anim(world: &mut World, n: u32, anim: &str, now: i64, looping: bool) {
+    if anim_ms(world, anim).is_none() {
+        diag::info!(Sim, "bo2mc bus: no animation {anim}");
+    }
+    world.resource_mut::<McRules>().anims.insert(n, (anim.to_owned(), now, looping));
+}
+
+fn bus_sound(world: &mut World, alias: &str, at: [f32; 3]) {
+    super::natives_fx::sound(world, crate::EventAudience::All, alias, at);
+}
+
+/// bo2mc: the bus's model while it stands at the stop: solid as its own
+/// boxes (`transit`), as TranZit's bus is.
+pub(super) fn parked_bus(world: &World) -> Option<u32> {
+    let bus = world.get_resource::<McRules>()?.bus.as_ref()?;
+    (bus.stage < 5).then_some(bus.model)
+}
+
+/// The players' positions (map).
+fn player_spots(world: &mut World) -> Vec<[f32; 3]> {
+    let clients: Vec<u32> = world.resource::<Zm>().players.keys().copied().collect();
+    let f = frame(world);
+    clients.iter().filter_map(|&c| f.player(ClientId(c)).filter(|p| p.pm_type == 0).map(|p| p.origin)).collect()
+}
+
+/// The arrival (`bo2mc::bus_on`): the bus stands at the road's stop when
+/// the world is in; the driver calls the stop, the doors open, everyone
+/// gets off, the doors shut and the bus drives off east and is gone.
+fn bus_arrival(world: &mut World, now: i64) {
+    if !bo2mc::bus_on() {
+        return;
+    }
+    // A world that never stands (or a bus that never comes) holds no round.
+    if world.resource::<McRules>().round_held.is_some_and(|at| now - at >= ROUND_HOLD_MAX_MS) {
+        world.resource_mut::<McRules>().bus_done = true;
+        release_round(world, now, "the bus never came");
+    }
+    if world.resource::<McRules>().bus_done {
+        release_round(world, now, "the bus has gone");
+        return;
+    }
+    if !bo2mc::room_built() {
+        return;
+    }
+    let Some(bus) = world.resource_mut::<McRules>().bus.take() else {
+        // Put it up once.
+        let o = bo2mc::BUS_ORIGIN;
+        let d = driver_at();
+        let driver_at = [o[0] + d[0], o[1] + d[1], o[2] + d[2]];
+        let (Some(model), Some(driver)) = (new_model(world, "veh_t6_civ_bus_zombie", o, 0.0), new_model(world, "p6_anim_zm_bus_driver", driver_at, d[3])) else {
+            diag::warn!(Sim, "bo2mc bus: its models would not load; no bus");
+            world.resource_mut::<McRules>().bus_done = true;
+            bo2mc::push(Request::BusGone);
+            return;
+        };
+        play_anim(world, model, "v_zombie_bus_all_doors_idle_closed", now, true);
+        play_anim(world, driver, "ai_zombie_bus_driver_idle", now, true);
+        bus_sound(world, "zmb_bus_airbrake", o);
+        diag::info!(Sim, "bo2mc bus: parked at the stop (ents {model}, {driver})");
+        world.resource_mut::<McRules>().bus = Some(Bus { model, driver, stage: 0, at: now, x: o[0], speed: 0.0, aboard_at: now });
+        return;
+    };
+    let mut bus = bus;
+    let o = [bus.x, bo2mc::BUS_ORIGIN[1], bo2mc::BUS_ORIGIN[2]];
+    let front = [o[0] + 337.0, o[1] - 35.0, o[2] + 40.0];
+    let since = now - bus.at;
+    let pick = (now / 7 % 3) as usize;
+    let next = |bus: &mut Bus, stage: u8| {
+        bus.stage = stage;
+        bus.at = now;
+    };
+    match bus.stage {
+        // The driver calls the stop.
+        0 if since >= 2000 => {
+            bus_sound(world, &format!("vox_bus_stop_generic_{pick}"), front);
+            play_anim(world, bus.driver, "ai_zombie_bus_driver_idle_dialog", now, true);
+            next(&mut bus, 1);
+        }
+        // The doors open: everybody off.
+        1 if since >= 2500 => {
+            play_anim(world, bus.model, "v_zombie_bus_all_doors_open", now, false);
+            bus_sound(world, "zmb_bus_door_open", front);
+            bus_sound(world, &format!("vox_bus_doors_open_{}", (now / 11 % 5) as usize), front);
+            diag::info!(Sim, "bo2mc bus: doors open at {}s", now / 1000);
+            bus.aboard_at = now;
+            next(&mut bus, 2);
+        }
+        // Everyone is off (two seconds clear of it), or he stayed too long.
+        2 => {
+            let talking = world.resource::<McRules>().anims.get(&bus.driver).is_some_and(|a| a.0 != "ai_zombie_bus_driver_idle");
+            if since >= 3000 && talking {
+                play_anim(world, bus.driver, "ai_zombie_bus_driver_idle", now, true);
+            }
+            if player_spots(world).iter().any(|p| bo2mc::in_bus(*p)) {
+                bus.aboard_at = now;
+            }
+            if now - bus.aboard_at >= 2000 || since >= BUS_WAIT_MS {
+                next(&mut bus, 3);
+            }
+        }
+        3 => {
+            play_anim(world, bus.model, "v_zombie_bus_all_doors_close", now, false);
+            bus_sound(world, "zmb_bus_door_close", front);
+            bus_sound(world, &format!("vox_bus_doors_close_{}", (now / 13 % 5) as usize), front);
+            play_anim(world, bus.driver, "ai_zombie_bus_driver_idle", now, true);
+            bo2mc::push(Request::BusGone);
+            diag::info!(Sim, "bo2mc bus: everyone off, doors shut at {}s", now / 1000);
+            next(&mut bus, 4);
+        }
+        // The horn, and away.
+        4 if since >= 2500 => {
+            bus_sound(world, "zmb_bus_horn_leave", front);
+            bus_sound(world, "zmb_bus_start_move", o);
+            if let Some(e) = world.resource_mut::<Zm>().ents.get_mut(&bus.model) {
+                e.loop_sound = Some("zmb_bus_exterior_loop".into());
+            }
+            next(&mut bus, 5);
+        }
+        5 => {
+            let dt = ((now - world.resource::<McRules>().last_ms).clamp(0, 200)) as f32 / 1000.0;
+            bus.speed = (bus.speed + BUS_ACCEL * dt).min(BUS_TOP_SPEED);
+            bus.x += bus.speed * dt;
+            let gone = bus.x > BUS_GONE_X;
+            let mut zm = world.resource_mut::<Zm>();
+            if let Some(e) = zm.ents.get_mut(&bus.model) {
+                e.origin[0] = bus.x;
+                e.hidden = gone;
+                if gone {
+                    e.loop_sound = None;
+                }
+            }
+            if let Some(e) = zm.ents.get_mut(&bus.driver) {
+                e.origin[0] = bus.x + driver_at()[0];
+                e.hidden = gone;
+            }
+            if gone {
+                drop(zm);
+                diag::info!(Sim, "bo2mc bus: gone down the road at {}s", now / 1000);
+                let mut r = world.resource_mut::<McRules>();
+                r.bus_done = true;
+                r.anims.remove(&bus.model);
+                r.anims.remove(&bus.driver);
+                return;
+            }
+        }
+        _ => {}
+    }
+    world.resource_mut::<McRules>().bus = Some(bus);
+}
+
+fn door_hint() -> String {
+    format!("Hold ^3[{{+activate}}]^7 to open Door [Cost: {}]", bo2mc::HOUSE_DOOR_COST)
+}
+
+/// The house's doors are bought (`bo2mc::HOUSE_DOOR_COST`, on with the
+/// bus): a buy trigger outside each door while they are locked; a buy
+/// opens the house.
+fn house_doors(world: &mut World, now: i64) {
+    if !bo2mc::bus_on() || !bo2mc::room_built() {
+        return;
+    }
+    let client = ClientId(0);
+    let trigs = match world.resource::<McRules>().house_doors {
+        Some(t) => t,
+        None => {
+            if !bo2mc::doors_locked() {
+                return;
+            }
+            let mut made = Vec::new();
+            for d in bo2mc::DOORS {
+                let spot = d.front(1);
+                let n = with_vm(world, |vm, world| {
+                    let n = world.resource_mut::<Zm>().alloc_entnum();
+                    let obj = vm.alloc_object(ObjKind::Entity(n));
+                    world.resource_mut::<Zm>().ents.insert(
+                        n,
+                        super::Ent {
+                            obj: Some(obj),
+                            classname: "trigger_radius_use".into(),
+                            origin: spot,
+                            radius: 44.0,
+                            height: 72.0,
+                            hint: Some(door_hint()),
+                            ..Default::default()
+                        },
+                    );
+                    n
+                });
+                made.extend(n);
+            }
+            let [a, b] = made[..] else { return };
+            diag::info!(Sim, "bo2mc house: doors locked, buys {a} and {b} ({} points)", bo2mc::HOUSE_DOOR_COST);
+            world.resource_mut::<McRules>().house_doors = Some([a, b]);
+            [a, b]
+        }
+    };
+    if !bo2mc::doors_locked() {
+        return;
+    }
+    let held = crate::script_player::buttons(&mut frame(world), client)
+        & (playerstate_iw4::buttons::USE | playerstate_iw4::buttons::USE_RELOAD)
+        != 0;
+    let was = std::mem::replace(&mut world.resource_mut::<McRules>().door_use_was, held);
+    let hint = door_hint();
+    let facing = world.resource::<Zm>().hints.get(&0).is_some_and(|h| *h == hint);
+    if !held || was || !facing {
+        return;
+    }
+    let Some(me) = frame(world).player(client).map(|p| p.origin) else {
+        return;
+    };
+    // The door he stands at.
+    let door = (0..bo2mc::DOORS.len())
+        .min_by(|&a, &b| {
+            let d = |i: usize| {
+                let o = world.resource::<Zm>().ents.get(&trigs[i]).map_or([0.0; 3], |e| e.origin);
+                (o[0] - me[0]).powi(2) + (o[1] - me[1]).powi(2)
+            };
+            d(a).total_cmp(&d(b))
+        })
+        .unwrap_or(0);
+    let cost = bo2mc::HOUSE_DOOR_COST;
+    let score = frame(world).client_meta(client).map_or(0, |m| m.score);
+    let ok = score >= cost;
+    let pobj = world.resource::<Zm>().players.get(&0).map(|p| p.obj);
+    with_vm(world, |vm, world| {
+        let Some(p) = pobj else { return };
+        let me = Value::Object(p);
+        if ok {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_score", "minus_to_player_score", me.clone(), vec![Value::Int(cost)]);
+        }
+        let sound = vm.string(if ok { "purchase" } else { "no_purchase" });
+        vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "play_sound_on_ent", me, vec![sound]);
+    });
+    diag::info!(Sim, "bo2mc house: door {door} {} at {}s ({score} points)", if ok { "bought" } else { "refused: points" }, now / 1000);
+    if !ok {
+        return;
+    }
+    bo2mc::unlock_doors();
+    bo2mc::push(Request::OpenDoor { door });
+    let mut zm = world.resource_mut::<Zm>();
+    for t in trigs {
+        if let Some(e) = zm.ents.get_mut(&t) {
+            e.trigger_off = true;
+            e.hint = None;
+        }
+    }
+}
+
+fn vault_hint() -> String {
+    format!("Hold ^3[{{+activate}}]^7 to open Door [Cost: {}]", bo2mc::VAULT_DOOR_COST)
+}
+
+/// The vault's door (his 10-07 ask): a buy trigger outside it while it is
+/// locked, `bo2mc::VAULT_DOOR_COST`.
+fn vault_door(world: &mut World, now: i64) {
+    if !bo2mc::room_built() || !bo2mc::vault_locked() {
+        return;
+    }
+    let client = ClientId(0);
+    let trig = match world.resource::<McRules>().vault_door {
+        Some(t) => t,
+        None => {
+            let d = bo2mc::VAULT_DOOR;
+            let spot = bo2mc::cell_floor(d.cell[0] + d.outward[0], d.cell[2] + d.outward[1]);
+            let n = with_vm(world, |vm, world| {
+                let n = world.resource_mut::<Zm>().alloc_entnum();
+                let obj = vm.alloc_object(ObjKind::Entity(n));
+                world.resource_mut::<Zm>().ents.insert(
+                    n,
+                    super::Ent {
+                        obj: Some(obj),
+                        classname: "trigger_radius_use".into(),
+                        origin: spot,
+                        radius: 44.0,
+                        height: 72.0,
+                        hint: Some(vault_hint()),
+                        ..Default::default()
+                    },
+                );
+                n
+            });
+            let Some(n) = n else { return };
+            diag::info!(Sim, "bo2mc vault: door locked, buy {n} at {spot:?} ({} points)", bo2mc::VAULT_DOOR_COST);
+            world.resource_mut::<McRules>().vault_door = Some(n);
+            n
+        }
+    };
+    let held = crate::script_player::buttons(&mut frame(world), client)
+        & (playerstate_iw4::buttons::USE | playerstate_iw4::buttons::USE_RELOAD)
+        != 0;
+    let was = std::mem::replace(&mut world.resource_mut::<McRules>().vault_use_was, held);
+    let hint = vault_hint();
+    let facing = world.resource::<Zm>().hints.get(&0).is_some_and(|h| *h == hint);
+    if !held || was || !facing {
+        return;
+    }
+    let cost = bo2mc::VAULT_DOOR_COST;
+    let score = frame(world).client_meta(client).map_or(0, |m| m.score);
+    let ok = score >= cost;
+    let pobj = world.resource::<Zm>().players.get(&0).map(|p| p.obj);
+    with_vm(world, |vm, world| {
+        let Some(p) = pobj else { return };
+        let me = Value::Object(p);
+        if ok {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_score", "minus_to_player_score", me.clone(), vec![Value::Int(cost)]);
+        }
+        let sound = vm.string(if ok { "purchase" } else { "no_purchase" });
+        vm.spawn_named(world, "maps/mp/zombies/_zm_utility", "play_sound_on_ent", me, vec![sound]);
+    });
+    diag::info!(Sim, "bo2mc vault: door {} at {}s ({score} points)", if ok { "bought" } else { "refused: points" }, now / 1000);
+    if !ok {
+        return;
+    }
+    bo2mc::unlock_vault();
+    bo2mc::push(Request::OpenVault);
+    if let Some(e) = world.resource_mut::<Zm>().ents.get_mut(&trig) {
+        e.trigger_off = true;
+        e.hint = None;
+    }
+}
+
+const REBUILD_HINT: &str = "Hold ^3[{+activate}]^7 to Rebuild Barrier";
+/// Holding use: the first board this long after he presses, then one a
+/// board this often (BO2's pace).
+const BOARD_FIRST_MS: i64 = 500;
+const BOARD_EVERY_MS: i64 = 1000;
+
+/// The windows (`bo2mc::WINDOWS`): a rebuild trigger inside each, shown
+/// while boards are down; holding use nails one back a second, 10 points
+/// each (BO2's barricades, Minecraft's planks).
+fn windows(world: &mut World, now: i64) {
+    if !bo2mc::room_built() {
+        return;
+    }
+    let trigs = match world.resource::<McRules>().window_trigs.clone() {
+        Some(t) => t,
+        None => {
+            let mut made = Vec::new();
+            for w in bo2mc::WINDOWS {
+                let spot = w.inside();
+                let n = with_vm(world, |vm, world| {
+                    let n = world.resource_mut::<Zm>().alloc_entnum();
+                    let obj = vm.alloc_object(ObjKind::Entity(n));
+                    world.resource_mut::<Zm>().ents.insert(
+                        n,
+                        super::Ent {
+                            obj: Some(obj),
+                            classname: "trigger_radius_use".into(),
+                            origin: spot,
+                            radius: 54.0,
+                            height: 72.0,
+                            hint: None,
+                            trigger_off: true,
+                            ..Default::default()
+                        },
+                    );
+                    n
+                });
+                made.extend(n);
+            }
+            diag::info!(Sim, "bo2mc windows: {} rebuild triggers {made:?}", made.len());
+            world.resource_mut::<McRules>().window_trigs = Some(made.clone());
+            made
+        }
+    };
+    // Each trigger on while its window is missing boards.
+    let mut open = Vec::new();
+    {
+        let mut zm = world.resource_mut::<Zm>();
+        for (w, t) in trigs.iter().enumerate() {
+            let missing = bo2mc::boards_up(w).is_some_and(|n| (n as usize) < bo2mc::WINDOW_BOARDS);
+            if let Some(e) = zm.ents.get_mut(t) {
+                e.trigger_off = !missing;
+                e.hint = missing.then(|| REBUILD_HINT.to_string());
+            }
+            if missing {
+                open.push(w);
+            }
+        }
+    }
+    let client = ClientId(0);
+    let held = crate::script_player::buttons(&mut frame(world), client)
+        & (playerstate_iw4::buttons::USE | playerstate_iw4::buttons::USE_RELOAD)
+        != 0;
+    let facing = world.resource::<Zm>().hints.get(&0).is_some_and(|h| h == REBUILD_HINT);
+    if !held || !facing || open.is_empty() {
+        world.resource_mut::<McRules>().board_at = None;
+        return;
+    }
+    let Some(at) = world.resource::<McRules>().board_at else {
+        world.resource_mut::<McRules>().board_at = Some(now + BOARD_FIRST_MS);
+        return;
+    };
+    if now < at {
+        return;
+    }
+    world.resource_mut::<McRules>().board_at = Some(now + BOARD_EVERY_MS);
+    let Some(me) = frame(world).player(client).map(|p| p.origin) else {
+        return;
+    };
+    // The window he stands at.
+    let Some(window) = open.into_iter().min_by(|&a, &b| {
+        let d = |w: usize| {
+            let o = bo2mc::WINDOWS[w].inside();
+            (o[0] - me[0]).powi(2) + (o[1] - me[1]).powi(2)
+        };
+        d(a).total_cmp(&d(b))
+    }) else {
+        return;
+    };
+    bo2mc::push(Request::Rebuild { window });
+    let pobj = world.resource::<Zm>().players.get(&0).map(|p| p.obj);
+    with_vm(world, |vm, world| {
+        let Some(p) = pobj else { return };
+        vm.spawn_named(world, "maps/mp/zombies/_zm_score", "add_to_player_score", Value::Object(p), vec![Value::Int(bo2mc::BOARD_POINTS)]);
+    });
+    diag::info!(Sim, "bo2mc windows: board back in window {window} at {}s (+{})", now / 1000, bo2mc::BOARD_POINTS);
 }
 
 /// Test aid: IW4L_BO2MC_TEST_POINTS=N adds N points once, 5 s in (to buy
@@ -998,7 +2106,11 @@ fn test_points(world: &mut World, now: i64) {
     if n <= 0 || now < 5000 || world.resource::<McRules>().points_given {
         return;
     }
-    let Some(obj) = world.resource::<Zm>().players.get(&0).map(|p| p.obj) else {
+    // Once he is in (his spawn sets the score to the start's 500).
+    if world.resource::<Zm>().wallbuy_since.is_none_or(|t| now - t < 3000) {
+        return;
+    }
+    let Some(obj) = world.resource::<Zm>().players.get(&0).filter(|p| p.begun).map(|p| p.obj) else {
         return;
     };
     world.resource_mut::<McRules>().points_given = true;
@@ -1198,7 +2310,9 @@ fn turn_perks_on(world: &mut World, now: i64) {
 /// Night = round: a finished round waits for nightfall; a round still on
 /// at midnight holds the clock; sunset warns a player underground.
 fn night(world: &mut World, now: i64) {
-    let live = clock_live();
+    // The Nether and the End have no day: BO2's own ten seconds between
+    // rounds, the waves never stop.
+    let live = clock_live() && !bo2mc::endless();
     let t = bo2mc::day_ticks();
     let (holding, since, morning, paused) = {
         let r = world.resource::<McRules>();
@@ -1225,7 +2339,7 @@ fn night(world: &mut World, now: i64) {
             // No clock: BO2's own ten seconds between rounds.
             now - since >= 10_000
         };
-        if fall {
+        if fall && world.resource::<McRules>().souls.is_none() {
             with_vm(world, |vm, world| {
                 let level = Value::Object(vm.level);
                 let name = vm.string(NIGHT);
@@ -1237,6 +2351,9 @@ fn night(world: &mut World, now: i64) {
                 "bo2mc night falls at {}s (clock {t:.0}): round {round} starts",
                 now / 1000
             );
+            if round > 0 && round % souls_every() == 0 {
+                start_souls(world, now, round);
+            }
         }
     } else if live && (MIDNIGHT..DAWN).contains(&t) && !bo2mc::day_paused() && now - since >= 1000 {
         // Asked again (once a second) until the clock says it waits: a
@@ -1265,6 +2382,122 @@ fn night(world: &mut World, now: i64) {
         world.resource_mut::<McRules>().rounds_logged = round;
         diag::info!(Sim, "bo2mc round {round} at {}s (clock {t:.0})", now / 1000);
     }
+    test_souls(world, now, round);
+}
+
+/// The chat's /round <n>: round n, now. In a round, its zombies drop dead
+/// (no power-ups) and BO2's own round end counts on to n, and night comes
+/// again at once; between rounds the coming round is n and night falls
+/// now. Round 1 still waiting for the bus is n when the bus has gone.
+fn jump_round(world: &mut World, now: i64, n: i32) {
+    let n = n.clamp(1, 255);
+    let (holding, held) = {
+        let r = world.resource::<McRules>();
+        (r.holding, r.round_held.is_some())
+    };
+    let between = holding || held;
+    // In a round BO2 adds the one itself as the round ends.
+    let set = if between { n } else { n - 1 };
+    with_vm(world, |vm, _| {
+        let lv = vm.level;
+        let level = Value::Object(lv);
+        set_field(vm, lv, "round_number", Value::Int(set));
+        if between {
+            // Their pace for round n, as round_think sets it at the end of
+            // the round before (round 1's is init's own).
+            let vars = field(vm, &level, "zombie_vars");
+            let easy = field(vm, &level, "gamedifficulty").as_int() == Some(0);
+            let name = if easy { "zombie_move_speed_multiplier_easy" } else { "zombie_move_speed_multiplier" };
+            if let Some(m) = field(vm, &vars, name).as_float()
+                && n > 1
+            {
+                set_field(vm, lv, "zombie_move_speed", Value::Float((n - 1) as f32 * m));
+            }
+        } else {
+            for name in ["zombie_total", "zombie_total_subtract"] {
+                set_field(vm, lv, name, Value::Int(0));
+            }
+        }
+    });
+    if held {
+        diag::info!(Sim, "bo2mc chat: /round {n}: round {n} starts when the bus has gone");
+        return;
+    }
+    if holding {
+        world.resource_mut::<McRules>().morning_seen = true;
+        world.resource_mut::<McRules>().holding_since = now - 10_000;
+        if clock_live() {
+            push_clock(world, Request::PauseDay(false));
+            push_clock(world, Request::SetDay(NIGHTFALL));
+        }
+        diag::info!(Sim, "bo2mc chat: /round {n} between rounds: night falls now");
+        return;
+    }
+    // Every zombie of this round drops; round_wait sees none left.
+    let living: Vec<(u32, ObjRef, [f32; 3], i32)> = {
+        let zm = world.resource::<Zm>();
+        zm.actors
+            .iter()
+            .filter(|(_, a)| a.alive)
+            .filter_map(|(n, a)| Some((*n, a.obj?, zm.ents.get(n)?.origin, a.health)))
+            .collect()
+    };
+    let killed = living.len();
+    with_vm(world, |vm, world| {
+        for (k, obj, at, health) in living {
+            set_field(vm, obj, "no_powerups", Value::Int(1));
+            super::actors::damage(vm, world, k, Value::Object(obj), Value::Object(obj), health + 100, 0, "MOD_UNKNOWN", "none", at, [0.0; 3], "none");
+        }
+    });
+    world.resource_mut::<McRules>().jump_night = true;
+    diag::info!(Sim, "bo2mc chat: /round {n} at {}s: this round's {killed} zombies dropped, round {n} next", now / 1000);
+}
+
+/// The chat's /points: BO2's own score calls, as a buy or a board uses.
+fn chat_points(world: &mut World, amount: i32, set: bool) {
+    let Some(obj) = world.resource::<Zm>().players.get(&0).filter(|p| p.begun).map(|p| p.obj) else {
+        diag::info!(Sim, "bo2mc chat: /points before he is in: dropped");
+        return;
+    };
+    let score = frame(world).client_meta(ClientId(0)).map_or(0, |m| m.score);
+    let add = if set { amount.max(0) - score } else { amount.max(-score) };
+    with_vm(world, |vm, world| {
+        let me = Value::Object(obj);
+        if add > 0 {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_score", "add_to_player_score", me, vec![Value::Int(add)]);
+        } else if add < 0 {
+            vm.spawn_named(world, "maps/mp/zombies/_zm_score", "minus_to_player_score", me, vec![Value::Int(-add)]);
+        }
+    });
+    diag::info!(Sim, "bo2mc chat: /points {add:+} ({score} -> {})", score + add);
+}
+
+/// IW4L_BO2MC_TEST_SOULS=<seconds> (hidden tests): a souls round starts that
+/// many seconds in, whatever the round, so a test can watch it from outside.
+fn test_souls(world: &mut World, now: i64, round: i32) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(at) = std::env::var("IW4L_BO2MC_TEST_SOULS").ok().and_then(|v| v.parse::<i64>().ok()) else {
+        return;
+    };
+    if now < at * 1000 || world.resource::<McRules>().souls.is_some() || DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    start_souls(world, now, round.max(1));
+}
+
+/// A spectator (the chat's /gamemode spectator) is not hunted: BO2's
+/// `ignoreme` on the player while the mode lasts.
+fn spectator_unseen(world: &mut World) {
+    static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let now = bo2mc::game_mode() == bo2mc::SPECTATOR;
+    if WAS.swap(now, std::sync::atomic::Ordering::Relaxed) == now {
+        return;
+    }
+    let Some(obj) = world.resource::<Zm>().players.get(&0).map(|p| p.obj) else {
+        return;
+    };
+    diag::info!(Sim, "bo2mc chat: spectator {now}: zombies ignore him");
+    with_vm(world, |vm, _| set_field(vm, obj, "ignoreme", Value::Int(i32::from(now))));
 }
 
 /// Minecraft's own damage the world side measures (falls as Minecraft
@@ -1272,7 +2505,23 @@ fn night(world: &mut World, now: i64) {
 /// damage, so last stand and game over follow as for any hit. Fire and lava
 /// are cut by armor as in Minecraft; falls, drowning and starving are not.
 fn world_damage(world: &mut World, now: i64) {
-    let events = bo2mc::take_player_events();
+    let mut events = bo2mc::take_player_events();
+    // The chat's /round and /points, whatever state he is in.
+    events.retain(|e| match *e {
+        bo2mc::PlayerEvent::Round(n) => {
+            jump_round(world, now, n);
+            false
+        }
+        bo2mc::PlayerEvent::Points { amount, set } => {
+            chat_points(world, amount, set);
+            false
+        }
+        bo2mc::PlayerEvent::TimeMoved => {
+            world.resource_mut::<McRules>().morning_seen = true;
+            false
+        }
+        _ => true,
+    });
     // Not while the world loads in under him at the start.
     if events.is_empty() || now < 10_000 {
         return;
@@ -1285,12 +2534,30 @@ fn world_damage(world: &mut World, now: i64) {
     if ps.pm_type != 0 || down || ps.health <= 0 {
         return;
     }
-    for bo2mc::PlayerEvent::Damage { amount, cause } in events {
+    let phd = world.resource::<Zm>().players.get(&c).is_some_and(|p| p.perks.contains("specialty_flakjacket"));
+    for event in events {
+        // The chat's /kill and /tp.
+        let (amount, cause) = match event {
+            bo2mc::PlayerEvent::Damage { amount, cause } => (amount, cause),
+            bo2mc::PlayerEvent::Kill => (100_000, "kill"),
+            bo2mc::PlayerEvent::Teleport { to } => {
+                diag::info!(Sim, "bo2mc chat: teleported to {to:?}");
+                super::teleport_player(world, ClientId(c), to);
+                continue;
+            }
+            bo2mc::PlayerEvent::Round(_) | bo2mc::PlayerEvent::Points { .. } | bo2mc::PlayerEvent::TimeMoved => continue,
+        };
         if amount <= 0 {
+            continue;
+        }
+        // PhD Flopper: no fall damage, Minecraft's falls too.
+        if phd && cause == "fall" {
+            diag::info!(Sim, "bo2mc perks: PhD Flopper takes the fall ({amount})");
             continue;
         }
         let means = match cause {
             "lava" | "in_fire" | "on_fire" => "MOD_BURNED",
+            "kill" => "MOD_SUICIDE",
             _ => "MOD_FALLING",
         };
         diag::info!(Sim, "bo2mc {cause}: {amount} damage (health {})", ps.health);
@@ -1346,11 +2613,23 @@ fn rise_again_closer(world: &mut World, now: i64) {
             .filter_map(|(n, a)| Some((*n, a.obj?, zm.ents.get(n)?.origin, a.health)))
             .collect()
     };
+    // A portal trip: the zombies were in the world left behind; once the
+    // room stands in the new one, all of them rise again around the players.
+    let changed = {
+        let d = bo2mc::dimension();
+        let mut r = world.resource_mut::<McRules>();
+        if r.dimension_seen != d && bo2mc::room_built() {
+            r.dimension_seen = d;
+            true
+        } else {
+            false
+        }
+    };
     let mut gone = Vec::new();
     with_vm(world, |vm, world| {
         let emerged = vm.intern("completed_emerging_into_playable_area");
         for (n, obj, at, health) in living {
-            if !gsc_t6::truthy(&vm.raw_field(obj, emerged)) {
+            if !changed && !gsc_t6::truthy(&vm.raw_field(obj, emerged)) {
                 continue;
             }
             let d = players
@@ -1359,6 +2638,9 @@ fn rise_again_closer(world: &mut World, now: i64) {
                 .fold(f32::MAX, f32::min);
             let reason = {
                 let mut zm = world.resource_mut::<Zm>();
+                if changed {
+                    zm.mc.actors.remove(&n);
+                }
                 let st = zm.mc.actors.entry(n).or_default();
                 let best = match st.best {
                     _ if st.clawing => (d, now),
@@ -1366,7 +2648,9 @@ fn rise_again_closer(world: &mut World, now: i64) {
                     _ => (d, now),
                 };
                 st.best = Some(best);
-                if d > 40.0 * 36.0 {
+                if changed {
+                    Some("the world changed")
+                } else if d > 40.0 * 36.0 {
                     Some("far behind")
                 } else if st.clawing && st.claw.is_some_and(|(_, since)| now - since > 10_000) {
                     Some("clawed one spot too long")
@@ -1379,7 +2663,7 @@ fn rise_again_closer(world: &mut World, now: i64) {
                 }
             };
             let Some(reason) = reason else { continue };
-            if gone.len() >= 2 {
+            if gone.len() >= 2 && !changed {
                 break;
             }
             // Back in the round's queue, as the failsafe does it.
@@ -1432,7 +2716,7 @@ fn rise_again_closer(world: &mut World, now: i64) {
 /// here its number goes up when night falls.
 pub(super) fn shown_round(world: &World, round: i32) -> i32 {
     match world.get_resource::<McRules>() {
-        Some(r) if bo2mc::enabled() && r.holding && clock_live() => (round - 1).max(1),
+        Some(r) if bo2mc::enabled() && r.holding && clock_live() && !bo2mc::endless() => (round - 1).max(1),
         _ => round,
     }
 }

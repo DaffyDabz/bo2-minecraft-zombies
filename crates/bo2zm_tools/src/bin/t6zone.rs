@@ -138,6 +138,11 @@ fn report(path: &Path, do_walk: bool) -> Result<ZoneReport, String> {
     let records_end = walk.position();
 
     let image = open_zone(path).map_err(|e| e.to_string())?;
+    // T6ZONE_DUMP=dir: write the inflated image there as <file stem>.img.
+    if let Ok(dir) = std::env::var("T6ZONE_DUMP") {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let _ = std::fs::write(Path::new(&dir).join(format!("{stem}.img")), &image.bytes);
+    }
     if image.game != ZoneGame::T6 {
         return Err(format!("opened as {:?}, not T6", image.game));
     }
@@ -283,6 +288,13 @@ fn report(path: &Path, do_walk: bool) -> Result<ZoneReport, String> {
                     stream.cursor(),
                     trail.join(" > ")
                 );
+                // T6ZONE_STARTS=n: where the last n assets started.
+                if let Some(n) = std::env::var("T6ZONE_STARTS").ok().and_then(|v| v.parse().ok()) {
+                    let from = census.starts.len().saturating_sub(n);
+                    for (cursor, virt, i, t) in &census.starts[from..] {
+                        println!("   start asset {i} {} at {cursor:#x} virtual {virt:#x}", t.name());
+                    }
+                }
                 return Err(format!("walk failed at asset {index} ({})", ty.name()));
             }
         }

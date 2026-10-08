@@ -865,6 +865,21 @@ pub fn sample_client_input(
         };
         let ads = actions.client.using_ads || actions.client.kb.speed.active;
         crate::client::pad_aim::pad_look_frame(&mut actions, &view, &targets, ads);
+        // bo2mc: Deadshot Daiquiri: aiming turns to the nearest zombie head.
+        if ps.perks[0] & weapon_iw4::bo2_perks::PERK_BO2_DEADSHOT != 0 {
+            const HEAD: f32 = 62.0;
+            let heads: Vec<[f32; 3]> = presented
+                .snapshot()
+                .map(|s| t6_zombies(s, local.0))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, o)| [o[0], o[1], o[2] + HEAD])
+                .filter(|h| in_front(*h, 10.0) && visible(*h))
+                .collect();
+            let turn = crate::client::deadshot::frame(eye, angles, &heads, ads, view.fov_scale, view.dt);
+            actions.pad_look_delta[0] += turn[0];
+            actions.pad_look_delta[1] += turn[1];
+        }
     } else {
         actions.pad_look_delta = [0.0; 2];
     }

@@ -78,6 +78,9 @@ pub(crate) struct Actor {
     pub yaw_goal: Option<f32>,
     pub script: String,
     pub scripted: Option<Scripted>,
+    /// `animcustom`: the script function playing its animations; its AI
+    /// waits until that thread ends (Die Rise's Jumping Jack wall leaps).
+    pub custom: Option<gsc_t6::ThreadId>,
     pub traverse: Option<Traverse>,
     pub goal: Option<[f32; 3]>,
     pub goal_sent: bool,
@@ -295,6 +298,22 @@ pub(crate) fn run_script(vm: &mut Vm<World>, world: &mut World, n: u32, script: 
     if script == "claw" {
         return;
     }
+    // Hellhounds (aitype `type` "zombie_dog") run BO2's `zm_dog_*`
+    // animscripts; a state with no dog script (scripted) takes the zombie one.
+    if !script.starts_with("traverse/")
+        && is_dog(vm, obj)
+        && vm
+            .spawn_named(
+                world,
+                &format!("{ANIMSCRIPTS}/zm_dog_{script}"),
+                "main",
+                Value::Object(obj),
+                vec![],
+            )
+            .is_some()
+    {
+        return;
+    }
     let path = if let Some(rest) = script.strip_prefix("traverse/") {
         format!("{ANIMSCRIPTS}/traverse/{rest}")
     } else {
@@ -306,6 +325,13 @@ pub(crate) fn run_script(vm: &mut Vm<World>, world: &mut World, n: u32, script: 
     {
         vm.report_once(format!("no animscript {path}::main"));
     }
+}
+
+/// A hellhound: its aitype sets `type` "zombie_dog" (Nuketown's dog, the
+/// souls round's).
+pub(crate) fn is_dog(vm: &mut Vm<World>, obj: ObjRef) -> bool {
+    let t = field(vm, obj, "type");
+    vm.to_text(&t).eq_ignore_ascii_case("zombie_dog")
 }
 
 /// Field values the engine reads off an actor's script object.
@@ -378,7 +404,15 @@ pub(crate) fn walk_move(
             // monster clip and stand there for good (the sprinters in the
             // clipped ditch behind the ledge, M4 retest 1).
             let inside = f.trace_static_world(end, end, mins, maxs, MASK_AI).startsolid != 0;
-            if !clear || !inside {
+            // A walking step is ~1 unit: one left just inside a window's
+            // clip by its climb-in anim never got a step that ends outside
+            // and stood there till the scripts killed it (Origins round 1
+            // never ended). A step on a heading that is out within 16 units
+            // is fine.
+            let len = (rem[0] * rem[0] + rem[1] * rem[1]).sqrt().max(1e-3);
+            let ahead = [p[0] + rem[0] / len * 16.0, p[1] + rem[1] / len * 16.0, p[2]];
+            let out_ahead = || f.trace_static_world(ahead, ahead, mins, maxs, MASK_AI).startsolid == 0;
+            if !clear || !inside || (len < 16.0 && out_ahead()) {
                 p = end;
             }
             break;
@@ -403,7 +437,28 @@ pub(crate) fn walk_move(
     if t.startsolid != 0 {
         return ([p[0], p[1], from[2]], false);
     }
-    (lerp3(p, down, t.fraction), true)
+    // A brush model under it is ground too, and so is a thin turned box (a
+    // floor slab of a Die Rise elevator car or the crashed escape pod over
+    // its pit: the zombies that came in fell through it).
+    let on = f.trace_world(p, down, mins, maxs, MASK_AI);
+    let frac = if on.startsolid == 0 { on.fraction.min(t.fraction) } else { t.fraction };
+    let mut at = lerp3(p, down, frac);
+    for b in f.oriented_blockers() {
+        if b.maxs[2] - b.mins[2] > 16.0 {
+            continue;
+        }
+        let d = [at[0] - b.origin[0], at[1] - b.origin[1], at[2] - b.origin[2]];
+        let dot = |a: [f32; 3]| a[0] * d[0] + a[1] * d[1] + a[2] * d[2];
+        let (lx, ly) = (dot(b.axis[0]), dot(b.axis[1]));
+        if lx < b.mins[0] || lx > b.maxs[0] || ly < b.mins[1] || ly > b.maxs[1] {
+            continue;
+        }
+        let top = b.origin[2] + b.axis[0][2] * lx + b.axis[1][2] * ly + b.axis[2][2] * b.maxs[2];
+        if top > at[2] && top <= p[2] {
+            at[2] = top;
+        }
+    }
+    (at, true)
 }
 
 /// The node a goal routes to: the nearest one that walks to it.
@@ -436,6 +491,11 @@ pub(crate) fn drop_nodes_to_floor(world: &mut World, nodes: &mut [super::T6PathN
     let f = frame(world);
     let (mut moved, mut total, mut most, mut solid, mut none) = (0usize, 0.0f32, 0.0f32, 0usize, 0usize);
     for n in nodes.iter_mut() {
+        // One on a mover (a Die Rise car) stands on it, not on the floor
+        // under it.
+        if n.spawnflags & super::nav::NODE_ON_MOVER != 0 {
+            continue;
+        }
         let from = [n.origin[0], n.origin[1], n.origin[2] + 16.0];
         let to = [n.origin[0], n.origin[1], n.origin[2] - 512.0];
         let t = f.trace_static_world(from, to, [-4.0, -4.0, 0.0], [4.0, 4.0, 4.0], MASK_AI);
@@ -708,6 +768,15 @@ fn think_one(vm: &mut Vm<World>, world: &mut World, n: u32, now: i64) {
         }
         vm.notify_str(world, obj, "enemy", &[]);
     }
+    // Hellhounds: BO2's engine runs a dog at its enemy (no script gives a
+    // dog a goal); the goal follows the enemy once he is 48 units off it.
+    if let Some(e) = enemy
+        && is_dog(vm, obj)
+        && let Some(p) = pos_of(vm, world, &Value::Object(e))
+        && a.goal.is_none_or(|g| dist2(g, p) > 48.0 * 48.0)
+    {
+        super::natives_ai::set_goal(vm, world, n, p);
+    }
     // Animscript state.
     let me = world
         .resource::<Zm>()
@@ -715,7 +784,14 @@ fn think_one(vm: &mut Vm<World>, world: &mut World, n: u32, now: i64) {
         .get(&n)
         .map(|e| e.origin)
         .unwrap_or([0.0; 3]);
-    let scripted = a.scripted.is_some();
+    let custom = a.custom.is_some_and(|t| vm.thread_running(t));
+    if a.custom.is_some() && !custom {
+        if let Some(act) = world.resource_mut::<Zm>().actors.get_mut(&n) {
+            act.custom = None;
+            act.script.clear();
+        }
+    }
+    let scripted = a.scripted.is_some() || custom;
     let traversing = a.traverse.is_some();
     if !scripted && !traversing && a.script != "init" {
         let fight = field_num(vm, obj, "pathenemyfightdist", 64.0).max(1.0);
@@ -1311,6 +1387,10 @@ fn advance_anim(vm: &mut Vm<World>, world: &mut World, n: u32, obj: ObjRef, now:
         .as_ref()
         .map(|x| x.notifies.clone())
         .unwrap_or_default();
+    // Clips whose notetracks carry their own `end` send it once: a second
+    // one would wake the wait the script starts on the first (the window
+    // boards' tear in, then out, cut the out short).
+    let own_end = notes.iter().any(|(name, _)| name == "end");
     let mut sent = p.sent;
     let mut cur_cycle = p.cycle;
     while cur_cycle < cycle {
@@ -1318,7 +1398,9 @@ fn advance_anim(vm: &mut Vm<World>, world: &mut World, n: u32, obj: ObjRef, now:
         for (name, _) in notes.iter().skip(sent) {
             events.push(name.clone());
         }
-        events.push("end".to_owned());
+        if !own_end {
+            events.push("end".to_owned());
+        }
         sent = 0;
         cur_cycle += 1;
     }
@@ -1331,11 +1413,13 @@ fn advance_anim(vm: &mut Vm<World>, world: &mut World, n: u32, obj: ObjRef, now:
         for (name, _) in notes.iter().skip(sent) {
             events.push(name.clone());
         }
-        events.push("end".to_owned());
+        if !own_end {
+            events.push("end".to_owned());
+        }
         sent = notes.len();
     }
     // Scripted animations move by their root motion from where they began.
-    if a.scripted.is_some()
+    if (a.scripted.is_some() || a.custom.is_some())
         && let Some(anim) = &anim
     {
         let root = anim_root(anim, frac);
@@ -1368,8 +1452,15 @@ fn advance_anim(vm: &mut Vm<World>, world: &mut World, n: u32, obj: ObjRef, now:
         let note = vm.string(&ev);
         vm.notify_str(world, obj, &p.notify, &[note]);
     }
-    // A scripted animation's end hands the actor back to its AI.
-    if finished && a.scripted.is_some() && a.alive {
+    // A scripted animation's end hands the actor back to its AI, unless its
+    // `end` already started the next one (the window boards' tear in, out).
+    let restarted = world
+        .resource::<Zm>()
+        .actors
+        .get(&n)
+        .and_then(|x| x.playing.as_ref())
+        .is_some_and(|q| q.start_ms != p.start_ms || q.state != p.state);
+    if finished && a.scripted.is_some() && a.alive && !restarted {
         if let Some(act) = world.resource_mut::<Zm>().actors.get_mut(&n) {
             act.scripted = None;
             act.script.clear();
@@ -1445,13 +1536,32 @@ pub(crate) fn spawn_actor(
     if let Some(act) = world.resource_mut::<Zm>().actors.get_mut(&n) {
         act.asd = asd;
     }
+    let init = if is_dog(vm, obj) {
+        let f = vm.intern("isdog");
+        vm.set_raw_field(obj, f, Value::Int(1));
+        "zm_dog_init"
+    } else {
+        "zm_init"
+    };
+    let team = field(vm, obj, "team");
     vm.spawn_named(
         world,
-        &format!("{ANIMSCRIPTS}/zm_init"),
+        &format!("{ANIMSCRIPTS}/{init}"),
         "main",
         Value::Object(obj),
         vec![],
     );
+    // zm_init puts every actor on level.zombie_team; the aitype's own team
+    // wins (Origins' giant robots are "neutral": on axis they counted as
+    // round enemies and round 1 never ended).
+    if let Value::Str(_) = team {
+        let f = vm.intern("team");
+        let text = vm.to_text(&team);
+        vm.set_raw_field(obj, f, team);
+        if let Some(act) = world.resource_mut::<Zm>().actors.get_mut(&n) {
+            act.team = text;
+        }
+    }
     if let Some(act) = world.resource_mut::<Zm>().actors.get_mut(&n) {
         act.script.clear();
     }

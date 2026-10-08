@@ -489,6 +489,11 @@ impl<H> Vm<H> {
             && (self.threads[t.index as usize].is_some() || self.running.contains(&t))
     }
 
+    /// Is the thread still running (not returned or ended)?
+    pub fn thread_running(&self, t: ThreadId) -> bool {
+        self.thread_live(t)
+    }
+
     /// Start `func` as a new thread on `self_` and run it until it yields.
     pub fn spawn(&mut self, host: &mut H, func: u32, self_: Value, args: Vec<Value>) -> ThreadId {
         let t = self.new_thread(func, self_, args);
@@ -896,6 +901,16 @@ impl<H> Vm<H> {
                         BinOp::Le => x <= y,
                         _ => x >= y,
                     },
+                    // Strings compare by text (_visionset_mgr::add_sorted_name_key).
+                    (Value::Str(_) | Value::IStr(_), Value::Str(_) | Value::IStr(_)) => {
+                        let (x, y) = (self.to_text(&a), self.to_text(&b));
+                        match op {
+                            BinOp::Lt => x < y,
+                            BinOp::Gt => x > y,
+                            BinOp::Le => x <= y,
+                            _ => x >= y,
+                        }
+                    }
                     _ => {
                         let (Some(x), Some(y)) = (num(&a), num(&b)) else {
                             return Err(format!(
@@ -1269,11 +1284,35 @@ impl<H> Vm<H> {
         )));
     }
 
+    /// The thread's call chain, outermost first: `script::func@addr > ...`.
+    fn frame_chain(&self, program: &Program, th: &Thread) -> String {
+        let chain: Vec<String> = th
+            .frames
+            .iter()
+            .map(|fr| {
+                let func = &program.functions[fr.func as usize];
+                let at = func
+                    .addrs
+                    .get(fr.pc.saturating_sub(1) as usize)
+                    .copied()
+                    .unwrap_or(0);
+                format!(
+                    "{}::{}@{at:#x}",
+                    program.scripts[func.script as usize].name,
+                    self.strings.get(func.name)
+                )
+            })
+            .collect();
+        chain.join(" > ")
+    }
+
     #[allow(clippy::too_many_lines)]
     fn interp(&mut self, host: &mut H, t: ThreadId, th: &mut Thread, program: &Program) -> Outcome {
         let mut r = Ref::default();
         let mut obj: Option<ObjRef> = None;
         let mut steps: u64 = 0;
+        let started = std::time::Instant::now();
+        let mut slow_named = false;
         macro_rules! pop {
             () => {
                 th.stack.pop().unwrap_or_default()
@@ -1292,28 +1331,20 @@ impl<H> Vm<H> {
                 }
             }
             steps += 1;
-            if steps > STEP_LIMIT {
-                let chain: Vec<String> = th
-                    .frames
-                    .iter()
-                    .map(|fr| {
-                        let func = &program.functions[fr.func as usize];
-                        let at = func
-                            .addrs
-                            .get(fr.pc.saturating_sub(1) as usize)
-                            .copied()
-                            .unwrap_or(0);
-                        format!(
-                            "{}::{}@{at:#x}",
-                            program.scripts[func.script as usize].name,
-                            self.strings.get(func.name)
-                        )
-                    })
-                    .collect();
-                fail!(
-                    "thread ran {STEP_LIMIT} instructions without waiting; ended ({})",
-                    chain.join(" > ")
+            // Slow-thread watchdog: a thread that has run 2 s without waiting
+            // names itself on stderr once (the step limit may be far off when
+            // its builtins are slow, and messages only drain after the tick).
+            if steps & 0xFFFF == 0 && !slow_named && started.elapsed().as_secs() >= 2 {
+                slow_named = true;
+                eprintln!(
+                    "bo2zm gsc: thread running {} ms, {steps} instructions without waiting: {}",
+                    started.elapsed().as_millis(),
+                    self.frame_chain(program, th)
                 );
+            }
+            if steps > STEP_LIMIT {
+                let chain = self.frame_chain(program, th);
+                fail!("thread ran {STEP_LIMIT} instructions without waiting; ended ({chain})");
                 return Outcome::Done;
             }
             let Some(frame) = th.frames.last_mut() else {

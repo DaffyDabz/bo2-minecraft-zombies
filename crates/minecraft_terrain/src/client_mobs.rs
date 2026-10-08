@@ -412,6 +412,8 @@ pub struct ClientMob {
     eye_height: f32,
     max_head_y_rot: f32,
     seen: bool,
+    /// Minecraft Zombies: its body falling, once it is dead.
+    ragdoll: Option<crate::ragdoll::Ragdoll>,
 }
 
 impl ClientMob {
@@ -466,6 +468,7 @@ impl ClientMob {
             eye_height: mob.eye_height,
             max_head_y_rot: mob.max_head_y_rot,
             seen: true,
+            ragdoll: None,
         }
     }
 
@@ -655,6 +658,19 @@ impl ClientMob {
         if self.dead {
             self.death_time += 1;
         }
+        // Minecraft Zombies: the dead body falls as a ragdoll from where it
+        // died, pushed the way the killing hit pushed it.
+        if self.dead && (self.ragdoll.is_some() || crate::ragdoll::enabled()) {
+            let (position, motion, body, size) = (self.position, self.position - self.old_position, self.y_body_rot, self.size);
+            let seed = (position.x.to_bits() ^ position.z.to_bits().rotate_left(21) ^ position.y.to_bits().rotate_left(42)) as u32;
+            self.ragdoll
+                .get_or_insert_with(|| crate::ragdoll::Ragdoll::new(position, motion, body, size, seed))
+                .tick(position);
+            if self.death_time % 5 == 1 && std::env::var_os("IW4L_BO2MC_RAGLOG").is_some() {
+                let (feet, pose) = self.ragdoll.unwrap().pose(1.0);
+                eprintln!("ragdoll t{} size {:?} motion {:.2} at {:.2} feet {:.2} rot {:.2} long {:.2}", self.death_time, size, motion, position, feet, pose.rot, pose.rot * glam::Vec3::Z);
+            }
+        }
         // LivingEntity.baseTick ends by keeping the head and body yaw.
         self.y_head_rot_o = self.y_head_rot;
         self.y_body_rot_o = self.y_body_rot;
@@ -734,9 +750,16 @@ impl ClientMob {
     pub fn pose(&self, partial: f32) -> MobPose {
         let head = rot_lerp(partial, self.y_head_rot_o, self.y_head_rot);
         let body = rot_lerp(partial, self.y_body_rot_o, self.y_body_rot);
-        let feet = vec_lerp(self.old_position, self.position, f64::from(partial));
+        let (feet, ragdoll) = match &self.ragdoll {
+            Some(ragdoll) => {
+                let (feet, pose) = ragdoll.pose(partial);
+                (feet, Some(pose))
+            }
+            None => (vec_lerp(self.old_position, self.position, f64::from(partial)), None),
+        };
         MobPose {
             feet,
+            ragdoll,
             body_rot: body,
             head_yaw: wrap_degrees(head - body),
             head_pitch: if partial == 1.0 { self.x_rot } else { lerp(partial, self.x_rot_o, self.x_rot) },
@@ -750,7 +773,8 @@ impl ClientMob {
             rest_start: self.rest_start,
             fly_start: self.fly_start,
             swing: self.swing.swinging().then(|| self.swing.animation(partial)),
-            red_overlay: self.hurt_time > 0 || self.death_time > 0,
+            // A ragdoll is red for vanilla's 20 dying ticks, then lies as it is.
+            red_overlay: self.hurt_time > 0 || (self.death_time > 0 && (self.ragdoll.is_none() || self.death_time <= 20)),
             death_time: if self.death_time > 0 { self.death_time as f32 + partial } else { 0.0 },
         }
     }
@@ -760,6 +784,9 @@ impl ClientMob {
 #[derive(Clone, Copy, Debug)]
 pub struct MobPose {
     pub feet: DVec3,
+    /// Minecraft Zombies: a dead body's fall, which turns it instead of
+    /// vanilla's tip over.
+    pub ragdoll: Option<crate::ragdoll::RagdollPose>,
     /// `bodyRot`, degrees.
     pub body_rot: f32,
     /// `yRot`: the head's yaw from the body, degrees.
@@ -853,6 +880,11 @@ impl MobPose {
     /// then, dying, tipped over about Z by up to `flip_degrees`
     /// (`getFlipDegrees`).
     pub fn body_rotation(&self, flip_degrees: f32) -> glam::Quat {
+        // The cubes drawn next swing loose if this is a ragdoll.
+        crate::ragdoll::set_drawing(self.feet, self.ragdoll);
+        if let Some(ragdoll) = self.ragdoll {
+            return ragdoll.rot;
+        }
         let turn = glam::Quat::from_rotation_y((180.0 - self.body_rot).to_radians());
         if self.death_time > 0.0 {
             let fall = ((self.death_time - 1.0) / 20.0 * 1.6).sqrt().min(1.0);

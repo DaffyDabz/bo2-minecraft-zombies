@@ -65,6 +65,19 @@ pub(crate) struct Move {
     pub rot: Option<Track>,
     /// Launch origin, velocity, start, duration.
     pub gravity: Option<([f32; 3], [f32; 3], i64, i64)>,
+    pub vibe: Option<Vibe>,
+}
+
+/// A `vibrate`: the angles it rocks about, the tilt per degree of
+/// amplitude (pitch, roll), the amplitude, period and time.
+#[derive(Clone, Debug)]
+pub(crate) struct Vibe {
+    base: [f32; 3],
+    tilt: [f32; 2],
+    amp: f32,
+    period_ms: f32,
+    start_ms: i64,
+    dur_ms: i64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,7 +95,7 @@ impl Movers {
             if rot {
                 m.rot = None;
             }
-            if m.pos.is_none() && m.rot.is_none() && m.gravity.is_none() {
+            if m.pos.is_none() && m.rot.is_none() && m.gravity.is_none() && m.vibe.is_none() {
                 self.list.remove(&n);
             }
         }
@@ -128,6 +141,28 @@ impl Movers {
             dur_ms: (secs * 1000.0).round().max(1.0) as i64,
             accel_ms: (accel * 1000.0) as i64,
             decel_ms: (decel * 1000.0) as i64,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn vibrate(
+        &mut self,
+        n: u32,
+        base: [f32; 3],
+        dir: [f32; 3],
+        amp: f32,
+        period: f32,
+        now: i64,
+        secs: f32,
+    ) {
+        let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-3);
+        self.list.entry(n).or_default().vibe = Some(Vibe {
+            base,
+            tilt: [dir[0] / len, dir[1] / len],
+            amp,
+            period_ms: (period * 1000.0).max(1.0),
+            start_ms: now,
+            dur_ms: (secs * 1000.0).round() as i64,
         });
     }
 
@@ -180,7 +215,18 @@ pub(crate) fn advance(world: &mut World, now: i64) {
                     done.push((n, "rotatedone"));
                 }
             }
-            if m.pos.is_none() && m.rot.is_none() && m.gravity.is_none() {
+            if let Some(v) = &m.vibe {
+                let t = now - v.start_ms;
+                if t >= v.dur_ms {
+                    e.angles = v.base;
+                    m.vibe = None;
+                } else {
+                    let fade = 1.0 - t as f32 / v.dur_ms.max(1) as f32;
+                    let w = (std::f32::consts::TAU * t as f32 / v.period_ms).sin() * v.amp * fade;
+                    e.angles = [v.base[0] + w * v.tilt[0], v.base[1], v.base[2] + w * v.tilt[1]];
+                }
+            }
+            if m.pos.is_none() && m.rot.is_none() && m.gravity.is_none() && m.vibe.is_none() {
                 finished.push(n);
             }
         }

@@ -203,3 +203,49 @@ impl GameSettings {
         }
     }
 }
+
+impl GameSettings {
+    /// The name he plays under (lobby, scoreboard, the game's own
+    /// messages): a name his settings give (the family launcher's
+    /// profile), else the Steam account this PC signs into.
+    pub fn shown_name(&self) -> String {
+        if self.player_name == "Player" {
+            steam_name().unwrap_or_else(|| self.player_name.clone())
+        } else {
+            self.player_name.clone()
+        }
+    }
+}
+
+/// The Steam name of the account Steam signs into on this PC (its
+/// `config/loginusers.vdf`: the auto-login one, else the newest), as BO2
+/// shows the player's Steam name; read once.
+pub fn steam_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let root = std::env::var_os("ProgramFiles(x86)")?;
+        let path = std::path::Path::new(&root).join("Steam/config/loginusers.vdf");
+        let text = std::fs::read_to_string(path).ok()?;
+        // Each account is a { } block of "key" "value" lines.
+        let mut best: Option<(bool, u64, String)> = None;
+        for block in text.split('{').skip(2) {
+            let block = block.split('}').next().unwrap_or("");
+            let field = |key: &str| {
+                block.lines().find_map(|l| {
+                    let mut parts = l.split('"').filter(|p| !p.trim().is_empty());
+                    (parts.next()? == key).then(|| parts.next().map(str::to_owned)).flatten()
+                })
+            };
+            let Some(name) = field("PersonaName").filter(|n| !n.trim().is_empty()) else {
+                continue;
+            };
+            let auto = field("AutoLogin").as_deref() == Some("1");
+            let time = field("Timestamp").and_then(|t| t.parse().ok()).unwrap_or(0);
+            if best.as_ref().is_none_or(|b| (auto, time) > (b.0, b.1)) {
+                best = Some((auto, time, name));
+            }
+        }
+        best.map(|(_, _, n)| n.trim().chars().take(16).collect())
+    })
+    .clone()
+}

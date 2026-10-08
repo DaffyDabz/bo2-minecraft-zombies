@@ -93,7 +93,14 @@ pub fn drive_class_select_screen(
         }
         return;
     }
+    // A loading screen that asked to stay up a little longer.
+    if loading.as_deref().is_some_and(LoadingScreen::held) {
+        return;
+    }
     // The load ends here, with or without a screen over it.
+    if let Some(l) = loading.as_deref() {
+        diag::info!(Ui, "loading: load done at {} ms", l.elapsed().as_millis());
+    }
     if let Some(load) = load.as_deref_mut() {
         load.finish();
     }

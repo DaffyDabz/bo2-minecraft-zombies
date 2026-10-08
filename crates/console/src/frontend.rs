@@ -521,7 +521,7 @@ pub(crate) fn route(
             _ => {}
         }
     }
-    let mut lobby_names = vec![settings.player_name.clone()];
+    let mut lobby_names = vec![settings.shown_name()];
     if state.public
         && let Some(bridge) = services.bridge.as_ref()
     {

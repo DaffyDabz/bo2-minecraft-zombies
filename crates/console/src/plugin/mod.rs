@@ -132,6 +132,7 @@ impl Plugin for ConsolePlugin {
                     isolate_gameplay_input,
                     drive_scripted_keys,
                     drive_scripted_mouse,
+                    minecraft_chat_keys,
                     expire_pressed_inputs,
                     publish_client_action_input,
                     sync_cursor_grab,
@@ -277,6 +278,105 @@ fn isolate_gameplay_input(
     for _ in mouse.read() {}
 }
 
+/// bo2mc: Minecraft's chat. T opens it, / opens it on a slash; what is typed
+/// goes on its line, Enter sends it (to `chat_submitted`), Esc closes it,
+/// Up and Down bring back lines sent before. While it is open the keyboard
+/// and the mouse buttons are its alone.
+fn minecraft_chat_keys(
+    console: Res<ConsoleState>,
+    ui: Option<ResMut<frame::MinecraftUi>>,
+    mut events: MessageReader<KeyboardInput>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut buttons: ResMut<ButtonInput<MouseButton>>,
+    mut history: Local<(Vec<String>, Option<usize>)>,
+) {
+    let Some(mut ui) = ui else {
+        for _ in events.read() {}
+        return;
+    };
+    if !ui.active || !ui.bo2mc || console.open || ui.inventory_open {
+        if ui.chat_open {
+            ui.chat_open = false;
+            ui.chat_line.clear();
+        }
+        for _ in events.read() {}
+        return;
+    }
+    if !ui.chat_open {
+        for _ in events.read() {}
+        let slash = keys.just_pressed(KeyCode::Slash);
+        if keys.just_pressed(KeyCode::KeyT) || slash {
+            ui.chat_open = true;
+            ui.chat_line = if slash { "/".to_owned() } else { String::new() };
+            history.1 = None;
+            keys.reset_all();
+            buttons.reset_all();
+        }
+        return;
+    }
+    for ev in events.read() {
+        if ev.state != ButtonState::Pressed || !ui.chat_open {
+            continue;
+        }
+        match &ev.logical_key {
+            Key::Enter => {
+                let line = std::mem::take(&mut ui.chat_line).trim().to_owned();
+                if !line.is_empty() {
+                    if history.0.last() != Some(&line) {
+                        history.0.push(line.clone());
+                    }
+                    ui.chat_submitted.push(line);
+                }
+                ui.chat_open = false;
+            }
+            Key::Escape => {
+                ui.chat_line.clear();
+                ui.chat_open = false;
+            }
+            Key::Backspace => {
+                ui.chat_line.pop();
+            }
+            Key::ArrowUp | Key::ArrowDown => {
+                let n = history.0.len();
+                if n == 0 {
+                    continue;
+                }
+                let at = match (history.1, ev.logical_key == Key::ArrowUp) {
+                    (None, true) => Some(n - 1),
+                    (None, false) => None,
+                    (Some(i), true) => Some(i.saturating_sub(1)),
+                    (Some(i), false) => (i + 1 < n).then_some(i + 1),
+                };
+                history.1 = at;
+                ui.chat_line = at.map(|i| history.0[i].clone()).unwrap_or_default();
+            }
+            _ => {
+                if let Some(text) = &ev.text {
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        if ui.chat_line.chars().count() < 256 {
+                            ui.chat_line.push(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Esc and Enter as keys alone (no typed-text event: the scripted keys).
+    if ui.chat_open && keys.just_pressed(KeyCode::Escape) {
+        ui.chat_line.clear();
+        ui.chat_open = false;
+    }
+    if ui.chat_open && (keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter)) {
+        let line = std::mem::take(&mut ui.chat_line).trim().to_owned();
+        if !line.is_empty() {
+            ui.chat_submitted.push(line);
+        }
+        ui.chat_open = false;
+    }
+    keys.reset_all();
+    buttons.reset_all();
+}
+
 #[derive(Default)]
 struct PhysicalInputState {
     active_pad: Option<Entity>,
@@ -364,7 +464,7 @@ fn publish_client_action_input(
         *wheel_carry = 0.0;
     }
     let script_menu = script_menus.is_some_and(|menus| menus.captures_input());
-    let inventory_open = minecraft.is_some_and(|ui| ui.active && ui.inventory_open);
+    let inventory_open = minecraft.is_some_and(|ui| ui.active && (ui.inventory_open || ui.chat_open));
     skate.input_blocked = console.open || script_menu;
     // J, or clicking both sticks in together, toggles skating.
     let sticks_clicked = pad.is_some_and(|pad| {
@@ -630,7 +730,7 @@ fn sync_cursor_grab(
     screen: Option<Res<AppScreen>>,
     mut focused: MessageReader<WindowFocused>,
     mut entered: MessageReader<CursorEntered>,
-    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut windows: Query<(&mut CursorOptions, &mut Window), With<PrimaryWindow>>,
 ) {
     let mut returned = false;
     for ev in focused.read() {
@@ -639,12 +739,12 @@ fn sync_cursor_grab(
     returned |= entered.read().count() > 0;
 
     let menu_open = script_menus.is_some_and(|m| m.captures_input())
-        || minecraft.is_some_and(|ui| ui.active && ui.inventory_open);
+        || minecraft.is_some_and(|ui| ui.active && (ui.inventory_open || ui.chat_open));
     let in_game = screen
         .as_ref()
         .is_some_and(|s| matches!(**s, AppScreen::InGame));
     let grab = in_game && !console.open && !menu_open && !crate::startup::scripted_run();
-    let Ok(mut cursor) = windows.single_mut() else {
+    let Ok((mut cursor, mut window)) = windows.single_mut() else {
         return;
     };
     let want = if grab {
@@ -652,6 +752,22 @@ fn sync_cursor_grab(
     } else {
         CursorGrabMode::None
     };
+    // Windows locks the pointer by clipping it to wherever it is now: taken
+    // while the pointer sits on another monitor (an alt-tab back, a click on
+    // the taskbar) the lock pins it out there, and the pointer wanders off the
+    // game. So a pointer outside the focused window is put back in its middle
+    // first, and the lock is taken again from there next frame (his 10-08).
+    if want == CursorGrabMode::Locked && window.focused && window.cursor_position().is_none() {
+        // The old clip is let go first: a pointer held out there cannot be moved.
+        if cursor.grab_mode != CursorGrabMode::None {
+            cursor.grab_mode = CursorGrabMode::None;
+        } else {
+            let middle = window.size() / 2.0;
+            window.set_cursor_position(Some(middle));
+        }
+        cursor.visible = false;
+        return;
+    }
     if returned && want != CursorGrabMode::None && cursor.grab_mode == want {
         // Drop it visibly held but actually loose, and re-take it next frame.
         // The cursor stays hidden across the gap, so the player sees nothing.
